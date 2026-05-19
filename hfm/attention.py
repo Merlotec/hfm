@@ -313,7 +313,7 @@ class WindowedCrossAttention(nn.Module):
 
     def forward(self, queries: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, Hq, Wq, Cq = queries.shape
-        _, Hk, Wk, Ck = context.shape
+        _, Hk, Wk, _ = context.shape
         ws = self.ws
 
         assert Hq % ws == 0 and Wq % ws == 0

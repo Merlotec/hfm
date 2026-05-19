@@ -71,42 +71,45 @@ class FeedForward(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PatchEmbed(nn.Module):
-    """4-channel image → [B, P, P, d_patch] grid of patch embeddings."""
+    """4-channel image → [B, P, P, d_patch] grid of patch embeddings.
+
+    No bias, no LayerNorm — both would break the left-inverse property with
+    the paired PatchDecoder.  Per-token normalisation happens inside each
+    transformer layer via PreNorm.
+    """
 
     def __init__(self, in_channels: int = 4, patch_px: int = 4, embed_dim: int = 64):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, embed_dim,
-                              kernel_size=patch_px, stride=patch_px)
-        self.norm = nn.LayerNorm(embed_dim)
+                              kernel_size=patch_px, stride=patch_px, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)                                # [B, C, P, P]
-        x = rearrange(x, 'b c h w -> b h w c')
-        return self.norm(x)
+        x = self.proj(x)                                # [B, d_patch, P, P]
+        return rearrange(x, 'b c h w -> b h w c')       # [B, P, P, d_patch]
 
 
 class PatchDecoder(nn.Module):
-    """[B, P, P, d_patch] → [B, out_channels, img_size, img_size]."""
+    """[B, P, P, d_patch] → [B, in_channels, img_size, img_size].
 
-    def __init__(self, d_patch: int = 64, patch_px: int = 4,
-                 out_channels: int = 4):
+    Uses the *transposed* convolution of the paired PatchEmbed (weight tying).
+    Because Conv2d and ConvTranspose2d share the same weight tensor shape
+    [d_patch, in_channels, kH, kW], passing the encoder weight directly to
+    F.conv_transpose2d makes this the exact adjoint operation.
+
+    Consequence: encode(decode(z)) == z when the weight matrix is orthogonal.
+    The network is free to learn orthogonality; no explicit constraint is needed
+    because the only consistent fixed point of the weight-tied pair is W^T W = I.
+    """
+
+    def __init__(self, encoder: "PatchEmbed"):
         super().__init__()
-        self.patch_px = patch_px
-        hidden = d_patch * patch_px * patch_px
-        self.proj = nn.Linear(d_patch, hidden)
-        self.out_channels = out_channels
-        # pixel shuffle: rearrange patch tokens to pixel grid
-        self.final = nn.Conv2d(d_patch, out_channels, kernel_size=1)
+        self.encoder = encoder   # shared weight — no new parameters here
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, P, P, d_patch]
-        B, Ph, Pw, C = x.shape
-        px = self.patch_px
-        x = self.proj(x)                                # [B, P, P, C*px*px]
-        x = x.reshape(B, Ph, Pw, C, px, px)
-        x = x.permute(0, 3, 1, 4, 2, 5)                # [B, C, P, px, P, px]
-        x = x.reshape(B, C, Ph * px, Pw * px)          # [B, C, img, img]
-        return self.final(x)
+        x = rearrange(x, 'b h w c -> b c h w')         # [B, d_patch, P, P]
+        stride = self.encoder.proj.stride
+        return F.conv_transpose2d(x, self.encoder.proj.weight, stride=stride)
 
 
 # ---------------------------------------------------------------------------
@@ -353,14 +356,16 @@ class PatchBlock(nn.Module):
     """
 
     def __init__(self, d_patch: int, d_feat_finest: int, n_heads: int,
-                 radius: int = 3, mlp_ratio: float = 4.0, dropout: float = 0.0):
+                 radius: int = 3, window_size: int = 8,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
         self.local_self = LocalSelfAttention(d_patch, n_heads, radius=radius,
                                              dropout=dropout)
         self.norm1 = nn.LayerNorm(d_patch)
-        # Cross-attn to the finest feature level (same spatial resolution)
-        self.cross_feat = CrossAttention(d_patch, d_feat_finest, n_heads,
-                                         dropout=dropout)
+        # Windowed cross-attn: patches are 64×64, feat_finest may be 256×256
+        self.cross_feat = WindowedCrossAttention(d_patch, d_feat_finest, n_heads,
+                                                  window_size=window_size,
+                                                  dropout=dropout)
         self.norm2 = nn.LayerNorm(d_patch)
         self.ffn = FeedForward(d_patch, mlp_ratio, dropout=dropout)
         self.norm_ffn = nn.LayerNorm(d_patch)
@@ -388,13 +393,16 @@ class ResidualBlock(nn.Module):
     """
 
     def __init__(self, d_resid: int, d_sys_finest: int, n_heads: int,
-                 radius: int = 3, mlp_ratio: float = 4.0, dropout: float = 0.0):
+                 radius: int = 3, window_size: int = 8,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
         self.local_self = LocalSelfAttention(d_resid, n_heads, radius=radius,
                                              dropout=dropout)
         self.norm1 = nn.LayerNorm(d_resid)
-        self.cross_sys = CrossAttention(d_resid, d_sys_finest, n_heads,
-                                        dropout=dropout)
+        # Windowed cross-attn: resid patches are 64×64, sys_finest may be 256×256
+        self.cross_sys = WindowedCrossAttention(d_resid, d_sys_finest, n_heads,
+                                                window_size=window_size,
+                                                dropout=dropout)
         self.norm2 = nn.LayerNorm(d_resid)
         self.ffn = FeedForward(d_resid, mlp_ratio, dropout=dropout)
         self.norm_ffn = nn.LayerNorm(d_resid)
@@ -461,6 +469,7 @@ class HFMLayer(nn.Module):
             d_feat_finest=cfg.d_feat[-1],
             n_heads=cfg.n_heads_patch,
             radius=cfg.patch_local_radius,
+            window_size=cfg.feat_window_size,
             mlp_ratio=cfg.mlp_ratio,
             dropout=cfg.dropout,
         )
@@ -471,6 +480,7 @@ class HFMLayer(nn.Module):
             d_sys_finest=cfg.d_sys[-1],
             n_heads=cfg.n_heads_patch,
             radius=cfg.patch_local_radius,
+            window_size=cfg.feat_window_size,
             mlp_ratio=cfg.mlp_ratio,
             dropout=cfg.dropout,
         )
@@ -636,8 +646,8 @@ class HFM(nn.Module):
         # Transformer layers
         self.layers = nn.ModuleList([HFMLayer(cfg) for _ in range(cfg.n_layers)])
 
-        # Decoder
-        self.decoder = PatchDecoder(cfg.d_patch, cfg.patch_px, cfg.in_channels)
+        # Decoder: shares weights with patch_embed (adjoint / ConvTranspose2d)
+        self.decoder = PatchDecoder(self.patch_embed)
 
         self._init_weights()
 
@@ -650,6 +660,12 @@ class HFM(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+
+        # Patch and residual encoder weights are square (d_patch == in_ch * kH * kW),
+        # so orthogonal init makes encode(decode(z)) == z exactly from step 0.
+        for embed in (self.patch_embed, self.resid_embed):
+            w = embed.proj.weight                        # [d_patch, in_ch, kH, kW]
+            nn.init.orthogonal_(w.reshape(w.shape[0], -1))  # treat as 2-D matrix
 
     def init_sys_emb(self, batch_size: int,
                      device: torch.device) -> List[torch.Tensor]:
