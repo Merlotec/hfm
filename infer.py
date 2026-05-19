@@ -115,7 +115,7 @@ def save_images(gt: np.ndarray, pred: np.ndarray, out_dir: Path,
     T, C = gt.shape[:2]
     for t in range(T):
         for c in range(C):
-            fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+            _, axes = plt.subplots(1, 3, figsize=(14, 4))
             vmin = gt_phys[t, c].min()
             vmax = gt_phys[t, c].max()
 
@@ -175,7 +175,7 @@ def main():
 
     # ---- load checkpoint ----
     print(f'\nLoading checkpoint: {args.checkpoint}')
-    ckpt  = torch.load(args.checkpoint, map_location='cpu')
+    ckpt  = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     cfg   = ckpt['cfg']
     model = HFM(cfg).to(device)
     model.load_state_dict(ckpt['model_state'])
@@ -258,7 +258,6 @@ def main():
         torch.cat([frames_gt[t].cpu() for t in range(n_warmup)], dim=0).numpy(),
         mean, std,
     )
-    all_phys   = np.concatenate([warmup_phys, pred_phys], axis=0)
     all_ts     = timestamps[:n_warmup] + timestamps[n_warmup:n_warmup + args.n_predict]
     save_viewer_frames(
         gt_phys   = warmup_phys,
