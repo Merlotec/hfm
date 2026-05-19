@@ -41,7 +41,7 @@ FULL_DIR    = DATA_ROOT / 'fvm_gen_datasets-bk'
 # Config — smaller than production to run quickly on CPU/MPS
 # ---------------------------------------------------------------------------
 
-CFG = HFMConfig()   # full production defaults
+CFG = HFMConfig(n_warmup_frames=3)  # production architecture, reduced warmup for memory
 
 N_WARMUP    = CFG.n_warmup_frames
 SEQ_LEN     = N_WARMUP + 2        # warmup frames + prediction input + target
@@ -143,7 +143,7 @@ def save_checkpoint(model: HFM, opt: torch.optim.Optimizer,
 # ---------------------------------------------------------------------------
 
 def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
-           criterion: nn.Module):
+           criterion: nn.Module, device: torch.device):
     print('\n' + '='*60)
     print('STAGE 1 — overfit without residual path')
     print('='*60)
@@ -151,17 +151,19 @@ def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     x_target = frames[N_WARMUP + 1]
     loss = torch.tensor(float('nan'))
+    amp = device.type == 'cuda'
 
     for step in range(1, N_STEPS_1 + 1):
         opt.zero_grad()
 
-        sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+            sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
+                                pixel_mask=pixel_mask)
+            pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
                             pixel_mask=pixel_mask)
-        pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
-                        pixel_mask=pixel_mask)
-        pred = pred * pixel_mask
+            pred = pred * pixel_mask
+            loss = criterion(pred, x_target)
 
-        loss = criterion(pred, x_target)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -190,6 +192,7 @@ def stage2(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     x_target = frames[N_WARMUP + 1]
     loss = torch.tensor(float('nan'))
+    amp = device.type == 'cuda'
 
     for step in range(1, N_STEPS_2 + 1):
         opt.zero_grad()
@@ -197,17 +200,18 @@ def stage2(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
         B = frames[0].shape[0]
         sys = model.init_sys_emb(B, device)
 
-        for t in range(N_WARMUP):
-            pred_t, sys = model(frames[t], sys_emb=sys, resid=None, pixel_mask=pixel_mask)
-            pred_t = pred_t * pixel_mask
-            err_t = (frames[t + 1] - pred_t).detach()
-            _, sys = model(frames[t], sys_emb=sys, resid=err_t, pixel_mask=pixel_mask)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+            for t in range(N_WARMUP):
+                pred_t, sys = model(frames[t], sys_emb=sys, resid=None, pixel_mask=pixel_mask)
+                pred_t = pred_t * pixel_mask
+                err_t = (frames[t + 1] - pred_t).detach()
+                _, sys = model(frames[t], sys_emb=sys, resid=err_t, pixel_mask=pixel_mask)
 
-        pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
-                        pixel_mask=pixel_mask)
-        pred = pred * pixel_mask
+            pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
+                            pixel_mask=pixel_mask)
+            pred = pred * pixel_mask
+            loss = criterion(pred, x_target)
 
-        loss = criterion(pred, x_target)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -255,7 +259,7 @@ if __name__ == '__main__':
     print(f'Model: {n_params:.1f}M parameters')
 
     roundtrip_check(model, device)
-    stage1(model, frames, pixel_mask, criterion)
+    stage1(model, frames, pixel_mask, criterion, device)
     stage2(model, frames, pixel_mask, criterion, device)
 
     print('\nDone. If stage 1 loss reached < 0.01 and stage 2 loss is lower,')
