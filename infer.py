@@ -246,7 +246,7 @@ def main():
     pred_arr = torch.cat(preds, dim=0).numpy()
 
     gt_phys   = denorm(gt_arr,   mean, std)
-    pred_phys = denorm(pred_arr, mean, std)
+    pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()  # re-zero holes after denorm
 
     np.save(out_dir / 'frames_gt.npy',        gt_arr)
     np.save(out_dir / 'frames_pred.npy',       pred_arr)
