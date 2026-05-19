@@ -24,7 +24,7 @@ echo "Data       : $DATA_DIR"
 echo "Output     : $OUT_DIR"
 echo ""
 
-python scripts/infer.py \
+python infer.py \
     --checkpoint "$CKPT" \
     --data-dir   "$DATA_DIR" \
     --out-dir    "$OUT_DIR" \

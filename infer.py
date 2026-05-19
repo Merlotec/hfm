@@ -9,9 +9,9 @@ run, then autoregressively predicts subsequent frames.  Outputs are saved to
   - images/t{NNN}_ch{C}.png             — ground-truth vs prediction per channel
 
 Usage:
-    python scripts/infer.py --checkpoint hfm/checkpoints/overfit_stage2_step02000.pt \\
-                            --data-dir   /path/to/sim_dataset \\
-                            --out-dir    hfm/out/overfit
+    python infer.py --checkpoint checkpoints/overfit_stage2_step02000.pt \\
+                    --data-dir   /path/to/sim_dataset \\
+                    --out-dir    out/overfit
 """
 
 import argparse
@@ -22,13 +22,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hfm import HFM
 from hfm.data import build_renderer, FVMSequenceDataset
 
-DATA_ROOT = Path(__file__).resolve().parents[2] / 'fvm_model' / 'data'
-FOUNDATION_STATS = Path(__file__).resolve().parents[2] / \
+DATA_ROOT = Path(__file__).resolve().parents[1] / 'fvm_model' / 'data'
+FOUNDATION_STATS = Path(__file__).resolve().parents[1] / \
                    'fvm_model' / 'fvm_foundation' / 'input_stats.json'
 
 CHANNEL_NAMES = ['rho', 'u', 'v', 'p']
