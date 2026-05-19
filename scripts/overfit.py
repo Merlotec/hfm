@@ -64,9 +64,11 @@ N_WARMUP    = CFG.n_warmup_frames
 SEQ_LEN     = N_WARMUP + 2        # warmup frames + prediction input + target
 FIRST_FRAME = 20
 LR          = 1e-4
-N_STEPS_1   = 200                 # stage 1: no residual
-N_STEPS_2   = 200                 # stage 2: with residual
+N_STEPS_1   = 2000                # stage 1: no residual
+N_STEPS_2   = 2000                # stage 2: with residual
 LOG_EVERY   = 10
+CKPT_EVERY  = 500                 # save a checkpoint every N steps (each stage)
+CKPT_DIR    = Path(__file__).resolve().parents[1] / 'checkpoints'
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,21 @@ def sys_emb_norm(sys: list[torch.Tensor]) -> float:
     return sum(s.norm().item() for s in sys) / len(sys)
 
 
+def save_checkpoint(model: HFM, opt: torch.optim.Optimizer,
+                    stage: str, step: int, loss: float):
+    CKPT_DIR.mkdir(exist_ok=True)
+    path = CKPT_DIR / f'overfit_{stage}_step{step:05d}.pt'
+    torch.save({
+        'stage':            stage,
+        'step':             step,
+        'loss':             loss,
+        'cfg':              CFG,
+        'model_state':      model.state_dict(),
+        'optimizer_state':  opt.state_dict(),
+    }, path)
+    print(f'  [ckpt] saved → {path.name}')
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: overfit without residual
 # ---------------------------------------------------------------------------
@@ -147,6 +164,7 @@ def stage1(model: HFM, frames: list[torch.Tensor],
 
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     x_target = frames[N_WARMUP + 1]
+    loss = torch.tensor(float('nan'))
 
     for step in range(1, N_STEPS_1 + 1):
         opt.zero_grad()
@@ -163,6 +181,10 @@ def stage1(model: HFM, frames: list[torch.Tensor],
             snorm = sys_emb_norm(sys)
             print(f'  step {step:4d}  loss={loss.item():.5f}  sys_norm={snorm:.4f}')
 
+        if step % CKPT_EVERY == 0:
+            save_checkpoint(model, opt, 'stage1', step, loss.item())
+
+    save_checkpoint(model, opt, 'stage1', N_STEPS_1, loss.item())
     print(f'Stage 1 final loss: {loss.item():.6f}')
 
 
@@ -178,11 +200,11 @@ def stage2(model: HFM, frames: list[torch.Tensor],
 
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     x_target = frames[N_WARMUP + 1]
+    loss = torch.tensor(float('nan'))
 
     for step in range(1, N_STEPS_2 + 1):
         opt.zero_grad()
 
-        # Warmup with residual: predict each frame, feed error back
         B = frames[0].shape[0]
         sys = model.init_sys_emb(B, device)
 
@@ -202,6 +224,10 @@ def stage2(model: HFM, frames: list[torch.Tensor],
             snorm = sys_emb_norm(sys)
             print(f'  step {step:4d}  loss={loss.item():.5f}  sys_norm={snorm:.4f}')
 
+        if step % CKPT_EVERY == 0:
+            save_checkpoint(model, opt, 'stage2', step, loss.item())
+
+    save_checkpoint(model, opt, 'stage2', N_STEPS_2, loss.item())
     print(f'Stage 2 final loss: {loss.item():.6f}')
 
 
