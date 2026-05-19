@@ -204,7 +204,7 @@ def main():
 
     start = args.seq_start if args.seq_start is not None else len(ds) // 2
     seq   = ds[start]                                   # [T, C, H, W]
-    frames_gt = [seq[t:t+1].to(device) for t in range(seq_len)]
+    frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
 
     # Timestamps from source filenames (t_<value>.npz)
     timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
@@ -216,6 +216,7 @@ def main():
         sys = model.init_sys_emb(B, device)
         for t in range(n_warmup):
             pred_t, sys = model(frames_gt[t], sys_emb=sys, resid=None)
+            pred_t = pred_t * pixel_mask
             err_t = (frames_gt[t + 1] - pred_t)
             _, sys = model(frames_gt[t], sys_emb=sys, resid=err_t)
         sys_norm = sum(s.norm().item() for s in sys) / len(sys)

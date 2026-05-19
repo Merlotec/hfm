@@ -174,7 +174,8 @@ def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
     for step in range(1, N_STEPS_1 + 1):
         opt.zero_grad()
 
-        sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP)
+        sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
+                            pixel_mask=pixel_mask)
         pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True)
         pred = pred * pixel_mask
 
