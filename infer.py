@@ -62,6 +62,39 @@ def denorm(frames: np.ndarray, mean: torch.Tensor, std: torch.Tensor) -> np.ndar
     return frames * s + m
 
 
+def save_viewer_frames(
+    gt_phys: np.ndarray,
+    pred_phys: np.ndarray,
+    timestamps: list[float],
+    n_warmup: int,
+    run_name: str,
+    viewer_dir: Path,
+):
+    """
+    Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c.
+
+    Layout:  viewer_dir / run_name / t_{timestamp}.npz
+    Each file contains: grid (4, H, W), t (scalar float32), is_seed (bool).
+
+    Warmup frames are marked is_seed=True; predicted frames is_seed=False.
+    """
+    run_dir = viewer_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    T = len(timestamps)
+    for i, ts in enumerate(timestamps):
+        if i < n_warmup:
+            grid     = gt_phys[i].astype(np.float32)
+            is_seed  = True
+        else:
+            grid     = pred_phys[i - n_warmup].astype(np.float32)
+            is_seed  = False
+        np.savez(run_dir / f't_{ts:.4g}.npz',
+                 grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed))
+
+    print(f'  Saved {T} viewer frames → {run_dir}')
+
+
 def save_images(gt: np.ndarray, pred: np.ndarray, out_dir: Path,
                 mean: torch.Tensor, std: torch.Tensor):
     """Save side-by-side GT vs prediction PNGs, one per timestep per channel."""
@@ -172,6 +205,9 @@ def main():
     seq   = ds[start]                                   # [T, C, H, W]
     frames_gt = [seq[t:t+1].to(device) for t in range(seq_len)]
 
+    # Timestamps from source filenames (t_<value>.npz)
+    timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
+
     # ---- warmup ----
     print(f'\nRunning warmup ({n_warmup} frames)...')
     with torch.no_grad():
@@ -207,17 +243,37 @@ def main():
     gt_arr   = torch.cat(gt,    dim=0).numpy()    # [T, C, H, W]
     pred_arr = torch.cat(preds, dim=0).numpy()
 
+    gt_phys   = denorm(gt_arr,   mean, std)
+    pred_phys = denorm(pred_arr, mean, std)
+
     np.save(out_dir / 'frames_gt.npy',        gt_arr)
     np.save(out_dir / 'frames_pred.npy',       pred_arr)
-    np.save(out_dir / 'frames_gt_phys.npy',   denorm(gt_arr,   mean, std))
-    np.save(out_dir / 'frames_pred_phys.npy', denorm(pred_arr, mean, std))
+    np.save(out_dir / 'frames_gt_phys.npy',   gt_phys)
+    np.save(out_dir / 'frames_pred_phys.npy', pred_phys)
     print(f'\nSaved arrays → {out_dir}')
+
+    # Viewer-compatible output: warmup frames (is_seed=True) + predictions
+    print('Saving viewer frames...')
+    warmup_phys = denorm(
+        torch.cat([frames_gt[t].cpu() for t in range(n_warmup)], dim=0).numpy(),
+        mean, std,
+    )
+    all_phys   = np.concatenate([warmup_phys, pred_phys], axis=0)
+    all_ts     = timestamps[:n_warmup] + timestamps[n_warmup:n_warmup + args.n_predict]
+    save_viewer_frames(
+        gt_phys   = warmup_phys,
+        pred_phys = pred_phys,
+        timestamps = all_ts,
+        n_warmup  = n_warmup,
+        run_name  = sim_dir.name,
+        viewer_dir = out_dir / 'viewer',
+    )
 
     if not args.no_images:
         print('Saving images...')
         save_images(gt_arr, pred_arr, out_dir, mean, std)
 
-    print('\nDone.')
+    print(f'\nDone.  Viewer output → {out_dir / "viewer"}')
 
 
 if __name__ == '__main__':

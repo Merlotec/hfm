@@ -17,6 +17,8 @@ import sys
 import json
 from pathlib import Path
 
+sys.stdout.reconfigure(line_buffering=True)
+
 import torch
 import torch.nn as nn
 
@@ -181,7 +183,7 @@ def stage1(model: HFM, frames: list[torch.Tensor],
             snorm = sys_emb_norm(sys)
             print(f'  step {step:4d}  loss={loss.item():.5f}  sys_norm={snorm:.4f}')
 
-        if step % CKPT_EVERY == 0:
+        if step % CKPT_EVERY == 0 and step < N_STEPS_1:
             save_checkpoint(model, opt, 'stage1', step, loss.item())
 
     save_checkpoint(model, opt, 'stage1', N_STEPS_1, loss.item())
@@ -224,7 +226,7 @@ def stage2(model: HFM, frames: list[torch.Tensor],
             snorm = sys_emb_norm(sys)
             print(f'  step {step:4d}  loss={loss.item():.5f}  sys_norm={snorm:.4f}')
 
-        if step % CKPT_EVERY == 0:
+        if step % CKPT_EVERY == 0 and step < N_STEPS_2:
             save_checkpoint(model, opt, 'stage2', step, loss.item())
 
     save_checkpoint(model, opt, 'stage2', N_STEPS_2, loss.item())
