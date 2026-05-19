@@ -87,7 +87,8 @@ def warmup_system(
         x_next = frames[t + 1]
 
         # First pass: encode current frame, update sys (no residual yet)
-        pred, sys = model(x_t, sys_emb=sys, resid=None, freeze_sys=False)
+        pred, sys = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
+                          pixel_mask=pixel_mask)
         if pixel_mask is not None:
             pred = pred * pixel_mask
 
@@ -97,7 +98,8 @@ def warmup_system(
                                          # backprop through the error itself here
 
         # Second pass: refine sys using the residual signal
-        _, sys = model(x_t, sys_emb=sys, resid=err, freeze_sys=False)
+        _, sys = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
+                       pixel_mask=pixel_mask)
 
     return sys
 

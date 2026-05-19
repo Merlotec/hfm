@@ -681,15 +681,37 @@ class HFM(nn.Module):
         sys_emb: Optional[List[torch.Tensor]] = None,
         resid: Optional[torch.Tensor] = None,
         freeze_sys: bool = False,
+        pixel_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        pixel_mask : (1, 1, H, W) bool — True for fluid pixels.
+            A patch is kept if it contains at least one fluid pixel.
+            Hole patch tokens are forced to zero after positional encoding
+            and after every transformer layer so they cannot contaminate
+            fluid tokens through attention.
+        """
         B = x.shape[0]
         device = x.device
 
+        # ---- derive patch-level hole mask ----
+        # patch_mask[b, p, q, :] = 0 when the entire p×q patch is a hole.
+        patch_mask: Optional[torch.Tensor] = None
+        if pixel_mask is not None:
+            pm = F.max_pool2d(pixel_mask.float(),
+                              kernel_size=self.cfg.patch_px,
+                              stride=self.cfg.patch_px)   # [1, 1, P, P]
+            patch_mask = pm.permute(0, 2, 3, 1)           # [1, P, P, 1] broadcast over d
+
         # ---- encode inputs ----
         patches = self.patch_pos(self.patch_embed(x))       # [B, P, P, d_patch]
+        if patch_mask is not None:
+            patches = patches * patch_mask
+
         resid_tokens = None
         if resid is not None:
             resid_tokens = self.resid_pos(self.resid_embed(resid))
+            if patch_mask is not None:
+                resid_tokens = resid_tokens * patch_mask
 
         # ---- initialise feature hierarchy ----
         feat = [
@@ -713,10 +735,15 @@ class HFM(nn.Module):
             patches, feat, sys, resid_tokens = layer(
                 patches, feat, sys, resid_tokens
             )
+            # Re-zero hole patches after each layer: LayerNorm maps zero→beta
+            # (the learned bias), which would otherwise contaminate neighbouring
+            # fluid tokens through attention in the next layer.
+            if patch_mask is not None:
+                patches = patches * patch_mask
+                if resid_tokens is not None:
+                    resid_tokens = resid_tokens * patch_mask
 
         # ---- decode patches → prediction ----
         pred = self.decoder(patches)                        # [B, C, H, W]
 
-        # Return updated sys (without positional encoding added again)
-        # We return the post-layer sys so it accumulates context frame-by-frame.
         return pred, sys
