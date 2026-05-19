@@ -41,35 +41,16 @@ FULL_DIR    = DATA_ROOT / 'fvm_gen_datasets-bk'
 # Config — smaller than production to run quickly on CPU/MPS
 # ---------------------------------------------------------------------------
 
-CFG = HFMConfig(
-    img_size       = 256,
-    in_channels    = 4,
-    patch_px       = 4,
-    d_patch        = 32,
-    d_resid        = 32,
-    # 3 levels only — skip 256×256 to keep activation memory tractable on MPS
-    feat_sizes     = (32, 64, 128),
-    d_feat         = (128, 64, 32),
-    d_sys          = (64, 32, 16),
-    n_heads_patch  = 2,
-    n_heads_feat   = (4, 2, 1),
-    n_heads_sys    = (2, 1, 1),
-    n_heads_resid  = 2,
-    feat_window_size = 8,
-    n_layers       = 2,
-    mlp_ratio      = 4.0,
-    dropout        = 0.0,
-    n_warmup_frames = 3,
-)
+CFG = HFMConfig()   # full production defaults
 
 N_WARMUP    = CFG.n_warmup_frames
 SEQ_LEN     = N_WARMUP + 2        # warmup frames + prediction input + target
 FIRST_FRAME = 20
 LR          = 1e-4
-N_STEPS_1   = 2000                # stage 1: no residual
-N_STEPS_2   = 2000                # stage 2: with residual
-LOG_EVERY   = 10
-CKPT_EVERY  = 500                 # save a checkpoint every N steps (each stage)
+N_STEPS_1   = 5000                # stage 1: no residual
+N_STEPS_2   = 5000                # stage 2: with residual
+LOG_EVERY   = 50
+CKPT_EVERY  = 1000                # save a checkpoint every N steps (each stage)
 CKPT_DIR    = Path(__file__).resolve().parents[1] / 'checkpoints'
 
 
