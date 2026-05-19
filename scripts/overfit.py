@@ -41,7 +41,7 @@ FULL_DIR    = DATA_ROOT / 'fvm_gen_datasets-bk'
 # Config — smaller than production to run quickly on CPU/MPS
 # ---------------------------------------------------------------------------
 
-CFG = HFMConfig(n_warmup_frames=3)  # production architecture, reduced warmup for memory
+CFG = HFMConfig(n_warmup_frames=3, gradient_checkpointing=True)
 
 N_WARMUP    = CFG.n_warmup_frames
 SEQ_LEN     = N_WARMUP + 2        # warmup frames + prediction input + target

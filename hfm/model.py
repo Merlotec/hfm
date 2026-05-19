@@ -675,6 +675,41 @@ class HFM(nn.Module):
             for s, d in zip(self.cfg.feat_sizes, self.cfg.d_sys)
         ]
 
+    @staticmethod
+    def _checkpointed_layer(
+        layer: nn.Module,
+        patches: torch.Tensor,
+        feat: List[torch.Tensor],
+        sys: List[torch.Tensor],
+        resid_tokens: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], Optional[torch.Tensor]]:
+        """Run one HFMLayer with activation checkpointing.
+
+        torch.utils.checkpoint requires flat tensor I/O, so we pack/unpack
+        the list arguments.  A sentinel zero tensor is used in place of None
+        residual so the function signature stays uniform.
+        """
+        from torch.utils.checkpoint import checkpoint
+        n_f = len(feat)
+        n_s = len(sys)
+        has_resid = resid_tokens is not None
+        r_in = resid_tokens if has_resid else patches.new_zeros(*patches.shape[:-1], 1)
+
+        def fn(p, *args):
+            f = list(args[:n_f])
+            s = list(args[n_f:n_f + n_s])
+            r = args[-1] if has_resid else None
+            new_p, new_f, new_s, new_r = layer(p, f, s, r)
+            r_out = new_r if new_r is not None else p.new_zeros(*p.shape[:-1], 1)
+            return (new_p,) + tuple(new_f) + tuple(new_s) + (r_out,)
+
+        out = checkpoint(fn, patches, *feat, *sys, r_in, use_reentrant=False)
+        new_patches = out[0]
+        new_feat    = list(out[1:1 + n_f])
+        new_sys     = list(out[1 + n_f:1 + n_f + n_s])
+        new_resid   = out[-1] if has_resid else None
+        return new_patches, new_feat, new_sys, new_resid
+
     def forward(
         self,
         x: torch.Tensor,
@@ -732,9 +767,14 @@ class HFM(nn.Module):
 
         # ---- transformer layers ----
         for layer in self.layers:
-            patches, feat, sys, resid_tokens = layer(
-                patches, feat, sys, resid_tokens
-            )
+            if self.cfg.gradient_checkpointing and self.training:
+                patches, feat, sys, resid_tokens = HFM._checkpointed_layer(
+                    layer, patches, feat, sys, resid_tokens
+                )
+            else:
+                patches, feat, sys, resid_tokens = layer(
+                    patches, feat, sys, resid_tokens
+                )
             # Re-zero hole patches after each layer: LayerNorm maps zero→beta
             # (the learned bias), which would otherwise contaminate neighbouring
             # fluid tokens through attention in the next layer.

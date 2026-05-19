@@ -37,6 +37,9 @@ class HFMConfig:
     # --- training loop ---
     n_warmup_frames: int = 5     # frames used to build up system embeddings
 
+    # --- memory ---
+    gradient_checkpointing: bool = False   # recompute activations during backward
+
     @property
     def n_patch(self) -> int:
         return self.img_size // self.patch_px   # patches per side (64)
