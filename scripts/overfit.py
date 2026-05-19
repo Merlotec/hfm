@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hfm import HFMConfig, HFM
 from hfm.trainer import warmup_system, FluidLoss
-from hfm.data import FVMDataModule, build_renderer, FVMSequenceDataset
+from hfm.data import FVMDataModule, build_renderer, FVMSequenceDataset, load_pixel_mask
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -85,11 +85,12 @@ def get_device() -> torch.device:
     return torch.device('cpu')
 
 
-def load_fixed_batch(device: torch.device) -> list[torch.Tensor]:
+def load_fixed_batch(device: torch.device) -> tuple[list[torch.Tensor], torch.Tensor]:
     """
     Render and cache all frames from the overfit run, then pick a fixed
     window of SEQ_LEN consecutive frames as the single training batch.
-    Returns a list of SEQ_LEN tensors each [1, C, H, W].
+    Returns (frames, pixel_mask) where frames is a list of SEQ_LEN tensors
+    each [1, C, H, W] and pixel_mask is (1, 1, H, W) bool on device.
     """
     print(f'Loading overfit data from {OVERFIT_DIR}')
 
@@ -128,11 +129,13 @@ def load_fixed_batch(device: torch.device) -> list[torch.Tensor]:
     )
     print(f'  Run: {sim_dir.name}  —  {len(ds)} sequences available')
 
+    pixel_mask = load_pixel_mask(OVERFIT_DIR, renderer, (256, 256)).to(device)
+
     # Use the middle of the sequence for stability
     mid = len(ds) // 2
     seq = ds[mid]                               # [T, C, H, W]
-    frames = [seq[t:t+1].to(device) for t in range(SEQ_LEN)]
-    return frames
+    frames = [seq[t:t+1].to(device) * pixel_mask for t in range(SEQ_LEN)]
+    return frames, pixel_mask
 
 
 def sys_emb_norm(sys: list[torch.Tensor]) -> float:
@@ -158,8 +161,8 @@ def save_checkpoint(model: HFM, opt: torch.optim.Optimizer,
 # Stage 1: overfit without residual
 # ---------------------------------------------------------------------------
 
-def stage1(model: HFM, frames: list[torch.Tensor],
-           criterion: nn.Module, device: torch.device):
+def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
+           criterion: nn.Module):
     print('\n' + '='*60)
     print('STAGE 1 — overfit without residual path')
     print('='*60)
@@ -173,6 +176,7 @@ def stage1(model: HFM, frames: list[torch.Tensor],
 
         sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP)
         pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True)
+        pred = pred * pixel_mask
 
         loss = criterion(pred, x_target)
         loss.backward()
@@ -194,7 +198,7 @@ def stage1(model: HFM, frames: list[torch.Tensor],
 # Stage 2: overfit with residual path
 # ---------------------------------------------------------------------------
 
-def stage2(model: HFM, frames: list[torch.Tensor],
+def stage2(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
            criterion: nn.Module, device: torch.device):
     print('\n' + '='*60)
     print('STAGE 2 — overfit with residual path')
@@ -212,10 +216,12 @@ def stage2(model: HFM, frames: list[torch.Tensor],
 
         for t in range(N_WARMUP):
             pred_t, sys = model(frames[t], sys_emb=sys, resid=None)
+            pred_t = pred_t * pixel_mask
             err_t = (frames[t + 1] - pred_t).detach()
             _, sys = model(frames[t], sys_emb=sys, resid=err_t)
 
         pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True)
+        pred = pred * pixel_mask
 
         loss = criterion(pred, x_target)
         loss.backward()
@@ -257,16 +263,16 @@ if __name__ == '__main__':
     device = get_device()
     print(f'Device: {device}')
 
-    frames    = load_fixed_batch(device)
+    frames, pixel_mask = load_fixed_batch(device)
     model     = HFM(CFG).to(device)
-    criterion = FluidLoss(l1_weight=0.1).to(device)
+    criterion = FluidLoss(l1_weight=0.1, pixel_mask=pixel_mask).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f'Model: {n_params:.1f}M parameters')
 
     roundtrip_check(model, device)
-    stage1(model, frames, criterion, device)
-    stage2(model, frames, criterion, device)
+    stage1(model, frames, pixel_mask, criterion)
+    stage2(model, frames, pixel_mask, criterion, device)
 
     print('\nDone. If stage 1 loss reached < 0.01 and stage 2 loss is lower,')
     print('the model and training loop are working correctly.')

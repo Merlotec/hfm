@@ -38,13 +38,25 @@ from .config import HFMConfig
 # ---------------------------------------------------------------------------
 
 class FluidLoss(nn.Module):
-    def __init__(self, l1_weight: float = 0.1):
+    def __init__(self, l1_weight: float = 0.1,
+                 pixel_mask: Optional[torch.Tensor] = None):
         super().__init__()
         self.l1_weight = l1_weight
+        if pixel_mask is not None:
+            self.register_buffer('pixel_mask', pixel_mask)
+        else:
+            self.pixel_mask: Optional[torch.Tensor] = None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        mse = nn.functional.mse_loss(pred, target)
-        l1 = nn.functional.l1_loss(pred, target)
+        if self.pixel_mask is not None:
+            valid = self.pixel_mask.expand_as(target)
+            p = pred[valid]
+            t = target[valid]
+        else:
+            p = pred.reshape(-1)
+            t = target.reshape(-1)
+        mse = (p - t).pow(2).mean()
+        l1  = (p - t).abs().mean()
         return mse + self.l1_weight * l1
 
 
@@ -54,8 +66,9 @@ class FluidLoss(nn.Module):
 
 def warmup_system(
     model: HFM,
-    frames: List[torch.Tensor],      # list of [B, C, H, W]
+    frames: List[torch.Tensor],      # list of [B, C, H, W], already masked
     n_warmup: int,
+    pixel_mask: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """
     Run n_warmup steps of (forward → compute residual → forward-with-residual)
@@ -75,6 +88,8 @@ def warmup_system(
 
         # First pass: encode current frame, update sys (no residual yet)
         pred, sys = model(x_t, sys_emb=sys, resid=None, freeze_sys=False)
+        if pixel_mask is not None:
+            pred = pred * pixel_mask
 
         # Compute prediction error
         err = (x_next - pred).detach()  # detach error from pred graph — we only
@@ -98,6 +113,7 @@ def train_step(
     criterion: nn.Module,
     n_warmup: Optional[int] = None,
     clip_grad: float = 1.0,
+    pixel_mask: Optional[torch.Tensor] = None,
 ) -> float:
     """
     Run one full training step:
@@ -118,6 +134,8 @@ def train_step(
     x_in = frames[nw]
     x_target = frames[nw + 1]
     pred, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True)
+    if pixel_mask is not None:
+        pred = pred * pixel_mask
 
     loss = criterion(pred, x_target)
     loss.backward()

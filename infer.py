@@ -25,7 +25,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hfm import HFM
-from hfm.data import build_renderer, FVMSequenceDataset
+from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / 'fvm_model' / 'data'
 FOUNDATION_STATS = Path(__file__).resolve().parents[1] / \
@@ -188,6 +188,7 @@ def main():
     print(f'\nLoading data from {data_dir}')
     mean, std = load_stats(data_dir)
     renderer  = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
+    pixel_mask = load_pixel_mask(data_dir, renderer, (cfg.img_size, cfg.img_size)).to(device)
 
     sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()])
     if not sim_dirs:
@@ -203,7 +204,7 @@ def main():
 
     start = args.seq_start if args.seq_start is not None else len(ds) // 2
     seq   = ds[start]                                   # [T, C, H, W]
-    frames_gt = [seq[t:t+1].to(device) for t in range(seq_len)]
+    frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
 
     # Timestamps from source filenames (t_<value>.npz)
     timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
@@ -215,6 +216,7 @@ def main():
         sys = model.init_sys_emb(B, device)
         for t in range(n_warmup):
             pred_t, sys = model(frames_gt[t], sys_emb=sys, resid=None)
+            pred_t = pred_t * pixel_mask
             err_t = (frames_gt[t + 1] - pred_t)
             _, sys = model(frames_gt[t], sys_emb=sys, resid=err_t)
         sys_norm = sum(s.norm().item() for s in sys) / len(sys)
@@ -229,6 +231,7 @@ def main():
     with torch.no_grad():
         for t in range(args.n_predict):
             pred, _ = model(x, sys_emb=sys, resid=None, freeze_sys=True)
+            pred = pred * pixel_mask
             preds.append(pred.cpu())
             gt.append(frames_gt[n_warmup + t].cpu())
 

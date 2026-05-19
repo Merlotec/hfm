@@ -62,6 +62,31 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
 
 
 # ---------------------------------------------------------------------------
+# Pixel mask (fluid vs. hole)
+# ---------------------------------------------------------------------------
+
+def build_pixel_mask(renderer: MeshRenderer, resolution: tuple[int, int]) -> torch.Tensor:
+    """Boolean (1, 1, H, W) mask — True for pixels inside the fluid mesh."""
+    H, W = resolution
+    mask = torch.zeros(H * W, dtype=torch.bool)
+    mask[renderer._interior_idx] = True
+    return mask.view(1, 1, H, W)
+
+
+def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
+                    resolution: tuple[int, int]) -> torch.Tensor:
+    """Return cached pixel mask, building and saving it if not yet cached."""
+    H, W = resolution
+    cache = dataset_dir / f'pixel_mask_{H}x{W}.pt'
+    if cache.exists():
+        return torch.load(cache, weights_only=True)
+    mask = build_pixel_mask(renderer, resolution)
+    torch.save(mask, cache)
+    print(f'  Pixel mask saved — {mask.sum().item()} fluid / {mask.numel()} total pixels')
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # Stats helpers
 # ---------------------------------------------------------------------------
 
