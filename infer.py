@@ -263,7 +263,7 @@ def main():
     warmup_phys = denorm(
         torch.cat([frames_gt[t].cpu() for t in range(n_warmup)], dim=0).numpy(),
         mean, std,
-    )
+    ) * pixel_mask.cpu().numpy()
     all_ts     = timestamps[:n_warmup] + timestamps[n_warmup:n_warmup + args.n_predict]
     save_viewer_frames(
         gt_phys   = warmup_phys,
