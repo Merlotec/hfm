@@ -101,7 +101,7 @@ def main():
                         help='Override n_epochs from hyperparams.json')
     parser.add_argument('--log-every',  type=int,  default=50,
                         help='Print a log line every N steps')
-    parser.add_argument('--ckpt-every', type=int,  default=1000,
+    parser.add_argument('--ckpt-every', type=int,  default=200,
                         help='Save a mid-epoch checkpoint every N steps')
     args = parser.parse_args()
 
