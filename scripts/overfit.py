@@ -159,8 +159,8 @@ def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
                                 pixel_mask=pixel_mask)
-            pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
-                            pixel_mask=pixel_mask)
+            pred, _, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
+                               pixel_mask=pixel_mask)
             pred = pred * pixel_mask
             loss = criterion(pred, x_target)
 
@@ -202,13 +202,13 @@ def stage2(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             for t in range(N_WARMUP):
-                pred_t, sys = model(frames[t], sys_emb=sys, resid=None, pixel_mask=pixel_mask)
+                pred_t, sys, _ = model(frames[t], sys_emb=sys, resid=None, pixel_mask=pixel_mask)
                 pred_t = pred_t * pixel_mask
                 err_t = (frames[t + 1] - pred_t).detach()
-                _, sys = model(frames[t], sys_emb=sys, resid=err_t, pixel_mask=pixel_mask)
+                _, sys, _ = model(frames[t], sys_emb=sys, resid=err_t, pixel_mask=pixel_mask)
 
-            pred, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
-                            pixel_mask=pixel_mask)
+            pred, _, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
+                               pixel_mask=pixel_mask)
             pred = pred * pixel_mask
             loss = criterion(pred, x_target)
 
