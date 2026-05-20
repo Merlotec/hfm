@@ -262,25 +262,24 @@ def train_step_gan(
     """
     nw: int = n_warmup if n_warmup is not None else model.cfg.n_warmup_frames
 
-    device_type = frames[0].device.type
-    amp = device_type == 'cuda'   # bfloat16 autocast on CUDA; no GradScaler needed
-
     gen_optimizer.zero_grad()
     disc_optimizer.zero_grad()
 
-    # All forward passes run in bfloat16 to halve activation memory.
-    # Losses are cast to float32 before .backward() for numerical precision.
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        warmup_frames = frames[:nw + 1]
-        sys = warmup_system(model, warmup_frames, nw, pixel_mask)
+    # Build sys from warmup, then immediately detach to release the warmup
+    # computation graphs.  freeze_sys=True in the training forward detaches sys
+    # again internally, so the warmup graph is never reachable from the training
+    # loss anyway — keeping it alive only wastes activation memory.
+    warmup_frames = frames[:nw + 1]
+    sys = warmup_system(model, warmup_frames, nw, pixel_mask)
+    sys = [s.detach() for s in sys]
 
-        x_in     = frames[nw]
-        x_target = frames[nw + 1]
+    x_in     = frames[nw]
+    x_target = frames[nw + 1]
 
-        pred, _, feat = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
-                              pixel_mask=pixel_mask)
-        if pixel_mask is not None:
-            pred = pred * pixel_mask
+    pred, _, feat = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
+                          pixel_mask=pixel_mask)
+    if pixel_mask is not None:
+        pred = pred * pixel_mask
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
@@ -289,7 +288,7 @@ def train_step_gan(
             p.requires_grad_(True)
 
     if not gan_active:
-        recon_loss = criterion(pred.float(), x_target)
+        recon_loss = criterion(pred, x_target)
         if not torch.isfinite(recon_loss):
             _zero_and_restore()
             return float('nan'), 0.0
@@ -308,15 +307,14 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(True)
 
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        real_logit = discriminator(x_target,      feat_ctx, sys_ctx)
-        fake_logit = discriminator(pred.detach(), feat_ctx, sys_ctx)
+    real_logit = discriminator(x_target,      feat_ctx, sys_ctx)
+    fake_logit = discriminator(pred.detach(), feat_ctx, sys_ctx)
 
-    real_labels = torch.full_like(real_logit, 0.9, dtype=torch.float32)
-    fake_labels = torch.zeros_like(fake_logit,     dtype=torch.float32)
+    real_labels = torch.full_like(real_logit, 0.9)
+    fake_labels = torch.zeros_like(fake_logit)
 
-    d_loss = (F.binary_cross_entropy_with_logits(real_logit.float(), real_labels) +
-              F.binary_cross_entropy_with_logits(fake_logit.float(), fake_labels))
+    d_loss = (F.binary_cross_entropy_with_logits(real_logit, real_labels) +
+              F.binary_cross_entropy_with_logits(fake_logit, fake_labels))
     d_loss_val = d_loss.item()
 
     if not math.isfinite(d_loss_val):
@@ -336,12 +334,11 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(False)
 
-    recon_loss = criterion(pred.float(), x_target)
+    recon_loss = criterion(pred, x_target)
 
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        adv_logit = discriminator(pred, feat, sys)
-    adv_loss = F.binary_cross_entropy_with_logits(
-        adv_logit.float(), torch.ones_like(adv_logit, dtype=torch.float32)
+    adv_logit = discriminator(pred, feat, sys)
+    adv_loss  = F.binary_cross_entropy_with_logits(
+        adv_logit, torch.ones_like(adv_logit)
     )
 
     total_loss = recon_loss + adv_weight * adv_loss
