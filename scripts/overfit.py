@@ -157,8 +157,8 @@ def stage1(model: HFM, frames: list[torch.Tensor], pixel_mask: torch.Tensor,
         opt.zero_grad()
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-            sys = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
-                                pixel_mask=pixel_mask)
+            sys, _ = warmup_system(model, frames[:N_WARMUP + 1], n_warmup=N_WARMUP,
+                                   pixel_mask=pixel_mask)
             pred, _, _ = model(frames[N_WARMUP], sys_emb=sys, resid=None, freeze_sys=True,
                                pixel_mask=pixel_mask)
             pred = pred * pixel_mask

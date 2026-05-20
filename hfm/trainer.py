@@ -69,42 +69,53 @@ class FluidLoss(nn.Module):
 
 def warmup_system(
     model: HFM,
-    frames: List[torch.Tensor],      # list of [B, C, H, W], already masked
+    frames: List[torch.Tensor],
     n_warmup: int,
     pixel_mask: Optional[torch.Tensor] = None,
-) -> List[torch.Tensor]:
+    criterion: Optional[nn.Module] = None,
+) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
     """
     Run n_warmup steps of (forward → compute residual → forward-with-residual)
     to build up meaningful system embeddings.
 
-    Returns the updated sys_emb list.  The computation graph is kept alive
-    so that loss.backward() later can propagate through these steps.
+    When criterion is provided, accumulates a prediction loss at each warmup
+    step (averaged over steps).  This loss, backpropped before sys is detached,
+    is the only gradient signal that reaches SystemLevelBlock and sys_pos —
+    it trains sys to encode information that actually improves predictions.
+
+    Returns (sys_emb, warmup_loss).  warmup_loss is None when criterion is None.
     """
     B = frames[0].shape[0]
     device = frames[0].device
     sys = model.init_sys_emb(B, device)
 
     T = min(n_warmup, len(frames) - 1)
+    warmup_loss: Optional[torch.Tensor] = None
+
     for t in range(T):
-        x_t = frames[t]
+        x_t    = frames[t]
         x_next = frames[t + 1]
 
-        # First pass: encode current frame, update sys (no residual yet)
+        # First pass: predict next frame, update sys (no residual yet)
         pred, sys, _ = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
                              pixel_mask=pixel_mask)
         if pixel_mask is not None:
             pred = pred * pixel_mask
 
-        # Compute prediction error
-        err = (x_next - pred).detach()  # detach error from pred graph — we only
-                                         # want the residual to inform sys, not
-                                         # backprop through the error itself here
+        if criterion is not None:
+            step_loss = criterion(pred, x_next)
+            warmup_loss = step_loss if warmup_loss is None else warmup_loss + step_loss
+
+        err = (x_next - pred).detach()
 
         # Second pass: refine sys using the residual signal
         _, sys, _ = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
                           pixel_mask=pixel_mask)
 
-    return sys
+    if warmup_loss is not None and T > 0:
+        warmup_loss = warmup_loss / T   # average over warmup steps
+
+    return sys, warmup_loss
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +144,7 @@ def train_step(
 
     # Warmup uses frames[0 .. nw-1] to build sys
     warmup_frames = frames[:nw + 1]
-    sys = warmup_system(model, warmup_frames, nw)
+    sys, _ = warmup_system(model, warmup_frames, nw)
 
     # Training pass: freeze sys within this forward call, predict frame nw+1
     x_in = frames[nw]
@@ -207,7 +218,7 @@ class HFMTrainer:
         Returns predicted [B, C, H, W].
         """
         self.model.eval()
-        sys = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
+        sys, _ = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
         pred, _, _ = self.model(x, sys_emb=sys, freeze_sys=True)
         return pred
 
@@ -239,6 +250,7 @@ def train_step_gan(
     criterion: nn.Module,
     n_warmup: Optional[int] = None,
     adv_weight: float = 0.1,
+    warmup_loss_weight: float = 0.5,
     clip_grad: float = 1.0,
     pixel_mask: Optional[torch.Tensor] = None,
     gan_active: bool = True,
@@ -259,18 +271,30 @@ def train_step_gan(
 
     When gan_active=False:
       - Pure reconstruction step; discriminator is not called.
+
+    warmup_loss_weight: weight applied to the warmup prediction loss before
+      backpropping.  This is the only gradient path into SystemLevelBlock and
+      sys_pos, which are unreachable from the training loss (freeze_sys=True
+      detaches sys inside model.forward).  Set to 0.0 to disable.
     """
     nw: int = n_warmup if n_warmup is not None else model.cfg.n_warmup_frames
 
     gen_optimizer.zero_grad()
     disc_optimizer.zero_grad()
 
-    # Build sys from warmup, then immediately detach to release the warmup
-    # computation graphs.  freeze_sys=True in the training forward detaches sys
-    # again internally, so the warmup graph is never reachable from the training
-    # loss anyway — keeping it alive only wastes activation memory.
+    # Build sys from warmup.  Pass criterion so warmup_system accumulates a
+    # prediction loss — backpropping it here (before sys is detached) is the
+    # only gradient path that reaches SystemLevelBlock and sys_pos.
     warmup_frames = frames[:nw + 1]
-    sys = warmup_system(model, warmup_frames, nw, pixel_mask)
+    sys, warmup_loss = warmup_system(model, warmup_frames, nw, pixel_mask,
+                                     criterion=criterion)
+    if (warmup_loss_weight > 0.0 and warmup_loss is not None
+            and torch.isfinite(warmup_loss)):
+        (warmup_loss_weight * warmup_loss).backward()
+
+    # Detach to release the warmup computation graphs.  The training loss can
+    # never reach them anyway (freeze_sys=True detaches sys inside forward), so
+    # keeping them alive only wastes activation memory.
     sys = [s.detach() for s in sys]
 
     x_in     = frames[nw]
@@ -489,7 +513,7 @@ class GANTrainer:
         x: torch.Tensor,
     ) -> torch.Tensor:
         self.model.eval()
-        sys = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
+        sys, _ = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
         pred, _, _ = self.model(x, sys_emb=sys, freeze_sys=True)
         return pred
 
