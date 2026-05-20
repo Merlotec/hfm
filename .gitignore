@@ -49,3 +49,5 @@ lightning_logs
 data
 checkpoints*
 out
+
+.claude

@@ -12,6 +12,7 @@ The input should be 4 channels of a 256x256 image representing the fluid.
     - Each residual layer has local attention over only residual layer patches and to the local system embeddings.
     - Each feature map token has full attention over all other feature map embeddings, all other system embeddings and over the patches in its region.
     - The system embedding tokens have attention oveer all other system embeddings, feature map embeddings, and local residual patches. Although these values can only be changed if the residual layer is in the system. 
+  - At the end of the network we have a Generative Adversarial Network (GAN) discriminator. Its job is to predict whether the output is real or fake and adapt accordingly. This exists to ensure that the output of the model actually produces something that is reasonable. Both the final decoded frame and the the higher level feature tokens should be included (but the feature tokens should not have their values fixed - they should not be updated directly here).
 
 The training loop works as follows:
 

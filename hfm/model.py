@@ -717,7 +717,7 @@ class HFM(nn.Module):
         resid: Optional[torch.Tensor] = None,
         freeze_sys: bool = False,
         pixel_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         pixel_mask : (1, 1, H, W) bool — True for fluid pixels.
             A patch is kept if it contains at least one fluid pixel.
@@ -786,4 +786,4 @@ class HFM(nn.Module):
         # ---- decode patches → prediction ----
         pred = self.decoder(patches)                        # [B, C, H, W]
 
-        return pred, sys
+        return pred, sys, feat

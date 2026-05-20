@@ -26,10 +26,12 @@ produced by earlier graph nodes so gradients do flow back into the warmup.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .model import HFM
+from .discriminator import HFMDiscriminator
 from .config import HFMConfig
 
 
@@ -87,8 +89,8 @@ def warmup_system(
         x_next = frames[t + 1]
 
         # First pass: encode current frame, update sys (no residual yet)
-        pred, sys = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
-                          pixel_mask=pixel_mask)
+        pred, sys, _ = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
+                             pixel_mask=pixel_mask)
         if pixel_mask is not None:
             pred = pred * pixel_mask
 
@@ -98,8 +100,8 @@ def warmup_system(
                                          # backprop through the error itself here
 
         # Second pass: refine sys using the residual signal
-        _, sys = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
-                       pixel_mask=pixel_mask)
+        _, sys, _ = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
+                          pixel_mask=pixel_mask)
 
     return sys
 
@@ -135,7 +137,7 @@ def train_step(
     # Training pass: freeze sys within this forward call, predict frame nw+1
     x_in = frames[nw]
     x_target = frames[nw + 1]
-    pred, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True)
+    pred, _, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True)
     if pixel_mask is not None:
         pred = pred * pixel_mask
 
@@ -205,7 +207,7 @@ class HFMTrainer:
         """
         self.model.eval()
         sys = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
-        pred, _ = self.model(x, sys_emb=sys, freeze_sys=True)
+        pred, _, _ = self.model(x, sys_emb=sys, freeze_sys=True)
         return pred
 
     def save(self, path: str):
@@ -221,3 +223,268 @@ class HFMTrainer:
         self.model.load_state_dict(ckpt['model'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
+
+
+# ---------------------------------------------------------------------------
+# GAN training step
+# ---------------------------------------------------------------------------
+
+def train_step_gan(
+    model: HFM,
+    discriminator: HFMDiscriminator,
+    frames: List[torch.Tensor],
+    gen_optimizer: optim.Optimizer,
+    disc_optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    n_warmup: Optional[int] = None,
+    adv_weight: float = 0.1,
+    clip_grad: float = 1.0,
+    pixel_mask: Optional[torch.Tensor] = None,
+    gan_active: bool = True,
+    disc_update_threshold: float = 0.3,
+) -> Tuple[float, float]:
+    """
+    One training step, with optional GAN.
+
+    Returns (recon_loss, disc_loss).  disc_loss is 0.0 when gan_active=False.
+
+    When gan_active=True:
+      - Discriminator step: real vs fake with feat/sys as conditioning context;
+        update is skipped when d_loss <= disc_update_threshold (prevents the
+        discriminator from over-specialising once it already separates well).
+      - Generator step: non-saturating adversarial loss + reconstruction.
+        Feature and system tokens flow gradients freely — the discriminator
+        imposes no direct value targets, only real/fake classification signal.
+
+    When gan_active=False:
+      - Pure reconstruction step; discriminator is not called.
+    """
+    nw: int = n_warmup if n_warmup is not None else model.cfg.n_warmup_frames
+
+    gen_optimizer.zero_grad()
+    disc_optimizer.zero_grad()
+
+    # Warmup (keeps graph alive for later backward through transformer params)
+    warmup_frames = frames[:nw + 1]
+    sys = warmup_system(model, warmup_frames, nw, pixel_mask)
+
+    x_in     = frames[nw]
+    x_target = frames[nw + 1]
+
+    pred, _, feat = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
+                          pixel_mask=pixel_mask)
+    if pixel_mask is not None:
+        pred = pred * pixel_mask
+
+    if not gan_active:
+        recon_loss = criterion(pred, x_target)
+        recon_loss.backward()
+        if clip_grad > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        gen_optimizer.step()
+        return recon_loss.item(), 0.0
+
+    # Detached context: same conditioning for real and fake discriminator calls.
+    # Detaching here keeps the D-step backward isolated from the generator graph.
+    feat_ctx = [f.detach() for f in feat]
+    sys_ctx  = [s.detach() for s in sys]
+
+    # === Discriminator update ===
+    for p in discriminator.parameters():
+        p.requires_grad_(True)
+
+    real_logit = discriminator(x_target,      feat_ctx, sys_ctx)
+    fake_logit = discriminator(pred.detach(), feat_ctx, sys_ctx)
+
+    real_labels = torch.full_like(real_logit, 0.9)   # one-sided label smoothing
+    fake_labels = torch.zeros_like(fake_logit)
+
+    d_loss = (F.binary_cross_entropy_with_logits(real_logit, real_labels) +
+              F.binary_cross_entropy_with_logits(fake_logit, fake_labels))
+    d_loss_val = d_loss.item()
+
+    # Gate: skip the discriminator update when it is already separating well,
+    # to prevent it from memorising training samples and stalling the generator.
+    if d_loss_val > disc_update_threshold:
+        d_loss.backward()
+        disc_optimizer.step()
+    disc_optimizer.zero_grad()
+
+    # === Generator update ===
+    for p in discriminator.parameters():
+        p.requires_grad_(False)
+
+    recon_loss = criterion(pred, x_target)
+
+    adv_logit = discriminator(pred, feat, sys)
+    adv_loss  = F.binary_cross_entropy_with_logits(
+        adv_logit, torch.ones_like(adv_logit)
+    )
+
+    total_loss = recon_loss + adv_weight * adv_loss
+    total_loss.backward()
+
+    if clip_grad > 0:
+        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
+    gen_optimizer.step()
+
+    for p in discriminator.parameters():
+        p.requires_grad_(True)
+
+    return recon_loss.item(), d_loss_val
+
+
+# ---------------------------------------------------------------------------
+# GAN Trainer class
+# ---------------------------------------------------------------------------
+
+class GANTrainer:
+    """
+    Two-stage training wrapper that pairs HFM with an HFMDiscriminator.
+
+    Stage 1 — reconstruction + warmup curriculum (no GAN)
+    ------------------------------------------------------
+    n_warmup ramps linearly from 1 → cfg.n_warmup_frames over
+    warmup_ramp_steps steps.  Starting at n_warmup=1 means early training
+    resembles pure supervised prediction (sys ≈ zeros), and the warmup
+    mechanism is introduced gradually as the model stabilises.
+
+    Stage 2 — GAN active  (begins at gan_start_step)
+    -------------------------------------------------
+    adv_weight ramps from 0 → cfg.disc_adv_weight over gan_ramp_steps steps.
+    The discriminator update is skipped whenever d_loss <= disc_update_threshold
+    to prevent it from over-specialising and stalling the generator gradient.
+
+    Usage
+    -----
+    trainer = GANTrainer(cfg)
+    trainer.to(device)
+    for frame_batch in dataloader:          # [T, B, C, H, W]
+        frames = [frame_batch[t] for t in range(T)]
+        recon_loss, disc_loss = trainer.step(frames)
+        print(trainer.training_info())
+    """
+
+    def __init__(
+        self,
+        cfg: HFMConfig,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-5,
+        l1_weight: float = 0.1,
+        warmup_ramp_steps: int = 5_000,
+        gan_start_step: int = 10_000,
+        gan_ramp_steps: int = 1_000,
+        disc_update_threshold: float = 0.3,
+    ):
+        self.cfg = cfg
+        self.model = HFM(cfg)
+        self.discriminator = HFMDiscriminator(cfg)
+        self.criterion = FluidLoss(l1_weight)
+
+        self.gen_optimizer = optim.AdamW(
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        self.disc_optimizer = optim.Adam(
+            self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999)
+        )
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.gen_optimizer, T_max=10_000
+        )
+
+        self.warmup_ramp_steps    = warmup_ramp_steps
+        self.gan_start_step       = gan_start_step
+        self.gan_ramp_steps       = gan_ramp_steps
+        self.disc_update_threshold = disc_update_threshold
+        self.global_step          = 0
+
+    # ---- curriculum helpers ----
+
+    def _current_n_warmup(self) -> int:
+        max_nw = self.cfg.n_warmup_frames
+        if self.warmup_ramp_steps <= 0 or self.global_step >= self.warmup_ramp_steps:
+            return max_nw
+        frac = self.global_step / self.warmup_ramp_steps
+        return max(1, round(1 + (max_nw - 1) * frac))
+
+    def _current_adv_weight(self) -> float:
+        if self.global_step < self.gan_start_step:
+            return 0.0
+        steps_in = self.global_step - self.gan_start_step
+        ramp = min(1.0, steps_in / max(1, self.gan_ramp_steps))
+        return self.cfg.disc_adv_weight * ramp
+
+    # ---- public API ----
+
+    def to(self, device: torch.device) -> "GANTrainer":
+        self.model         = self.model.to(device)
+        self.discriminator = self.discriminator.to(device)
+        self.criterion     = self.criterion.to(device)
+        return self
+
+    def step(
+        self,
+        frames: List[torch.Tensor],
+        pixel_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[float, float]:
+        """frames: list of T tensors each [B, C, H, W].  Returns (recon_loss, disc_loss)."""
+        self.model.train()
+        self.discriminator.train()
+
+        adv_weight = self._current_adv_weight()
+
+        recon_loss, disc_loss = train_step_gan(
+            self.model, self.discriminator, frames,
+            self.gen_optimizer, self.disc_optimizer,
+            self.criterion,
+            n_warmup=self._current_n_warmup(),
+            adv_weight=adv_weight,
+            pixel_mask=pixel_mask,
+            gan_active=(adv_weight > 0.0),
+            disc_update_threshold=self.disc_update_threshold,
+        )
+
+        self.scheduler.step()
+        self.global_step += 1
+        return recon_loss, disc_loss
+
+    def training_info(self) -> dict:
+        """Current curriculum state — log this alongside losses."""
+        adv_weight = self._current_adv_weight()
+        return {
+            'global_step': self.global_step,
+            'n_warmup':    self._current_n_warmup(),
+            'adv_weight':  adv_weight,
+            'gan_active':  adv_weight > 0.0,
+        }
+
+    @torch.no_grad()
+    def predict(
+        self,
+        warmup_frames: List[torch.Tensor],
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        self.model.eval()
+        sys = warmup_system(self.model, warmup_frames, len(warmup_frames) - 1)
+        pred, _, _ = self.model(x, sys_emb=sys, freeze_sys=True)
+        return pred
+
+    def save(self, path: str):
+        torch.save({
+            'model':         self.model.state_dict(),
+            'discriminator': self.discriminator.state_dict(),
+            'gen_optimizer': self.gen_optimizer.state_dict(),
+            'disc_optimizer':self.disc_optimizer.state_dict(),
+            'scheduler':     self.scheduler.state_dict(),
+            'cfg':           self.cfg,
+            'global_step':   self.global_step,
+        }, path)
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location='cpu')
+        self.model.load_state_dict(ckpt['model'])
+        self.discriminator.load_state_dict(ckpt['discriminator'])
+        self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
+        self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
+        self.scheduler.load_state_dict(ckpt['scheduler'])
+        self.global_step = ckpt.get('global_step', 0)
