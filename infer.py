@@ -215,12 +215,12 @@ def main():
         B   = 1
         sys = model.init_sys_emb(B, device)
         for t in range(n_warmup):
-            pred_t, sys = model(frames_gt[t], sys_emb=sys, resid=None,
-                                pixel_mask=pixel_mask)
+            pred_t, sys, _ = model(frames_gt[t], sys_emb=sys, resid=None,
+                                   pixel_mask=pixel_mask)
             pred_t = pred_t * pixel_mask
             err_t = (frames_gt[t + 1] - pred_t)
-            _, sys = model(frames_gt[t], sys_emb=sys, resid=err_t,
-                           pixel_mask=pixel_mask)
+            _, sys, _ = model(frames_gt[t], sys_emb=sys, resid=err_t,
+                              pixel_mask=pixel_mask)
         sys_norm = sum(s.norm().item() for s in sys) / len(sys)
         print(f'  sys_emb norm after warmup: {sys_norm:.4f}')
 
@@ -232,8 +232,8 @@ def main():
 
     with torch.no_grad():
         for t in range(args.n_predict):
-            pred, _ = model(x, sys_emb=sys, resid=None, freeze_sys=True,
-                            pixel_mask=pixel_mask)
+            pred, _, _ = model(x, sys_emb=sys, resid=None, freeze_sys=True,
+                               pixel_mask=pixel_mask)
             pred = pred * pixel_mask
             preds.append(pred.cpu())
             gt.append(frames_gt[n_warmup + t].cpu())
