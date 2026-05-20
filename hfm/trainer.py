@@ -282,20 +282,37 @@ def train_step_gan(
     gen_optimizer.zero_grad()
     disc_optimizer.zero_grad()
 
-    # Build sys from warmup.  Pass criterion so warmup_system accumulates a
-    # prediction loss — backpropping it here (before sys is detached) is the
-    # only gradient path that reaches SystemLevelBlock and sys_pos.
-    warmup_frames = frames[:nw + 1]
-    sys, warmup_loss = warmup_system(model, warmup_frames, nw, pixel_mask,
-                                     criterion=criterion)
-    if (warmup_loss_weight > 0.0 and warmup_loss is not None
-            and torch.isfinite(warmup_loss)):
-        (warmup_loss_weight * warmup_loss).backward()
+    # Warmup with truncated BPTT depth=1: backward each step's prediction loss
+    # immediately and detach sys before the next step.  This bounds peak graph
+    # memory to ONE forward pass (vs 2*nw with a single accumulated backward)
+    # while still routing gradients into SystemLevelBlock and sys_pos — the only
+    # path that can train them (training forward uses freeze_sys=True).
+    # Each step_loss.backward() accumulates into the gradient buffer; the single
+    # gen_optimizer.step() at the end applies warmup + training gradients together.
+    B      = frames[0].shape[0]
+    device = frames[0].device
+    sys    = model.init_sys_emb(B, device)
 
-    # Detach to release the warmup computation graphs.  The training loss can
-    # never reach them anyway (freeze_sys=True detaches sys inside forward), so
-    # keeping them alive only wastes activation memory.
-    sys = [s.detach() for s in sys]
+    for t in range(nw):
+        x_t    = frames[t]
+        x_next = frames[t + 1]
+
+        pred_t, sys, _ = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
+                               pixel_mask=pixel_mask)
+        if pixel_mask is not None:
+            pred_t = pred_t * pixel_mask
+
+        if warmup_loss_weight > 0.0:
+            step_loss = criterion(pred_t, x_next)
+            if torch.isfinite(step_loss):
+                (warmup_loss_weight * step_loss / nw).backward()
+
+        sys = [s.detach() for s in sys]
+        err = (x_next - pred_t).detach()
+
+        _, sys, _ = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
+                          pixel_mask=pixel_mask)
+        sys = [s.detach() for s in sys]
 
     x_in     = frames[nw]
     x_target = frames[nw + 1]
