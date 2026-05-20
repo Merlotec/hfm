@@ -136,6 +136,7 @@ def main():
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
+        pixel_mask            = pixel_mask,
     )
     trainer.to(device)
 

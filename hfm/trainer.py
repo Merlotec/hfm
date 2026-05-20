@@ -441,11 +441,12 @@ class GANTrainer:
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 1_000,
         disc_update_threshold: float = 0.3,
+        pixel_mask: Optional[torch.Tensor] = None,
     ):
         self.cfg = cfg
         self.model = HFM(cfg)
         self.discriminator = HFMDiscriminator(cfg)
-        self.criterion = FluidLoss(l1_weight)
+        self.criterion = FluidLoss(l1_weight, pixel_mask=pixel_mask)
 
         self.gen_optimizer = optim.AdamW(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
