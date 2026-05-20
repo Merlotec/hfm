@@ -24,6 +24,7 @@ forward pass (they don't change further), but the tensors themselves were
 produced by earlier graph nodes so gradients do flow back into the warmup.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -276,8 +277,17 @@ def train_step_gan(
     if pixel_mask is not None:
         pred = pred * pixel_mask
 
+    def _zero_and_restore() -> None:
+        gen_optimizer.zero_grad()
+        disc_optimizer.zero_grad()
+        for p in discriminator.parameters():
+            p.requires_grad_(True)
+
     if not gan_active:
         recon_loss = criterion(pred, x_target)
+        if not torch.isfinite(recon_loss):
+            _zero_and_restore()
+            return float('nan'), 0.0
         recon_loss.backward()
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
@@ -303,10 +313,16 @@ def train_step_gan(
               F.binary_cross_entropy_with_logits(fake_logit, fake_labels))
     d_loss_val = d_loss.item()
 
+    if not math.isfinite(d_loss_val):
+        _zero_and_restore()
+        return float('nan'), float('nan')
+
     # Gate: skip the discriminator update when it is already separating well,
     # to prevent it from memorising training samples and stalling the generator.
     if d_loss_val > disc_update_threshold:
         d_loss.backward()
+        if clip_grad > 0:
+            nn.utils.clip_grad_norm_(discriminator.parameters(), clip_grad)
         disc_optimizer.step()
     disc_optimizer.zero_grad()
 
@@ -322,6 +338,10 @@ def train_step_gan(
     )
 
     total_loss = recon_loss + adv_weight * adv_loss
+    if not torch.isfinite(total_loss):
+        _zero_and_restore()
+        return float('nan'), d_loss_val
+
     total_loss.backward()
 
     if clip_grad > 0:
