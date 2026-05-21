@@ -95,8 +95,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
     parser.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR,
                         help='Dataset directory containing simulation subdirs')
-    parser.add_argument('--resume',     type=Path, default=None,
-                        help='GANTrainer checkpoint to resume from')
+    parser.add_argument('--resume',     type=str, default=None, nargs='?', const='latest',
+                        help='Checkpoint to resume from. Omit value to pick the latest train_step checkpoint.')
     parser.add_argument('--epochs',     type=int,  default=None,
                         help='Override n_epochs from hyperparams.json')
     parser.add_argument('--log-every',  type=int,  default=50,
@@ -140,6 +140,13 @@ def main():
     )
     trainer.to(device)
 
+    if args.resume == 'latest':
+        candidates = sorted(CKPT_DIR.glob('train_step*.pt'))
+        if not candidates:
+            print(f'No train_step checkpoints found in {CKPT_DIR}')
+            sys.exit(1)
+        args.resume = str(candidates[-1])
+        print(f'Auto-selected checkpoint: {candidates[-1].name}')
     if args.resume:
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
