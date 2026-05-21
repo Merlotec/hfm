@@ -282,6 +282,9 @@ def train_step_gan(
     gen_optimizer.zero_grad()
     disc_optimizer.zero_grad()
 
+    device_type = frames[0].device.type
+    amp = device_type == 'cuda'
+
     # Warmup with truncated BPTT depth=1: backward each step's prediction loss
     # immediately and detach sys before the next step.  This bounds peak graph
     # memory to ONE forward pass (vs 2*nw with a single accumulated backward)
@@ -297,10 +300,11 @@ def train_step_gan(
         x_t    = frames[t]
         x_next = frames[t + 1]
 
-        pred_t, sys, _ = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
-                               pixel_mask=pixel_mask)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+            pred_t, sys, _ = model(x_t, sys_emb=sys, resid=None, freeze_sys=False,
+                                   pixel_mask=pixel_mask)
         if pixel_mask is not None:
-            pred_t = pred_t * pixel_mask
+            pred_t = pred_t.float() * pixel_mask
 
         if warmup_loss_weight > 0.0:
             step_loss = criterion(pred_t, x_next)
@@ -310,17 +314,19 @@ def train_step_gan(
         sys = [s.detach() for s in sys]
         err = (x_next - pred_t).detach()
 
-        _, sys, _ = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
-                          pixel_mask=pixel_mask)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+            _, sys, _ = model(x_t, sys_emb=sys, resid=err, freeze_sys=False,
+                              pixel_mask=pixel_mask)
         sys = [s.detach() for s in sys]
 
     x_in     = frames[nw]
     x_target = frames[nw + 1]
 
-    pred, _, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
-                       pixel_mask=pixel_mask)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+        pred, _, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
+                           pixel_mask=pixel_mask)
     if pixel_mask is not None:
-        pred = pred * pixel_mask
+        pred = pred.float() * pixel_mask
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
@@ -345,8 +351,9 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(True)
 
-    real_logit = discriminator(x_target,      x_in, sys_ctx)
-    fake_logit = discriminator(pred.detach(), x_in, sys_ctx)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+        real_logit = discriminator(x_target,      x_in, sys_ctx)
+        fake_logit = discriminator(pred.detach(), x_in, sys_ctx)
 
     real_labels = torch.full_like(real_logit, 0.9)
     fake_labels = torch.zeros_like(fake_logit)
@@ -374,7 +381,8 @@ def train_step_gan(
 
     recon_loss = criterion(pred, x_target)
 
-    adv_logit = discriminator(pred, x_in, sys)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+        adv_logit = discriminator(pred, x_in, sys)
     adv_loss  = F.binary_cross_entropy_with_logits(
         adv_logit, torch.ones_like(adv_logit)
     )

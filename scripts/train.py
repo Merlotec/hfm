@@ -74,7 +74,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         mlp_ratio            = m['mlp_ratio'],
         dropout              = m['dropout'],
         n_warmup_frames      = t['n_warmup_frames'],
-        gradient_checkpointing = True,
+        gradient_checkpointing = False,
     )
     return cfg, t
 
@@ -139,6 +139,11 @@ def main():
         pixel_mask            = pixel_mask,
     )
     trainer.to(device)
+
+    if device.type == 'cuda':
+        trainer.model         = torch.compile(trainer.model)
+        trainer.discriminator = torch.compile(trainer.discriminator)
+        print('torch.compile enabled')
 
     if args.resume == 'latest':
         candidates = sorted(CKPT_DIR.glob('train_step*.pt'))
