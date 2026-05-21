@@ -178,9 +178,10 @@ def main():
     ckpt  = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     cfg   = ckpt['cfg']
     model = HFM(cfg).to(device)
-    model.load_state_dict(ckpt['model_state'])
+    model.load_state_dict(ckpt.get('model_state', ckpt.get('model')))
     model.eval()
-    print(f'  stage={ckpt["stage"]}  step={ckpt["step"]}  loss={ckpt["loss"]:.5f}')
+    step = ckpt.get('step', ckpt.get('global_step', '?'))
+    print(f'  step={step}')
 
     n_warmup = args.n_warmup if args.n_warmup is not None else cfg.n_warmup_frames
 
