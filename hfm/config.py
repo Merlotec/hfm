@@ -42,7 +42,7 @@ class HFMConfig:
 
     # --- GAN discriminator ---
     disc_dim: int = 128          # hidden dim for token projection branches
-    disc_adv_weight: float = 0.1  # adversarial loss weight relative to reconstruction
+    disc_adv_weight: float = 0.02  # adversarial loss weight relative to reconstruction
     disc_lr: float = 4e-4         # discriminator learning rate
 
     @property
