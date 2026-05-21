@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch._dynamo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -106,8 +105,6 @@ def main():
                         help='Save a mid-epoch checkpoint every N steps')
     args = parser.parse_args()
 
-    torch._dynamo.config.verbose = True
-
     device = get_device()
     print(f'Device: {device}')
 
@@ -154,10 +151,6 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
-    if device.type == 'cuda':
-        trainer.model         = torch.compile(trainer.model,         dynamic=True, mode='reduce-overhead')
-        trainer.discriminator = torch.compile(trainer.discriminator, dynamic=True, mode='reduce-overhead')
-        print('torch.compile enabled')
 
     n_gen  = sum(p.numel() for p in trainer.model.parameters())         / 1e6
     n_disc = sum(p.numel() for p in trainer.discriminator.parameters()) / 1e6
