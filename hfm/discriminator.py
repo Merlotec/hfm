@@ -9,6 +9,7 @@ only supervision signal is the binary real/fake classification.
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 from typing import List
 
 from .config import HFMConfig
@@ -23,15 +24,15 @@ class _FrameBranch(nn.Module):
         layers: list = []
         for i in range(len(channels) - 1):
             layers.append(
-                nn.Conv2d(channels[i], channels[i + 1], 4, stride=2, padding=1,
-                          bias=(i == 0))
+                spectral_norm(nn.Conv2d(channels[i], channels[i + 1], 4, stride=2, padding=1,
+                                        bias=(i == 0)))
             )
             if i > 0:
                 layers.append(nn.InstanceNorm2d(channels[i + 1], affine=True))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
         self.conv = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(512, out_dim)
+        self.proj = spectral_norm(nn.Linear(512, out_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.pool(self.conv(x)).flatten(1))   # [B, out_dim]
@@ -64,22 +65,22 @@ class HFMDiscriminator(nn.Module):
 
         # GAP + project each hierarchy level to a common dim
         self.feat_projs = nn.ModuleList([
-            nn.Linear(d_feat, d) for d_feat in cfg.d_feat
+            spectral_norm(nn.Linear(d_feat, d)) for d_feat in cfg.d_feat
         ])
         self.sys_projs = nn.ModuleList([
-            nn.Linear(d_sys, d) for d_sys in cfg.d_sys
+            spectral_norm(nn.Linear(d_sys, d)) for d_sys in cfg.d_sys
         ])
 
         n = cfg.n_levels
         fuse_dim = d * (1 + n + n)   # frame + all feat levels + all sys levels
 
         self.head = nn.Sequential(
-            nn.Linear(fuse_dim, d * 2),
+            spectral_norm(nn.Linear(fuse_dim, d * 2)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(d * 2, d),
+            spectral_norm(nn.Linear(d * 2, d)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(d, 1),
+            spectral_norm(nn.Linear(d, 1)),
         )
 
         self._init_weights()
