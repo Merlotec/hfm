@@ -231,7 +231,7 @@ class HFMTrainer:
         }, path)
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location='cpu')
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(ckpt['model'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
@@ -547,7 +547,7 @@ class GANTrainer:
         }, path)
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location='cpu')
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(ckpt['model'])
         self.discriminator.load_state_dict(ckpt['discriminator'])
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
