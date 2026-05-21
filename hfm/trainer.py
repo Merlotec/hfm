@@ -551,13 +551,20 @@ class GANTrainer:
         self.model.load_state_dict(ckpt['model'])
 
         # Remap pre-spectral-norm checkpoints: 'weight' → 'weight_orig'.
+        # Only rename keys where the new model actually has weight_orig (i.e.
+        # spectral-norm-wrapped layers).  Plain layers like InstanceNorm2d also
+        # have a 'weight' parameter that must keep its original key name.
         # weight_u / weight_v are absent in old checkpoints but are regenerated
         # by power iteration on the first forward pass, so strict=False is safe.
         disc_state = ckpt['discriminator']
-        remapped = {
-            (k[:-7] + '.weight_orig' if k.endswith('.weight') else k): v
-            for k, v in disc_state.items()
-        }
+        new_keys = set(self.discriminator.state_dict().keys())
+        remapped = {}
+        for k, v in disc_state.items():
+            if k.endswith('.weight'):
+                new_key = k[:-7] + '.weight_orig'
+                remapped[new_key if new_key in new_keys else k] = v
+            else:
+                remapped[k] = v
         missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
         non_uv_missing = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
         if non_uv_missing:
