@@ -140,11 +140,6 @@ def main():
     )
     trainer.to(device)
 
-    if device.type == 'cuda':
-        trainer.model         = torch.compile(trainer.model)
-        trainer.discriminator = torch.compile(trainer.discriminator)
-        print('torch.compile enabled')
-
     if args.resume == 'latest':
         candidates = sorted(CKPT_DIR.glob('train_step*.pt'))
         if not candidates:
@@ -155,6 +150,11 @@ def main():
     if args.resume:
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
+
+    if device.type == 'cuda':
+        trainer.model         = torch.compile(trainer.model)
+        trainer.discriminator = torch.compile(trainer.discriminator)
+        print('torch.compile enabled')
 
     n_gen  = sum(p.numel() for p in trainer.model.parameters())         / 1e6
     n_disc = sum(p.numel() for p in trainer.discriminator.parameters()) / 1e6
