@@ -560,6 +560,7 @@ class GANTrainer:
                 remapped[new_key if new_key in new_keys else k] = v
             else:
                 remapped[k] = v
+        disc_ok = True
         try:
             missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
             non_uv_missing = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
@@ -569,8 +570,12 @@ class GANTrainer:
                 print(f'  [warn] discriminator unexpected keys: {unexpected}')
         except RuntimeError as e:
             print(f'  [warn] discriminator checkpoint incompatible ({e}); reinitialising from scratch')
+            disc_ok = False
 
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
-        self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
+        if disc_ok:
+            self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
+        else:
+            print('  [warn] disc_optimizer reinitialised (discriminator architecture changed)')
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.global_step = ckpt.get('global_step', 0)
