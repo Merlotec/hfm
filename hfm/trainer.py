@@ -362,9 +362,9 @@ def train_step_gan(
         _zero_and_restore()
         return float('nan'), float('nan')
 
-    # Gate: skip the discriminator update when it is already separating well,
-    # to prevent it from memorising training samples and stalling the generator.
-    if d_loss_val > disc_update_threshold:
+    # Gate: skip update when disc is too good (loss too low, would stall generator)
+    # OR too confused (loss too high, diverging — updates would make it worse).
+    if disc_update_threshold < d_loss_val < 2.0:
         d_loss.backward()
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(discriminator.parameters(), clip_grad)
