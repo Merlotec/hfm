@@ -549,7 +549,22 @@ class GANTrainer:
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(ckpt['model'])
-        self.discriminator.load_state_dict(ckpt['discriminator'])
+
+        # Remap pre-spectral-norm checkpoints: 'weight' → 'weight_orig'.
+        # weight_u / weight_v are absent in old checkpoints but are regenerated
+        # by power iteration on the first forward pass, so strict=False is safe.
+        disc_state = ckpt['discriminator']
+        remapped = {
+            (k[:-7] + '.weight_orig' if k.endswith('.weight') else k): v
+            for k, v in disc_state.items()
+        }
+        missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
+        non_uv_missing = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
+        if non_uv_missing:
+            print(f'  [warn] discriminator missing keys: {non_uv_missing}')
+        if unexpected:
+            print(f'  [warn] discriminator unexpected keys: {unexpected}')
+
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
         self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
