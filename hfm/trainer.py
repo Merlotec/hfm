@@ -547,12 +547,10 @@ class GANTrainer:
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(ckpt['model'])
 
-        # Remap pre-spectral-norm checkpoints: 'weight' → 'weight_orig'.
-        # Only rename keys where the new model actually has weight_orig (i.e.
-        # spectral-norm-wrapped layers).  Plain layers like InstanceNorm2d also
-        # have a 'weight' parameter that must keep its original key name.
-        # weight_u / weight_v are absent in old checkpoints but are regenerated
-        # by power iteration on the first forward pass, so strict=False is safe.
+        # Load discriminator with compatibility handling:
+        #   - remap 'weight' → 'weight_orig' for spectral-norm-wrapped layers
+        #   - weight_u/v are regenerated on first forward pass (strict=False)
+        #   - if architecture changed (size mismatch), reinitialise from scratch
         disc_state = ckpt['discriminator']
         new_keys = set(self.discriminator.state_dict().keys())
         remapped = {}
@@ -562,12 +560,15 @@ class GANTrainer:
                 remapped[new_key if new_key in new_keys else k] = v
             else:
                 remapped[k] = v
-        missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
-        non_uv_missing = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
-        if non_uv_missing:
-            print(f'  [warn] discriminator missing keys: {non_uv_missing}')
-        if unexpected:
-            print(f'  [warn] discriminator unexpected keys: {unexpected}')
+        try:
+            missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
+            non_uv_missing = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
+            if non_uv_missing:
+                print(f'  [warn] discriminator missing keys: {non_uv_missing}')
+            if unexpected:
+                print(f'  [warn] discriminator unexpected keys: {unexpected}')
+        except RuntimeError as e:
+            print(f'  [warn] discriminator checkpoint incompatible ({e}); reinitialising from scratch')
 
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
         self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
