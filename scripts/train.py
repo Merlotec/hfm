@@ -105,6 +105,8 @@ def main():
                         help='Save a mid-epoch checkpoint every N steps')
     args = parser.parse_args()
 
+    torch._dynamo.config.verbose = True
+
     device = get_device()
     print(f'Device: {device}')
 
@@ -152,8 +154,8 @@ def main():
         trainer.load(str(args.resume))
 
     if device.type == 'cuda':
-        trainer.model         = torch.compile(trainer.model)
-        trainer.discriminator = torch.compile(trainer.discriminator)
+        trainer.model         = torch.compile(trainer.model,         dynamic=True, mode='reduce-overhead')
+        trainer.discriminator = torch.compile(trainer.discriminator, dynamic=True, mode='reduce-overhead')
         print('torch.compile enabled')
 
     n_gen  = sum(p.numel() for p in trainer.model.parameters())         / 1e6
