@@ -43,7 +43,7 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 
 WARMUP_RAMP_STEPS     = 0       # 0 = always use cfg.n_warmup_frames (no ramp)
 GAN_START_STEP        = 10_000  # step at which adversarial loss switches on
-GAN_RAMP_STEPS        = 5_000   # adv_weight ramps 0 → disc_adv_weight over this
+GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
 DISC_UPDATE_THRESHOLD = 0.3     # skip disc update when d_loss <= this
 
 # ---------------------------------------------------------------------------
