@@ -317,8 +317,8 @@ def train_step_gan(
     x_in     = frames[nw]
     x_target = frames[nw + 1]
 
-    pred, _, feat = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
-                          pixel_mask=pixel_mask)
+    pred, _, _ = model(x_in, sys_emb=sys, resid=None, freeze_sys=True,
+                       pixel_mask=pixel_mask)
     if pixel_mask is not None:
         pred = pred * pixel_mask
 
@@ -339,17 +339,14 @@ def train_step_gan(
         gen_optimizer.step()
         return recon_loss.item(), 0.0
 
-    # Detached context: same conditioning for real and fake discriminator calls.
-    # Detaching here keeps the D-step backward isolated from the generator graph.
-    feat_ctx = [f.detach() for f in feat]
-    sys_ctx  = [s.detach() for s in sys]
+    sys_ctx = [s.detach() for s in sys]
 
     # === Discriminator update ===
     for p in discriminator.parameters():
         p.requires_grad_(True)
 
-    real_logit = discriminator(x_target,      feat_ctx, sys_ctx)
-    fake_logit = discriminator(pred.detach(), feat_ctx, sys_ctx)
+    real_logit = discriminator(x_target,      x_in, sys_ctx)
+    fake_logit = discriminator(pred.detach(), x_in, sys_ctx)
 
     real_labels = torch.full_like(real_logit, 0.9)
     fake_labels = torch.zeros_like(fake_logit)
@@ -377,7 +374,7 @@ def train_step_gan(
 
     recon_loss = criterion(pred, x_target)
 
-    adv_logit = discriminator(pred, feat, sys)
+    adv_logit = discriminator(pred, x_in, sys)
     adv_loss  = F.binary_cross_entropy_with_logits(
         adv_logit, torch.ones_like(adv_logit)
     )

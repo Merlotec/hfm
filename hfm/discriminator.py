@@ -1,10 +1,9 @@
 """
 GAN discriminator for HFM.
 
-Takes the decoded frame plus the feature and system token hierarchies and
-outputs a real/fake logit.  Feature and system tokens are included as
-conditioning context — no direct value targets are imposed on them; the
-only supervision signal is the binary real/fake classification.
+Conditional discriminator: given the previous frame and system embeddings
+(both derived from ground-truth data), classify whether the next frame is
+real or generated.
 """
 
 import torch
@@ -15,42 +14,18 @@ from typing import List
 from .config import HFMConfig
 
 
-class _FrameBranch(nn.Module):
-    """Strided-conv encoder that maps a pixel frame to a fixed-size vector."""
-
-    def __init__(self, in_channels: int, out_dim: int):
-        super().__init__()
-        channels = [in_channels, 64, 128, 256, 512]
-        layers: list = []
-        for i in range(len(channels) - 1):
-            layers.append(
-                spectral_norm(nn.Conv2d(channels[i], channels[i + 1], 4, stride=2, padding=1,
-                                        bias=(i == 0)))
-            )
-            if i > 0:
-                layers.append(nn.InstanceNorm2d(channels[i + 1], affine=True))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-        self.conv = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = spectral_norm(nn.Linear(512, out_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.pool(self.conv(x)).flatten(1))   # [B, out_dim]
-
-
 class HFMDiscriminator(nn.Module):
     """
-    Discriminator for real vs. generated fluid frames.
+    Conditional discriminator for real vs. generated fluid frames.
 
     Inputs
     ------
     frame : [B, C, H, W]
-        Decoded pixel-space frame (model output or ground truth).
-    feat  : list of [B, S_l, S_l, d_feat_l]
-        Feature token hierarchy from HFM.  Included as conditioning context;
-        no direct value targets are imposed on these tokens.
-    sys   : list of [B, S_l, S_l, d_sys_l]
-        System token hierarchy.
+        The frame being evaluated (model output or ground truth).
+    x_prev : [B, C, H, W]
+        The ground-truth previous frame (identical for real and fake calls).
+    sys : list of [B, S_l, S_l, d_sys_l]
+        System token hierarchy built from ground-truth warmup frames.
 
     Output
     ------
@@ -61,18 +36,28 @@ class HFMDiscriminator(nn.Module):
         super().__init__()
         d = cfg.disc_dim
 
-        self.frame_branch = _FrameBranch(cfg.in_channels, d)
+        # x_prev and frame are concatenated along channels
+        channels = [cfg.in_channels * 2, 64, 128, 256, 512]
+        layers: list = []
+        for i in range(len(channels) - 1):
+            layers.append(
+                spectral_norm(nn.Conv2d(channels[i], channels[i + 1], 4,
+                                        stride=2, padding=1, bias=(i == 0)))
+            )
+            if i > 0:
+                layers.append(nn.InstanceNorm2d(channels[i + 1], affine=True))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
 
-        # GAP + project each hierarchy level to a common dim
-        self.feat_projs = nn.ModuleList([
-            spectral_norm(nn.Linear(d_feat, d)) for d_feat in cfg.d_feat
-        ])
+        self.conv = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_proj = spectral_norm(nn.Linear(512, d))
+
+        # Project each sys level to d
         self.sys_projs = nn.ModuleList([
             spectral_norm(nn.Linear(d_sys, d)) for d_sys in cfg.d_sys
         ])
 
-        n = cfg.n_levels
-        fuse_dim = d * (1 + n + n)   # frame + all feat levels + all sys levels
+        fuse_dim = d * (1 + cfg.n_levels)   # conv + all sys levels
 
         self.head = nn.Sequential(
             spectral_norm(nn.Linear(fuse_dim, d * 2)),
@@ -95,19 +80,19 @@ class HFMDiscriminator(nn.Module):
     def forward(
         self,
         frame: torch.Tensor,
-        feat: List[torch.Tensor],
+        x_prev: torch.Tensor,
         sys: List[torch.Tensor],
     ) -> torch.Tensor:
-        frame_vec = self.frame_branch(frame)                             # [B, d]
+        # Concatenate previous frame and current frame along channel dim
+        x = torch.cat([x_prev, frame], dim=1)              # [B, 2C, H, W]
+        conv_vec = self.conv_proj(
+            self.pool(self.conv(x)).flatten(1)             # [B, 512] → [B, d]
+        )
 
-        feat_vecs = [
-            self.feat_projs[l](feat[l].mean(dim=(1, 2)))                # [B, d]
-            for l in range(len(feat))
-        ]
         sys_vecs = [
-            self.sys_projs[l](sys[l].mean(dim=(1, 2)))                  # [B, d]
+            self.sys_projs[l](sys[l].mean(dim=(1, 2)))    # [B, d]
             for l in range(len(sys))
         ]
 
-        x = torch.cat([frame_vec] + feat_vecs + sys_vecs, dim=-1)       # [B, fuse_dim]
-        return self.head(x)                                              # [B, 1]
+        x = torch.cat([conv_vec] + sys_vecs, dim=-1)       # [B, fuse_dim]
+        return self.head(x)                                 # [B, 1]
