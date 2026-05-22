@@ -558,37 +558,46 @@ class HFMLayer(nn.Module):
         feat: List[torch.Tensor],
         sys: List[torch.Tensor],
         resid: Optional[torch.Tensor] = None,
+        n_coarse_levels: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], Optional[torch.Tensor]]:
         """
         All inputs are spatial grids [B, H, W, D].
         Returns updated (patches, feat_list, sys_list, resid_or_none).
+
+        n_coarse_levels: when set, only update feat/sys levels 0..n_coarse_levels-1
+            and pass patches + resid through unchanged. Fine levels are carried
+            forward as-is (they act as implicit skip connections to later full layers).
         """
-        # ---- update feature levels (coarse→fine so coarser context is fresh) ----
-        new_feat: List[torch.Tensor] = []
-        for l in range(self.cfg.n_levels):
-            coarser = self._coarser_feat(feat, l)
+        n_active = n_coarse_levels if n_coarse_levels is not None else self.cfg.n_levels
+
+        # ---- update feature levels (coarse→fine, using fresh coarser within pass) ----
+        new_feat: List[torch.Tensor] = list(feat)   # fine levels pass through
+        for l in range(n_active):
+            coarser = self._coarser_feat(new_feat, l)   # use already-updated coarser
             patches_at_l = self._patches_for_level(patches, l)
-            new_feat.append(self.feat_blocks[l](
+            new_feat[l] = self.feat_blocks[l](
                 feat[l], sys[l], patches_at_l, coarser
-            ))
+            )
 
         # ---- update system levels ----
-        new_sys: List[torch.Tensor] = []
-        for l in range(self.cfg.n_levels):
-            coarser = self._coarser_sys(sys, l)
+        new_sys: List[torch.Tensor] = list(sys)
+        for l in range(n_active):
+            coarser = self._coarser_sys(new_sys, l)
             resid_at_l = (self._resid_for_sys_level(resid, l)
                           if resid is not None else None)
-            new_sys.append(self.sys_blocks[l](
+            new_sys[l] = self.sys_blocks[l](
                 sys[l], feat[l], resid_at_l, coarser
-            ))
+            )
 
-        # ---- update patches (see finest feature level) ----
-        new_patches = self.patch_block(patches, feat[-1])
-
-        # ---- update residual (if present) ----
-        new_resid: Optional[torch.Tensor] = None
-        if resid is not None:
-            new_resid = self.resid_block(resid, sys[-1])
+        # ---- patches and resid: only update in full layers ----
+        if n_coarse_levels is None:
+            new_patches = self.patch_block(patches, new_feat[-1])
+            new_resid: Optional[torch.Tensor] = None
+            if resid is not None:
+                new_resid = self.resid_block(resid, new_sys[-1])
+        else:
+            new_patches = patches
+            new_resid = resid
 
         return new_patches, new_feat, new_sys, new_resid
 
@@ -704,6 +713,7 @@ class HFM(nn.Module):
             return (new_p,) + tuple(new_f) + tuple(new_s) + (r_out,)
 
         out = checkpoint(fn, patches, *feat, *sys, r_in, use_reentrant=False)
+        assert out is not None  # checkpoint returns None only in no_grad + no_reentrant edge case
         new_patches = out[0]
         new_feat    = list(out[1:1 + n_f])
         new_sys     = list(out[1 + n_f:1 + n_f + n_s])
@@ -766,14 +776,19 @@ class HFM(nn.Module):
             sys = [self.sys_pos[l](sys_emb[l]) for l in range(self.cfg.n_levels)]
 
         # ---- transformer layers ----
-        for layer in self.layers:
+        n_layers = len(self.layers)
+        n_fine   = self.cfg.n_fine_layers
+        coarse_n = self.cfg.n_coarse_levels if self.cfg.n_coarse_levels > 0 else None
+        for i, layer in enumerate(self.layers):
+            is_full = (i < n_fine or i >= n_layers - n_fine or coarse_n is None)
+            n_coarse = None if is_full else coarse_n
             if self.cfg.gradient_checkpointing and self.training:
                 patches, feat, sys, resid_tokens = HFM._checkpointed_layer(
                     layer, patches, feat, sys, resid_tokens
                 )
             else:
                 patches, feat, sys, resid_tokens = layer(
-                    patches, feat, sys, resid_tokens
+                    patches, feat, sys, resid_tokens, n_coarse_levels=n_coarse
                 )
             # Re-zero hole patches after each layer: LayerNorm maps zero→beta
             # (the learned bias), which would otherwise contaminate neighbouring

@@ -73,6 +73,8 @@ def load_config() -> tuple[HFMConfig, dict]:
         n_layers             = m['n_layers'],
         mlp_ratio            = m['mlp_ratio'],
         dropout              = m['dropout'],
+        n_coarse_levels      = m['n_coarse_levels'],
+        n_fine_layers        = m['n_fine_layers'],
         n_warmup_frames      = t['n_warmup_frames'],
         gradient_checkpointing = False,
     )

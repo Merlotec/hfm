@@ -37,6 +37,13 @@ class HFMConfig:
     # --- training loop ---
     n_warmup_frames: int = 5     # frames used to build up system embeddings
 
+    # --- hierarchical bottleneck ---
+    # Layout: n_fine_layers full layers → coarse-only middle → n_fine_layers full layers.
+    # Middle layers update only the coarsest n_coarse_levels levels (+ skip patches through).
+    # Set n_coarse_levels=0 to disable the bottleneck (all layers update everything).
+    n_coarse_levels: int = 2
+    n_fine_layers: int = 2    # full layers at each end (encode + decode)
+
     # --- memory ---
     gradient_checkpointing: bool = False   # recompute activations during backward
 

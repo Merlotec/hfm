@@ -20,9 +20,11 @@
     "n_heads_sys":  [4, 2, 1, 1],
     "n_heads_resid": 4,
 
-    "n_layers": 6,
+    "n_layers": 8,
     "mlp_ratio": 4.0,
-    "dropout": 0.0
+    "dropout": 0.0,
+    "n_coarse_levels": 2,
+    "n_fine_layers": 2
   },
 
   "training": {
