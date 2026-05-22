@@ -633,6 +633,11 @@ class HFM(nn.Module):
         self.patch_embed = PatchEmbed(cfg.in_channels, cfg.patch_px, cfg.d_patch)
         self.resid_embed = PatchEmbed(cfg.in_channels, cfg.patch_px, cfg.d_resid)
 
+        # Geometry encoders: project pixel_mask pattern within each patch to token space.
+        # Computed once per sequence (mask is fixed) and added as a positional bias.
+        self.mask_embed       = PatchEmbed(1, cfg.patch_px, cfg.d_patch)
+        self.mask_embed_resid = PatchEmbed(1, cfg.patch_px, cfg.d_resid)
+
         # Positional encodings
         P = cfg.n_patch
         self.patch_pos = LearnedPos2D(P, P, cfg.d_patch)
@@ -747,14 +752,28 @@ class HFM(nn.Module):
                               stride=self.cfg.patch_px)   # [1, 1, P, P]
             patch_mask = pm.permute(0, 2, 3, 1)           # [1, P, P, 1] broadcast over d
 
+        # ---- geometry encoding (fixed per sequence, added as positional bias) ----
+        # mask_enc encodes which pixels within each patch are fluid vs hole.
+        # Broadcast over batch; pixel_mask is [1, 1, H, W].
+        mask_enc: Optional[torch.Tensor] = None
+        mask_enc_resid: Optional[torch.Tensor] = None
+        if pixel_mask is not None:
+            m = pixel_mask.float()
+            mask_enc       = self.mask_embed(m)        # [1, P, P, d_patch]
+            mask_enc_resid = self.mask_embed_resid(m)  # [1, P, P, d_resid]
+
         # ---- encode inputs ----
         patches = self.patch_pos(self.patch_embed(x))       # [B, P, P, d_patch]
+        if mask_enc is not None:
+            patches = patches + mask_enc
         if patch_mask is not None:
             patches = patches * patch_mask
 
         resid_tokens = None
         if resid is not None:
             resid_tokens = self.resid_pos(self.resid_embed(resid))
+            if mask_enc_resid is not None:
+                resid_tokens = resid_tokens + mask_enc_resid
             if patch_mask is not None:
                 resid_tokens = resid_tokens * patch_mask
 
