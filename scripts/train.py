@@ -76,7 +76,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         n_coarse_levels      = m['n_coarse_levels'],
         n_fine_layers        = m['n_fine_layers'],
         n_warmup_frames      = t['n_warmup_frames'],
-        gradient_checkpointing = False,
+        gradient_checkpointing = True,
     )
     return cfg, t
 
