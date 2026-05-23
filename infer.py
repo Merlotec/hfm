@@ -173,7 +173,11 @@ def main():
     print(f'  step={step}')
 
     model = HFM(cfg).to(device)
-    model.load_state_dict(ckpt['model'])
+    missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+    if unexpected:
+        print(f'  [warn] model unexpected keys: {unexpected}')
+    if missing:
+        print(f'  New/missing model keys (random init): {missing}')
     model.eval()
 
     context_encoder = ContextEncoder(cfg).to(device)

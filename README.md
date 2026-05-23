@@ -1,6 +1,6 @@
 The input should be 4 channels of a 256x256 image representing the fluid.
 
-  - Split the domain into 4*4 patches. These represent the image level. These patch tokens have low dimensionality.
+eee Split the domain into 4*4 patches. These represent the image level. These patch tokens have low dimensionality.
   - Above this, we have a feature hierarchy of higher level tokens with much higher dimensionality. There should be a pyramid where we have 32x32, 64x64, 128x128 and 256x256 (with
   the entire image being 256x256).
   - There should be two copies of this hierarchy. The first should contain the feature map which absorbes higher level structural featues of the image. The second is the system 
