@@ -385,7 +385,9 @@ class HFM(nn.Module):
             [patches, self.global_tokens.expand(B, -1, -1)], dim=1
         )   # [B, P² + n_global, d]
 
-        # Transformer layers
+        # Transformer layers — hole patches start at zero but evolve freely via
+        # attention, allowing the transformer to inpaint them and receive gradient
+        # from the hole-filling loss.
         for layer in self.layers:
             if self.cfg.gradient_checkpointing and self.training:
                 tokens = _checkpointed_layer(
@@ -393,12 +395,6 @@ class HFM(nn.Module):
                 )
             else:
                 tokens = layer(tokens, context, self.rope_cos, self.rope_sin)
-
-            if patch_mask is not None:
-                tokens = torch.cat([
-                    tokens[:, :n_patch] * patch_mask,
-                    tokens[:, n_patch:],
-                ], dim=1)
 
         # Decode from patch tokens only
         patch_tokens = tokens[:, :n_patch].reshape(B, P, P, self.cfg.d_patch)

@@ -103,7 +103,6 @@ def main() -> None:
     parser.add_argument('--batch-size',  type=int,  default=None,
                         help='Override batch_size from hyperparams.json')
     parser.add_argument('--log-every',   type=int,  default=50)
-    parser.add_argument('--ckpt-every',  type=int,  default=200)
     parser.add_argument('--workers',     type=int,  default=4)
     args = parser.parse_args()
 
@@ -167,11 +166,11 @@ def main() -> None:
     CKPT_DIR.mkdir(exist_ok=True)
     callbacks = [
         ModelCheckpoint(
-            dirpath             = str(CKPT_DIR),
-            filename            = 'ckpt-step{step:06d}',
-            every_n_train_steps = args.ckpt_every,
-            save_top_k          = -1,
-            save_last           = True,
+            dirpath          = str(CKPT_DIR),
+            filename         = 'ckpt-epoch{epoch:03d}',
+            every_n_epochs   = 2,
+            save_top_k       = -1,
+            save_last        = True,
             auto_insert_metric_name = False,
         ),
         LearningRateMonitor(logging_interval='step'),
