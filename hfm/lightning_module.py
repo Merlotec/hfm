@@ -50,6 +50,8 @@ class HFMLightningModule(L.LightningModule):
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
+        hole_weight: float = 0.1,
+        hole_fill_sigma: float = 15.0,
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.3,
@@ -68,7 +70,10 @@ class HFMLightningModule(L.LightningModule):
         self.model           = HFM(cfg)
         self.context_encoder = ContextEncoder(cfg)
         self.discriminator   = HFMDiscriminator(cfg)
-        self.criterion       = FluidLoss(l1_weight)
+        self.criterion       = FluidLoss(
+            l1_weight, pixel_mask=pixel_mask,
+            hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
+        )
 
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
@@ -126,9 +131,6 @@ class HFMLightningModule(L.LightningModule):
 
         context = self.context_encoder(frames[:n], pixel_mask=mask)
         pred    = self.model(x_in, context, pixel_mask=mask)
-        if mask is not None:
-            pred     = pred.float() * mask
-            x_target = x_target * mask
 
         # ---- reconstruction only (pre-GAN) ----
         if adv_w == 0.0:
@@ -141,10 +143,14 @@ class HFMLightningModule(L.LightningModule):
             self.log('recon', recon, prog_bar=True, sync_dist=True)
             return
 
+        # pred_disc: holes zeroed for discriminator; pred stays unmasked for criterion
+        # so gradient flows back through hole regions via the hole-filling loss.
+        pred_disc = pred.float() * mask if mask is not None else pred.float()
+
         # ---- discriminator update ----
         ctx_d      = context.detach()
-        real_logit = self.discriminator(x_target,      x_in, ctx_d)
-        fake_logit = self.discriminator(pred.detach(), x_in, ctx_d)
+        real_logit = self.discriminator(x_target,           x_in, ctx_d)
+        fake_logit = self.discriminator(pred_disc.detach(), x_in, ctx_d)
         d_loss = (
             F.binary_cross_entropy_with_logits(real_logit, torch.full_like(real_logit, 0.9)) +
             F.binary_cross_entropy_with_logits(fake_logit, torch.zeros_like(fake_logit))
@@ -161,7 +167,7 @@ class HFMLightningModule(L.LightningModule):
             p.requires_grad_(False)
 
         recon     = self.criterion(pred, x_target)
-        adv_logit = self.discriminator(pred, x_in, context)
+        adv_logit = self.discriminator(pred_disc, x_in, context)
         adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
         g_loss    = recon + adv_w * adv_loss
 
