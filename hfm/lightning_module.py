@@ -166,10 +166,16 @@ class HFMLightningModule(L.LightningModule):
         for p in self.discriminator.parameters():
             p.requires_grad_(False)
 
-        recon     = self.criterion(pred, x_target)
-        adv_logit = self.discriminator(pred_disc, x_in, context)
-        adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
-        g_loss    = recon + adv_w * adv_loss
+        recon = self.criterion(pred, x_target)
+        # Only apply adversarial loss when the discriminator is in the healthy range —
+        # same gate as the discriminator update, so generator never chases a runaway disc.
+        disc_healthy = self.disc_update_threshold < d_loss.item() < 2.0
+        if disc_healthy:
+            adv_logit = self.discriminator(pred_disc, x_in, context)
+            adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
+            g_loss    = recon + adv_w * adv_loss
+        else:
+            g_loss = recon
 
         gen_opt.zero_grad()
         self.manual_backward(g_loss)

@@ -207,13 +207,16 @@ def train_step_gan(
 
     recon_loss = criterion(pred, x_target)
 
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        adv_logit = discriminator(pred_disc, x_in, context)
-    adv_loss = F.binary_cross_entropy_with_logits(
-        adv_logit, torch.ones_like(adv_logit)
-    )
-
-    total_loss = recon_loss + adv_weight * adv_loss
+    disc_healthy = disc_update_threshold < d_loss_val < 2.0
+    if disc_healthy:
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+            adv_logit = discriminator(pred_disc, x_in, context)
+        adv_loss = F.binary_cross_entropy_with_logits(
+            adv_logit, torch.ones_like(adv_logit)
+        )
+        total_loss = recon_loss + adv_weight * adv_loss
+    else:
+        total_loss = recon_loss
     if not torch.isfinite(total_loss):
         _zero_and_restore()
         return float('nan'), d_loss_val
