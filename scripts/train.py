@@ -42,7 +42,7 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 
 GAN_START_STEP        = 10_000  # step at which adversarial loss switches on
 GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
-DISC_UPDATE_THRESHOLD = 0.3     # skip disc update when d_loss <= this
+DISC_UPDATE_THRESHOLD = 0.5     # skip disc update when d_loss <= this
 
 # ---------------------------------------------------------------------------
 # Config helpers

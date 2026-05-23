@@ -30,7 +30,7 @@
     "n_ctx_heads": 8,
 
     "disc_dim": 128,
-    "disc_adv_weight": 0.02,
+    "disc_adv_weight": 0.1,
     "disc_lr": 1e-4
   },
 
