@@ -304,7 +304,11 @@ class GANTrainer:
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.model.load_state_dict(ckpt['model'])
+        missing, unexpected = self.model.load_state_dict(ckpt['model'], strict=False)
+        if unexpected:
+            print(f'  [warn] model unexpected keys: {unexpected}')
+        if missing:
+            print(f'  New/missing model keys (random init): {missing}')
 
         if 'context_encoder' in ckpt:
             self.context_encoder.load_state_dict(ckpt['context_encoder'])

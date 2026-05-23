@@ -17,6 +17,10 @@ import lightning as L
 from torch.utils.data import DataLoader
 
 from .config import HFMConfig
+
+# HFMConfig is stored as a Python object in checkpoints; allowlist it so
+# Lightning's torch.load (weights_only=True default in PyTorch 2.6) doesn't fail.
+torch.serialization.add_safe_globals([HFMConfig])
 from .context_encoder import ContextEncoder
 from .data import FVMDataModule
 from .discriminator import HFMDiscriminator
@@ -84,7 +88,11 @@ class HFMLightningModule(L.LightningModule):
         Optimizer/scheduler state is NOT restored (fresh start).
         """
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.model.load_state_dict(ckpt['model'])
+        missing, unexpected = self.model.load_state_dict(ckpt['model'], strict=False)
+        if unexpected:
+            print(f'  [warn] model unexpected keys: {unexpected}')
+        if missing:
+            print(f'  New/missing model keys (random init): {missing}')
         if 'context_encoder' in ckpt:
             self.context_encoder.load_state_dict(ckpt['context_encoder'])
         else:
