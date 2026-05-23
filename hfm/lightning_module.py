@@ -119,7 +119,8 @@ class HFMLightningModule(L.LightningModule):
         context = self.context_encoder(frames[:n], pixel_mask=mask)
         pred    = self.model(x_in, context, pixel_mask=mask)
         if mask is not None:
-            pred = pred.float() * mask
+            pred     = pred.float() * mask
+            x_target = x_target * mask
 
         # ---- reconstruction only (pre-GAN) ----
         if adv_w == 0.0:
