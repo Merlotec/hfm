@@ -1,17 +1,18 @@
 """
 HFM inference script.
 
-Loads a checkpoint, runs warmup on an initial window of frames from a simulation
-run, then autoregressively predicts subsequent frames.  Outputs are saved to
---out-dir as:
-  - frames_gt.npy   / frames_pred.npy   — raw normalised arrays [T, C, H, W]
+Loads a GANTrainer checkpoint, feeds n_context_frames ground-truth frames into
+the ContextEncoder, then autoregressively predicts subsequent frames with HFM.
+
+Outputs are saved to --out-dir as:
+  - frames_gt.npy / frames_pred.npy       — normalised arrays [T, C, H, W]
   - frames_gt_phys.npy / frames_pred_phys.npy — denormalised physical values
-  - images/t{NNN}_ch{C}.png             — ground-truth vs prediction per channel
+  - images/t{NNN}_ch{C}.png              — ground-truth vs prediction per channel
 
 Usage:
-    python infer.py --checkpoint checkpoints/overfit_stage2_step02000.pt \\
+    python infer.py --checkpoint checkpoints/train_step010000.pt \\
                     --data-dir   /path/to/sim_dataset \\
-                    --out-dir    out/overfit
+                    --out-dir    out/infer
 """
 
 import argparse
@@ -24,7 +25,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hfm import HFM
+from hfm import HFM, ContextEncoder
+from hfm.config import HFMConfig
 from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / 'fvm_model' / 'data'
@@ -52,7 +54,7 @@ def load_stats(data_dir: Path) -> tuple[torch.Tensor, torch.Tensor]:
             with open(p) as f:
                 s = json.load(f)
             return torch.tensor(s['mean']), torch.tensor(s['std'])
-    raise FileNotFoundError('No normalisation stats found. Run overfit.py first.')
+    raise FileNotFoundError('No normalisation stats found.')
 
 
 def denorm(frames: np.ndarray, mean: torch.Tensor, std: torch.Tensor) -> np.ndarray:
@@ -66,29 +68,22 @@ def save_viewer_frames(
     gt_phys: np.ndarray,
     pred_phys: np.ndarray,
     timestamps: list[float],
-    n_warmup: int,
+    n_context: int,
     run_name: str,
     viewer_dir: Path,
 ):
-    """
-    Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c.
-
-    Layout:  viewer_dir / run_name / t_{timestamp}.npz
-    Each file contains: grid (4, H, W), t (scalar float32), is_seed (bool).
-
-    Warmup frames are marked is_seed=True; predicted frames is_seed=False.
-    """
+    """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c."""
     run_dir = viewer_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     T = len(timestamps)
     for i, ts in enumerate(timestamps):
-        if i < n_warmup:
-            grid     = gt_phys[i].astype(np.float32)
-            is_seed  = True
+        if i < n_context:
+            grid    = gt_phys[i].astype(np.float32)
+            is_seed = True
         else:
-            grid     = pred_phys[i - n_warmup].astype(np.float32)
-            is_seed  = False
+            grid    = pred_phys[i - n_context].astype(np.float32)
+            is_seed = False
         np.savez(run_dir / f't_{ts:.4g}.npz',
                  grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed))
 
@@ -119,19 +114,16 @@ def save_images(gt: np.ndarray, pred: np.ndarray, out_dir: Path,
             vmin = gt_phys[t, c].min()
             vmax = gt_phys[t, c].max()
 
-            im0 = axes[0].imshow(gt_phys[t, c],   vmin=vmin, vmax=vmax, cmap='RdBu_r')
-            im1 = axes[1].imshow(pred_phys[t, c], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            axes[0].imshow(gt_phys[t, c],   vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            axes[1].imshow(pred_phys[t, c], vmin=vmin, vmax=vmax, cmap='RdBu_r')
             err = np.abs(gt_phys[t, c] - pred_phys[t, c])
-            im2 = axes[2].imshow(err, cmap='hot')
+            axes[2].imshow(err, cmap='hot')
 
             axes[0].set_title(f'Ground truth — {CHANNEL_NAMES[c]}')
             axes[1].set_title(f'Prediction   — {CHANNEL_NAMES[c]}')
             axes[2].set_title(f'|Error|  max={err.max():.3f}')
             for ax in axes:
                 ax.axis('off')
-            plt.colorbar(im0, ax=axes[0], fraction=0.046)
-            plt.colorbar(im1, ax=axes[1], fraction=0.046)
-            plt.colorbar(im2, ax=axes[2], fraction=0.046)
 
             plt.suptitle(f't={t}  channel={CHANNEL_NAMES[c]}', fontsize=12)
             plt.tight_layout()
@@ -154,8 +146,8 @@ def main():
                         help='Dataset directory (contains subdirs with t_*.npz files)')
     parser.add_argument('--out-dir',    required=True,
                         help='Output directory')
-    parser.add_argument('--n-warmup',   type=int, default=None,
-                        help='Warmup frames (defaults to cfg.n_warmup_frames)')
+    parser.add_argument('--n-context',  type=int, default=None,
+                        help='Context frames fed to ContextEncoder (defaults to cfg.n_context_frames)')
     parser.add_argument('--n-predict',  type=int, default=10,
                         help='Number of frames to predict autoregressively')
     parser.add_argument('--seq-start',  type=int, default=None,
@@ -175,20 +167,28 @@ def main():
 
     # ---- load checkpoint ----
     print(f'\nLoading checkpoint: {args.checkpoint}')
-    ckpt  = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    cfg   = ckpt['cfg']
-    model = HFM(cfg).to(device)
-    model.load_state_dict(ckpt.get('model_state', ckpt.get('model')))
-    model.eval()
-    step = ckpt.get('step', ckpt.get('global_step', '?'))
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    cfg: HFMConfig = ckpt['cfg']
+    step = ckpt.get('global_step', '?')
     print(f'  step={step}')
 
-    n_warmup = args.n_warmup if args.n_warmup is not None else cfg.n_warmup_frames
+    model = HFM(cfg).to(device)
+    model.load_state_dict(ckpt['model'])
+    model.eval()
+
+    context_encoder = ContextEncoder(cfg).to(device)
+    if 'context_encoder' in ckpt:
+        context_encoder.load_state_dict(ckpt['context_encoder'])
+    else:
+        print('  [warn] no context_encoder in checkpoint; using random weights')
+    context_encoder.eval()
+
+    n_context = args.n_context if args.n_context is not None else cfg.n_context_frames
 
     # ---- load data ----
     print(f'\nLoading data from {data_dir}')
     mean, std = load_stats(data_dir)
-    renderer  = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
+    renderer   = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
     pixel_mask = load_pixel_mask(data_dir, renderer, (cfg.img_size, cfg.img_size)).to(device)
 
     sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()])
@@ -197,53 +197,42 @@ def main():
     sim_dir = sim_dirs[0]
     print(f'  Using run: {sim_dir.name}')
 
-    seq_len = n_warmup + args.n_predict + 1
+    # seq_len = n_context frames + the first prediction input frame
+    seq_len = n_context + args.n_predict + 1
     ds = FVMSequenceDataset.with_cache(
         sim_dir, renderer, seq_len, mean, std, first_frame=args.first_frame
     )
     print(f'  {len(ds)} sequences available (seq_len={seq_len})')
 
     start = args.seq_start if args.seq_start is not None else len(ds) // 2
-    seq   = ds[start]                                   # [T, C, H, W]
+    seq   = ds[start]                                    # [T, C, H, W]
     frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
 
-    # Timestamps from source filenames (t_<value>.npz)
     timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
 
-    # ---- warmup ----
-    print(f'\nRunning warmup ({n_warmup} frames)...')
+    # ---- encode context ----
+    print(f'\nEncoding {n_context} context frames...')
     with torch.no_grad():
-        B   = 1
-        sys = model.init_sys_emb(B, device)
-        for t in range(n_warmup):
-            pred_t, sys, _ = model(frames_gt[t], sys_emb=sys, resid=None,
-                                   pixel_mask=pixel_mask)
-            pred_t = pred_t * pixel_mask
-            err_t = (frames_gt[t + 1] - pred_t)
-            _, sys, _ = model(frames_gt[t], sys_emb=sys, resid=err_t,
-                              pixel_mask=pixel_mask)
-        sys_norm = sum(s.norm().item() for s in sys) / len(sys)
-        print(f'  sys_emb norm after warmup: {sys_norm:.4f}')
+        context = context_encoder(frames_gt[:n_context], pixel_mask=pixel_mask)
+    print(f'  context shape: {list(context.shape)}')
 
     # ---- autoregressive prediction ----
     print(f'\nPredicting {args.n_predict} frames autoregressively...')
     preds = []
     gt    = []
-    x = frames_gt[n_warmup]
+    x = frames_gt[n_context]
 
     with torch.no_grad():
         for t in range(args.n_predict):
-            pred, _, _ = model(x, sys_emb=sys, resid=None, freeze_sys=True,
-                               pixel_mask=pixel_mask)
-            pred = pred * pixel_mask
+            pred = model(x, context, pixel_mask=pixel_mask)
+            pred = pred.float() * pixel_mask
             preds.append(pred.cpu())
-            gt.append(frames_gt[n_warmup + t].cpu())
+            gt.append(frames_gt[n_context + t].cpu())
 
-            err = frames_gt[n_warmup + t + 1] - pred
-            mae = err.abs().mean().item()
-            print(f'  t={t+1:3d}  MAE={mae:.5f}')
+            if t + 1 < args.n_predict:
+                mae = (frames_gt[n_context + t + 1] - pred).abs().mean().item()
+                print(f'  t={t+1:3d}  MAE={mae:.5f}')
 
-            # Feed prediction (not ground truth) as next input
             x = pred
 
     # ---- save outputs ----
@@ -251,7 +240,7 @@ def main():
     pred_arr = torch.cat(preds, dim=0).numpy()
 
     gt_phys   = denorm(gt_arr,   mean, std)
-    pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()  # re-zero holes after denorm
+    pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()
 
     np.save(out_dir / 'frames_gt.npy',        gt_arr)
     np.save(out_dir / 'frames_pred.npy',       pred_arr)
@@ -259,19 +248,18 @@ def main():
     np.save(out_dir / 'frames_pred_phys.npy', pred_phys)
     print(f'\nSaved arrays → {out_dir}')
 
-    # Viewer-compatible output: warmup frames (is_seed=True) + predictions
     print('Saving viewer frames...')
-    warmup_phys = denorm(
-        torch.cat([frames_gt[t].cpu() for t in range(n_warmup)], dim=0).numpy(),
+    context_phys = denorm(
+        torch.cat([frames_gt[t].cpu() for t in range(n_context)], dim=0).numpy(),
         mean, std,
     ) * pixel_mask.cpu().numpy()
-    all_ts     = timestamps[:n_warmup] + timestamps[n_warmup:n_warmup + args.n_predict]
+    all_ts = timestamps[:n_context] + timestamps[n_context:n_context + args.n_predict]
     save_viewer_frames(
-        gt_phys   = warmup_phys,
-        pred_phys = pred_phys,
+        gt_phys    = context_phys,
+        pred_phys  = pred_phys,
         timestamps = all_ts,
-        n_warmup  = n_warmup,
-        run_name  = sim_dir.name,
+        n_context  = n_context,
+        run_name   = sim_dir.name,
         viewer_dir = out_dir / 'viewer',
     )
 

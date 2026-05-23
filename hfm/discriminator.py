@@ -1,9 +1,9 @@
 """
 GAN discriminator for HFM.
 
-Conditional discriminator: given the previous frame and system embeddings
-(both derived from ground-truth data), classify whether the next frame is
-real or generated.
+Conditional discriminator: given the previous frame and the context tokens
+from ContextEncoder (which encode the PDE dynamics), classify whether the
+next frame is real or generated.
 """
 
 import torch
@@ -20,12 +20,9 @@ class HFMDiscriminator(nn.Module):
 
     Inputs
     ------
-    frame : [B, C, H, W]
-        The frame being evaluated (model output or ground truth).
-    x_prev : [B, C, H, W]
-        The ground-truth previous frame (identical for real and fake calls).
-    sys : list of [B, S_l, S_l, d_sys_l]
-        System token hierarchy built from ground-truth warmup frames.
+    frame   : [B, C, H, W]       frame being evaluated (model output or ground truth)
+    x_prev  : [B, C, H, W]       ground-truth previous frame
+    context : [B, K, d_ctx]      context tokens from ContextEncoder
 
     Output
     ------
@@ -36,7 +33,7 @@ class HFMDiscriminator(nn.Module):
         super().__init__()
         d = cfg.disc_dim
 
-        # x_prev and frame are concatenated along channels
+        # Image branch: x_prev and frame concatenated along channels
         channels = [cfg.in_channels * 2, 64, 128, 256, 512]
         layers: list = []
         for i in range(len(channels) - 1):
@@ -48,19 +45,15 @@ class HFMDiscriminator(nn.Module):
                 layers.append(nn.InstanceNorm2d(channels[i + 1], affine=True))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
 
-        self.conv = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv      = nn.Sequential(*layers)
+        self.pool      = nn.AdaptiveAvgPool2d(1)
         self.conv_proj = spectral_norm(nn.Linear(512, d))
 
-        # Project each sys level to d
-        self.sys_projs = nn.ModuleList([
-            spectral_norm(nn.Linear(d_sys, d)) for d_sys in cfg.d_sys
-        ])
-
-        fuse_dim = d * (1 + cfg.n_levels)   # conv + all sys levels
+        # Context branch: mean-pool K tokens then project
+        self.ctx_proj = spectral_norm(nn.Linear(cfg.d_ctx, d))
 
         self.head = nn.Sequential(
-            spectral_norm(nn.Linear(fuse_dim, d * 2)),
+            spectral_norm(nn.Linear(d * 2, d * 2)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
             spectral_norm(nn.Linear(d * 2, d)),
@@ -81,18 +74,16 @@ class HFMDiscriminator(nn.Module):
         self,
         frame: torch.Tensor,
         x_prev: torch.Tensor,
-        sys: List[torch.Tensor],
+        context: torch.Tensor,
     ) -> torch.Tensor:
-        # Concatenate previous frame and current frame along channel dim
+        # Image branch
         x = torch.cat([x_prev, frame], dim=1)              # [B, 2C, H, W]
         conv_vec = self.conv_proj(
-            self.pool(self.conv(x)).flatten(1)             # [B, 512] → [B, d]
+            self.pool(self.conv(x)).flatten(1)              # [B, 512] → [B, d]
         )
 
-        sys_vecs = [
-            self.sys_projs[l](sys[l].mean(dim=(1, 2)))    # [B, d]
-            for l in range(len(sys))
-        ]
+        # Context branch: mean over K tokens
+        ctx_vec = self.ctx_proj(context.mean(dim=1))        # [B, d]
 
-        x = torch.cat([conv_vec] + sys_vecs, dim=-1)       # [B, fuse_dim]
-        return self.head(x)                                 # [B, 1]
+        x = torch.cat([conv_vec, ctx_vec], dim=-1)          # [B, 2d]
+        return self.head(x)                                  # [B, 1]

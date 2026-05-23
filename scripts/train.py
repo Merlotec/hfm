@@ -2,8 +2,7 @@
 Full-dataset training for HFM (GANTrainer).
 
 Two-stage curriculum, managed automatically:
-  Stage 1 (steps 0 → gan_start_step):   reconstruction + warmup ramp
-    n_warmup ramps 1 → cfg.n_warmup_frames over warmup_ramp_steps steps.
+  Stage 1 (steps 0 → gan_start_step):   reconstruction only
   Stage 2 (steps gan_start_step → end): GAN active
     adv_weight ramps 0 → cfg.disc_adv_weight over gan_ramp_steps steps.
 
@@ -30,7 +29,7 @@ from hfm.data import FVMDataModule, build_renderer, load_pixel_mask
 # Paths
 # ---------------------------------------------------------------------------
 
-_ROOT     = Path(__file__).resolve().parents[1]
+_ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'fvm_model' / 'data'
 
 DEFAULT_DATA_DIR = _DATA_ROOT / 'fvm_gen_datasets'
@@ -41,7 +40,6 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 # GAN curriculum constants (not in hyperparams.json)
 # ---------------------------------------------------------------------------
 
-WARMUP_RAMP_STEPS     = 0       # 0 = always use cfg.n_warmup_frames (no ramp)
 GAN_START_STEP        = 10_000  # step at which adversarial loss switches on
 GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
 DISC_UPDATE_THRESHOLD = 0.3     # skip disc update when d_loss <= this
@@ -60,22 +58,26 @@ def load_config() -> tuple[HFMConfig, dict]:
         in_channels          = m['in_channels'],
         patch_px             = m['patch_px'],
         d_patch              = m['d_patch'],
-        d_resid              = m['d_resid'],
         feat_sizes           = tuple(m['feat_sizes']),
         d_feat               = tuple(m['d_feat']),
-        d_sys                = tuple(m['d_sys']),
         patch_local_radius   = m['patch_local_radius'],
         feat_window_size     = m['feat_window_size'],
         n_heads_patch        = m['n_heads_patch'],
         n_heads_feat         = tuple(m['n_heads_feat']),
-        n_heads_sys          = tuple(m['n_heads_sys']),
-        n_heads_resid        = m['n_heads_resid'],
         n_layers             = m['n_layers'],
         mlp_ratio            = m['mlp_ratio'],
         dropout              = m['dropout'],
         n_coarse_levels      = m['n_coarse_levels'],
         n_fine_layers        = m['n_fine_layers'],
-        n_warmup_frames      = t['n_warmup_frames'],
+        n_context_frames     = m['n_context_frames'],
+        ctx_patch_px         = m['ctx_patch_px'],
+        d_ctx                = m['d_ctx'],
+        n_ctx_tokens         = m['n_ctx_tokens'],
+        n_ctx_layers         = m['n_ctx_layers'],
+        n_ctx_heads          = m['n_ctx_heads'],
+        disc_dim             = m['disc_dim'],
+        disc_adv_weight      = m['disc_adv_weight'],
+        disc_lr              = m['disc_lr'],
         gradient_checkpointing = True,
     )
     return cfg, t
@@ -112,7 +114,7 @@ def main():
 
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
-    seq_len  = cfg.n_warmup_frames + 2   # warmup frames + input frame + target frame
+    seq_len  = cfg.n_context_frames + 2   # context frames + input frame + target frame
 
     # ---- data ----
     dm = FVMDataModule(
@@ -134,7 +136,6 @@ def main():
         lr                    = train_hp['lr'],
         weight_decay          = train_hp['weight_decay'],
         l1_weight             = train_hp['l1_weight'],
-        warmup_ramp_steps     = WARMUP_RAMP_STEPS,
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
@@ -153,14 +154,15 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
-
     n_gen  = sum(p.numel() for p in trainer.model.parameters())         / 1e6
+    n_ctx  = sum(p.numel() for p in trainer.context_encoder.parameters()) / 1e6
     n_disc = sum(p.numel() for p in trainer.discriminator.parameters()) / 1e6
-    print(f'Generator:     {n_gen:.1f}M params')
-    print(f'Discriminator: {n_disc:.1f}M params')
-    print(f'Dataset:       {len(dm._dataset)} sequences  (seq_len={seq_len})')
-    print(f'Curriculum:    warmup ramps over {WARMUP_RAMP_STEPS} steps, '
-          f'GAN activates at step {GAN_START_STEP}\n')
+    print(f'Generator:       {n_gen:.1f}M params')
+    print(f'ContextEncoder:  {n_ctx:.1f}M params')
+    print(f'Discriminator:   {n_disc:.1f}M params')
+    assert dm._dataset is not None
+    print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len})')
+    print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
 
     CKPT_DIR.mkdir(exist_ok=True)
     nan_streak = 0
@@ -187,7 +189,6 @@ def main():
             if step % args.log_every == 0:
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
-                    f'nw={info["n_warmup"]}  '
                     f'recon={recon:.4f}  '
                     f'disc={disc:.4f}  '
                     f'adv_w={info["adv_weight"]:.3f}'

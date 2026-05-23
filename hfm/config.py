@@ -7,54 +7,49 @@ class HFMConfig:
     # --- image / patch ---
     img_size: int = 256
     in_channels: int = 4
-    patch_px: int = 4            # each patch covers patch_px × patch_px pixels
+    patch_px: int = 4
 
-    # --- patch / residual token dims (low) ---
+    # --- patch token dim ---
     d_patch: int = 64
-    d_resid: int = 64
 
     # --- feature hierarchy ---
-    # Spatial sizes from coarse→fine: 32, 64, 128, 256
     feat_sizes: Tuple[int, ...] = (32, 64, 128, 256)
-    # Embedding dims at each level (coarse→fine, decreasing)
     d_feat: Tuple[int, ...] = (512, 256, 128, 64)
-    # System embedding dims (same levels, lower dim)
-    d_sys: Tuple[int, ...] = (256, 128, 64, 32)
 
     # --- attention ---
-    patch_local_radius: int = 3   # patches attend to (2r+1)^2 neighbourhood
-    feat_window_size: int = 8     # window size for local self-attn on fine levels
+    patch_local_radius: int = 3
+    feat_window_size: int = 8
     n_heads_patch: int = 4
-    n_heads_feat: Tuple[int, ...] = (8, 4, 2, 1)  # per level
-    n_heads_sys: Tuple[int, ...] = (4, 2, 1, 1)
-    n_heads_resid: int = 4
+    n_heads_feat: Tuple[int, ...] = (8, 4, 2, 1)
 
     # --- transformer depth ---
-    n_layers: int = 6
+    n_layers: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.0
 
-    # --- training loop ---
-    n_warmup_frames: int = 5     # frames used to build up system embeddings
-
     # --- hierarchical bottleneck ---
-    # Layout: n_fine_layers full layers → coarse-only middle → n_fine_layers full layers.
-    # Middle layers update only the coarsest n_coarse_levels levels (+ skip patches through).
-    # Set n_coarse_levels=0 to disable the bottleneck (all layers update everything).
     n_coarse_levels: int = 2
-    n_fine_layers: int = 2    # full layers at each end (encode + decode)
+    n_fine_layers: int = 2
 
-    # --- memory ---
-    gradient_checkpointing: bool = False   # recompute activations during backward
+    # --- context encoder ---
+    n_context_frames: int = 5      # frames fed to ContextEncoder per step
+    ctx_patch_px: int = 16         # patch size in context encoder (coarser)
+    d_ctx: int = 256               # context token dimension
+    n_ctx_tokens: int = 64         # summary tokens output by context encoder
+    n_ctx_layers: int = 4          # transformer layers in context encoder
+    n_ctx_heads: int = 8
 
     # --- GAN discriminator ---
-    disc_dim: int = 128          # hidden dim for token projection branches
-    disc_adv_weight: float = 0.02  # adversarial loss weight relative to reconstruction
-    disc_lr: float = 1e-4         # discriminator learning rate
+    disc_dim: int = 128
+    disc_adv_weight: float = 0.02
+    disc_lr: float = 1e-4
+
+    # --- memory ---
+    gradient_checkpointing: bool = False
 
     @property
     def n_patch(self) -> int:
-        return self.img_size // self.patch_px   # patches per side (64)
+        return self.img_size // self.patch_px
 
     @property
     def n_levels(self) -> int:
