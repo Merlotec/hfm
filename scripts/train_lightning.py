@@ -101,7 +101,9 @@ def main() -> None:
                         help='Load weights from a GANTrainer .pt checkpoint (fresh optimizer)')
     parser.add_argument('--epochs',      type=int,  default=None)
     parser.add_argument('--devices',     type=int,  default=1,
-                        help='Number of GPUs (2 for dual 5090)')
+                        help='GPUs per node')
+    parser.add_argument('--nodes',       type=int,  default=1,
+                        help='Number of nodes for multi-node training')
     parser.add_argument('--batch-size',  type=int,  default=None,
                         help='Override batch_size from hyperparams.json')
     parser.add_argument('--log-every',   type=int,  default=50)
@@ -178,10 +180,12 @@ def main() -> None:
     ]
 
     # ---- trainer ----
+    multi_gpu = args.devices > 1 or args.nodes > 1
     trainer = L.Trainer(
         accelerator          = 'gpu' if torch.cuda.is_available() else 'cpu',
         devices              = args.devices,
-        strategy             = 'ddp_find_unused_parameters_true' if args.devices > 1 else 'auto',
+        num_nodes            = args.nodes,
+        strategy             = 'ddp_find_unused_parameters_true' if multi_gpu else 'auto',
         max_epochs           = n_epochs,
         callbacks            = callbacks,
         log_every_n_steps    = args.log_every,

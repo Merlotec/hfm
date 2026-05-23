@@ -69,18 +69,31 @@ class PatchEmbed(nn.Module):
 
 
 class PatchDecoder(nn.Module):
-    """[B, P, P, d_patch] → [B, C, H, W] via adjoint (weight-tied) ConvTranspose2d."""
+    """
+    [B, P, P, d_patch] → [B, C, H, W]
 
-    def __init__(self, encoder: PatchEmbed):
+    ConvTranspose2d (weight-tied to encoder) tiles patch tokens into non-overlapping
+    blocks, which causes seam artifacts. A two-layer 3×3 conv refinement head blurs
+    across block boundaries at minimal cost.
+    """
+
+    def __init__(self, encoder: PatchEmbed, out_channels: int):
         super().__init__()
         self.encoder = encoder
+        hidden = max(out_channels * 4, 32)
+        self.refine = nn.Sequential(
+            nn.Conv2d(out_channels, hidden, kernel_size=3, padding=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden, out_channels, kernel_size=3, padding=1, bias=False),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv_transpose2d(
+        out = F.conv_transpose2d(
             rearrange(x, 'b h w c -> b c h w'),
             self.encoder.proj.weight,
             stride=self.encoder.proj.stride,
         )
+        return self.refine(out)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +375,7 @@ class HFM(nn.Module):
         ])
 
         self.layers  = nn.ModuleList([HFMLayer(cfg) for _ in range(cfg.n_layers)])
-        self.decoder = PatchDecoder(self.patch_embed)
+        self.decoder = PatchDecoder(self.patch_embed, cfg.in_channels)
 
         self._init_weights()
 
