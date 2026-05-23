@@ -286,8 +286,7 @@ class HFM(nn.Module):
         P  = cfg.n_patch            # grid side (16 for 256px / 16px patches)
         hd = cfg.d_patch // cfg.n_heads
 
-        self.patch_embed = PatchEmbed(cfg.in_channels, cfg.patch_px, cfg.d_patch)
-        self.mask_embed  = PatchEmbed(1, cfg.patch_px, cfg.d_patch)
+        self.patch_embed  = PatchEmbed(cfg.in_channels + 1, cfg.patch_px, cfg.d_patch)
         self.skip_encoder = SkipEncoder(cfg.in_channels, cfg.skip_ch)
 
         # Learnable global capacity tokens
@@ -364,7 +363,14 @@ class HFM(nn.Module):
 
         skip_feats = self.skip_encoder(x)
 
-        # Patch-level geometry mask  [1, P², 1]
+        # Augment input with mask channel: model jointly learns to use/discount holes
+        if pixel_mask is not None:
+            mask_ch = pixel_mask.float().expand(B, 1, x.shape[2], x.shape[3])
+        else:
+            mask_ch = torch.ones(B, 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+        x_aug = torch.cat([x, mask_ch], dim=1)
+
+        # Patch-level geometry mask [1, P², 1] — used to zero fully-hole tokens at input
         patch_mask: Optional[torch.Tensor] = None
         if pixel_mask is not None:
             pm = F.max_pool2d(pixel_mask.float(),
@@ -373,9 +379,7 @@ class HFM(nn.Module):
             patch_mask = pm.reshape(pm.shape[0], -1, 1)
 
         # Encode input patches
-        patches = self.patch_embed(x)                               # [B, P, P, d]
-        if pixel_mask is not None:
-            patches = patches + self.mask_embed(pixel_mask.float())
+        patches = self.patch_embed(x_aug)                           # [B, P, P, d]
         patches = patches.reshape(B, n_patch, self.cfg.d_patch)     # [B, P², d]
         if patch_mask is not None:
             patches = patches * patch_mask

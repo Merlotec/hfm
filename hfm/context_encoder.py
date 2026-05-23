@@ -56,8 +56,7 @@ class ContextEncoder(nn.Module):
         super().__init__()
         P = cfg.img_size // cfg.ctx_patch_px    # patches per side in context encoder
 
-        self.patch_embed  = PatchEmbed(cfg.in_channels, cfg.ctx_patch_px, cfg.d_ctx)
-        self.mask_embed   = PatchEmbed(1, cfg.ctx_patch_px, cfg.d_ctx)
+        self.patch_embed  = PatchEmbed(cfg.in_channels + 1, cfg.ctx_patch_px, cfg.d_ctx)
         self.spatial_pos  = LearnedPos2D(P, P, cfg.d_ctx)
         self.temporal_pos = nn.Embedding(64, cfg.d_ctx)   # supports up to 64 input frames
 
@@ -97,14 +96,17 @@ class ContextEncoder(nn.Module):
     ) -> torch.Tensor:
         B = frames[0].shape[0]
 
-        geom = self.mask_embed(pixel_mask.float()) if pixel_mask is not None else None
+        if pixel_mask is not None:
+            mask_ch = pixel_mask.float().expand(B, 1, frames[0].shape[2], frames[0].shape[3])
+        else:
+            mask_ch = torch.ones(B, 1, frames[0].shape[2], frames[0].shape[3],
+                                 device=frames[0].device, dtype=frames[0].dtype)
 
         tokens: List[torch.Tensor] = []
         for t, frame in enumerate(frames):
-            tok = self.spatial_pos(self.patch_embed(frame))    # [B, P, P, d_ctx]
-            if geom is not None:
-                tok = tok + geom
-            tok = rearrange(tok, 'b h w d -> b (h w) d')      # [B, P², d_ctx]
+            frame_aug = torch.cat([frame, mask_ch], dim=1)
+            tok = self.spatial_pos(self.patch_embed(frame_aug))  # [B, P, P, d_ctx]
+            tok = rearrange(tok, 'b h w d -> b (h w) d')         # [B, P², d_ctx]
             tok = tok + self.temporal_pos.weight[t]            # broadcast temporal bias
             tokens.append(tok)
 
