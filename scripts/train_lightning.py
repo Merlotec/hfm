@@ -181,7 +181,7 @@ def main() -> None:
     trainer = L.Trainer(
         accelerator          = 'gpu' if torch.cuda.is_available() else 'cpu',
         devices              = args.devices,
-        strategy             = 'ddp' if args.devices > 1 else 'auto',
+        strategy             = 'ddp_find_unused_parameters_true' if args.devices > 1 else 'auto',
         max_epochs           = n_epochs,
         callbacks            = callbacks,
         log_every_n_steps    = args.log_every,
