@@ -202,6 +202,16 @@ class HFMLightningModule(L.LightningModule):
         checkpoint['cfg']             = self.cfg
         checkpoint['global_step']     = self.global_step
 
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # Fill keys present in the current model but absent from the checkpoint
+        # (e.g. decoder.refine added after the checkpoint was saved) with their
+        # random-init values so Lightning's strict load_state_dict doesn't fail.
+        current = self.state_dict()
+        ckpt_sd = checkpoint['state_dict']
+        for k, v in current.items():
+            if k not in ckpt_sd:
+                ckpt_sd[k] = v
+
 
 # ---------------------------------------------------------------------------
 # Lightning data module
