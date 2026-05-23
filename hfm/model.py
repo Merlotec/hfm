@@ -286,9 +286,8 @@ class HFM(nn.Module):
         P  = cfg.n_patch            # grid side (16 for 256px / 16px patches)
         hd = cfg.d_patch // cfg.n_heads
 
-        self.patch_embed  = PatchEmbed(cfg.in_channels, cfg.patch_px, cfg.d_patch)
-        self.patch_pos    = LearnedPos2D(P, P, cfg.d_patch)
-        self.mask_embed   = PatchEmbed(1, cfg.patch_px, cfg.d_patch)
+        self.patch_embed = PatchEmbed(cfg.in_channels, cfg.patch_px, cfg.d_patch)
+        self.mask_embed  = PatchEmbed(1, cfg.patch_px, cfg.d_patch)
         self.skip_encoder = SkipEncoder(cfg.in_channels, cfg.skip_ch)
 
         # Learnable global capacity tokens
@@ -374,7 +373,7 @@ class HFM(nn.Module):
             patch_mask = pm.reshape(pm.shape[0], -1, 1)
 
         # Encode input patches
-        patches = self.patch_pos(self.patch_embed(x))               # [B, P, P, d]
+        patches = self.patch_embed(x)                               # [B, P, P, d]
         if pixel_mask is not None:
             patches = patches + self.mask_embed(pixel_mask.float())
         patches = patches.reshape(B, n_patch, self.cfg.d_patch)     # [B, P², d]
