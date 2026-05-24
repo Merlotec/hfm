@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hfm import HFM, ContextEncoder
 from hfm.config import HFMConfig
 from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
+from hfm.discriminator import HFMDiscriminator
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / 'fvm_model' / 'data'
 FOUNDATION_STATS = Path(__file__).resolve().parents[1] / \
@@ -135,6 +136,79 @@ def save_images(gt: np.ndarray, pred: np.ndarray, out_dir: Path,
 
 
 # ---------------------------------------------------------------------------
+# Discriminator saliency
+# ---------------------------------------------------------------------------
+
+def disc_saliency(
+    discriminator: HFMDiscriminator,
+    frame: torch.Tensor,
+    x_in: torch.Tensor,
+    context: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Gradient of discriminator logit w.r.t. input pixels → [1, H, W] saliency map.
+    High values = pixels the discriminator is most sensitive to.
+    """
+    inp = frame.detach().float().requires_grad_(True)
+    logit = discriminator(inp, x_in.detach(), context.detach())
+    logit.mean().backward()
+    assert inp.grad is not None
+    return inp.grad.abs().mean(dim=1, keepdim=True)  # [1, 1, H, W]
+
+
+def save_disc_saliency(
+    saliency_fake: list[torch.Tensor],
+    saliency_real: list[torch.Tensor],
+    pred_phys: np.ndarray,
+    gt_phys: np.ndarray,
+    out_dir: Path,
+):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('  matplotlib not available — skipping saliency output')
+        return
+
+    sal_dir = out_dir / 'disc_saliency'
+    sal_dir.mkdir(exist_ok=True)
+
+    for t, (sf, sr) in enumerate(zip(saliency_fake, saliency_real)):
+        sf_np = sf.squeeze().cpu().numpy()
+        sr_np = sr.squeeze().cpu().numpy()
+
+        # Normalise each map to [0, 1] for display
+        def _norm(x: np.ndarray) -> np.ndarray:
+            mn, mx = x.min(), x.max()
+            return (x - mn) / (mx - mn + 1e-8)
+
+        fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+
+        # Show channel 1 (u-velocity) as representative frame
+        axes[0].imshow(pred_phys[t, 1], cmap='RdBu_r')
+        axes[0].set_title(f'Prediction (u)  t={t}')
+
+        axes[1].imshow(gt_phys[t, 1], cmap='RdBu_r')
+        axes[1].set_title(f'Ground truth (u)  t={t}')
+
+        axes[2].imshow(_norm(sf_np), cmap='hot')
+        axes[2].set_title('Disc saliency — fake\n(where it sees artefacts)')
+
+        axes[3].imshow(_norm(sr_np), cmap='hot')
+        axes[3].set_title('Disc saliency — real\n(where it sees "real")')
+
+        for ax in axes:
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.savefig(sal_dir / f't{t:03d}_disc_saliency.png', dpi=100, bbox_inches='tight')
+        plt.close()
+
+    print(f'  Saved {len(saliency_fake)} saliency maps → {sal_dir}')
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -154,8 +228,10 @@ def main():
                         help='Frame index to start from (defaults to middle of run)')
     parser.add_argument('--first-frame', type=int, default=20,
                         help='Skip this many initial transient frames')
-    parser.add_argument('--no-images',  action='store_true',
+    parser.add_argument('--no-images',    action='store_true',
                         help='Skip PNG generation')
+    parser.add_argument('--disc-saliency', action='store_true',
+                        help='Compute and save discriminator saliency heatmaps')
     args = parser.parse_args()
 
     device   = get_device()
@@ -187,6 +263,16 @@ def main():
         print('  [warn] no context_encoder in checkpoint; using random weights')
     context_encoder.eval()
 
+    discriminator: HFMDiscriminator | None = None
+    if args.disc_saliency:
+        if 'discriminator' in ckpt:
+            discriminator = HFMDiscriminator(cfg).to(device)
+            discriminator.load_state_dict(ckpt['discriminator'], strict=False)
+            discriminator.eval()
+            print('  Discriminator loaded for saliency.')
+        else:
+            print('  [warn] no discriminator in checkpoint — skipping saliency')
+
     n_context = args.n_context if args.n_context is not None else cfg.n_context_frames
 
     # ---- load data ----
@@ -198,78 +284,88 @@ def main():
     sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()])
     if not sim_dirs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
-    sim_dir = sim_dirs[0]
-    print(f'  Using run: {sim_dir.name}')
+    print(f'  Found {len(sim_dirs)} simulation directories\n')
 
-    # seq_len = n_context frames + the first prediction input frame
     seq_len = n_context + args.n_predict + 1
-    ds = FVMSequenceDataset.with_cache(
-        sim_dir, renderer, seq_len, mean, std, first_frame=args.first_frame
-    )
-    print(f'  {len(ds)} sequences available (seq_len={seq_len})')
 
-    start = args.seq_start if args.seq_start is not None else len(ds) // 2
-    seq   = ds[start]                                    # [T, C, H, W]
-    frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
+    for sim_idx, sim_dir in enumerate(sim_dirs):
+        print(f'[{sim_idx+1}/{len(sim_dirs)}] {sim_dir.name}')
+        run_out = out_dir / sim_dir.name
+        run_out.mkdir(parents=True, exist_ok=True)
 
-    timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
+        ds = FVMSequenceDataset.with_cache(
+            sim_dir, renderer, seq_len, mean, std, first_frame=args.first_frame
+        )
+        if len(ds) == 0:
+            print(f'  [skip] no sequences available')
+            continue
 
-    # ---- encode context ----
-    print(f'\nEncoding {n_context} context frames...')
-    with torch.no_grad():
-        context = context_encoder(frames_gt[:n_context], pixel_mask=pixel_mask)
-    print(f'  context shape: {list(context.shape)}')
+        start = args.seq_start if args.seq_start is not None else len(ds) // 2
+        seq   = ds[start]
+        frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
+        timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
 
-    # ---- autoregressive prediction ----
-    print(f'\nPredicting {args.n_predict} frames autoregressively...')
-    preds = []
-    gt    = []
-    x = frames_gt[n_context]
+        # ---- encode context ----
+        with torch.no_grad():
+            context = context_encoder(frames_gt[:n_context], pixel_mask=pixel_mask)
 
-    with torch.no_grad():
-        for t in range(args.n_predict):
-            pred = model(x, context, pixel_mask=pixel_mask)
-            pred = pred.float() * pixel_mask
-            preds.append(pred.cpu())
-            gt.append(frames_gt[n_context + t].cpu())
+        # ---- autoregressive prediction ----
+        preds          = []
+        gt             = []
+        saliency_fakes = []
+        saliency_reals = []
+        x = frames_gt[n_context]
 
-            if t + 1 < args.n_predict:
-                mae = (frames_gt[n_context + t + 1] - pred).abs().mean().item()
-                print(f'  t={t+1:3d}  MAE={mae:.5f}')
+        with torch.no_grad():
+            for t in range(args.n_predict):
+                pred = model(x, context, pixel_mask=pixel_mask)
+                pred = pred.float() * pixel_mask
+                preds.append(pred.cpu())
+                gt.append(frames_gt[n_context + t].cpu())
 
-            x = pred
+                if t + 1 < args.n_predict:
+                    mae = (frames_gt[n_context + t + 1] - pred).abs().mean().item()
+                    print(f'  t={t+1:3d}  MAE={mae:.5f}')
 
-    # ---- save outputs ----
-    gt_arr   = torch.cat(gt,    dim=0).numpy()    # [T, C, H, W]
-    pred_arr = torch.cat(preds, dim=0).numpy()
+                if discriminator is not None:
+                    x_in_t = frames_gt[n_context + t]
+                    saliency_fakes.append(disc_saliency(discriminator, pred,   x_in_t, context))
+                    saliency_reals.append(disc_saliency(discriminator, x_in_t, x_in_t, context))
 
-    gt_phys   = denorm(gt_arr,   mean, std)
-    pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()
+                x = pred
 
-    np.save(out_dir / 'frames_gt.npy',        gt_arr)
-    np.save(out_dir / 'frames_pred.npy',       pred_arr)
-    np.save(out_dir / 'frames_gt_phys.npy',   gt_phys)
-    np.save(out_dir / 'frames_pred_phys.npy', pred_phys)
-    print(f'\nSaved arrays → {out_dir}')
+        # ---- save outputs ----
+        gt_arr   = torch.cat(gt,    dim=0).numpy()
+        pred_arr = torch.cat(preds, dim=0).numpy()
+        gt_phys   = denorm(gt_arr,   mean, std)
+        pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()
 
-    print('Saving viewer frames...')
-    context_phys = denorm(
-        torch.cat([frames_gt[t].cpu() for t in range(n_context)], dim=0).numpy(),
-        mean, std,
-    ) * pixel_mask.cpu().numpy()
-    all_ts = timestamps[:n_context] + timestamps[n_context:n_context + args.n_predict]
-    save_viewer_frames(
-        gt_phys    = context_phys,
-        pred_phys  = pred_phys,
-        timestamps = all_ts,
-        n_context  = n_context,
-        run_name   = sim_dir.name,
-        viewer_dir = out_dir / 'viewer',
-    )
+        np.save(run_out / 'frames_gt.npy',       gt_arr)
+        np.save(run_out / 'frames_pred.npy',      pred_arr)
+        np.save(run_out / 'frames_gt_phys.npy',  gt_phys)
+        np.save(run_out / 'frames_pred_phys.npy', pred_phys)
 
-    if not args.no_images:
-        print('Saving images...')
-        save_images(gt_arr, pred_arr, out_dir, mean, std)
+        context_phys = denorm(
+            torch.cat([frames_gt[t].cpu() for t in range(n_context)], dim=0).numpy(),
+            mean, std,
+        ) * pixel_mask.cpu().numpy()
+        all_ts = timestamps[:n_context] + timestamps[n_context:n_context + args.n_predict]
+        save_viewer_frames(
+            gt_phys    = context_phys,
+            pred_phys  = pred_phys,
+            timestamps = all_ts,
+            n_context  = n_context,
+            run_name   = sim_dir.name,
+            viewer_dir = out_dir / 'viewer',
+        )
+
+        if not args.no_images:
+            save_images(gt_arr, pred_arr, run_out, mean, std)
+
+        if discriminator is not None and saliency_fakes:
+            save_disc_saliency(saliency_fakes, saliency_reals, pred_phys, gt_phys, run_out)
+
+        print(f'  Saved → {run_out}')
 
     print(f'\nDone.  Viewer output → {out_dir / "viewer"}')
 
