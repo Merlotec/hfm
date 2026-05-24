@@ -130,8 +130,6 @@ def main():
         lr                    = train_hp['lr'],
         weight_decay          = train_hp['weight_decay'],
         l1_weight             = train_hp['l1_weight'],
-        hole_weight           = train_hp.get('hole_loss_weight', 0.1),
-        hole_fill_sigma       = train_hp.get('hole_fill_sigma', 15.0),
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,

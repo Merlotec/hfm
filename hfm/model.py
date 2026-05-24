@@ -370,19 +370,10 @@ class HFM(nn.Module):
             mask_ch = torch.ones(B, 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
         x_aug = torch.cat([x, mask_ch], dim=1)
 
-        # Patch-level geometry mask [1, P², 1] — used to zero fully-hole tokens at input
-        patch_mask: Optional[torch.Tensor] = None
-        if pixel_mask is not None:
-            pm = F.max_pool2d(pixel_mask.float(),
-                              kernel_size=self.cfg.patch_px,
-                              stride=self.cfg.patch_px)
-            patch_mask = pm.reshape(pm.shape[0], -1, 1)
-
-        # Encode input patches
+        # Encode input patches — hole pixels are 0.0 from the renderer so fully-hole
+        # patch tokens are naturally zero without explicit masking.
         patches = self.patch_embed(x_aug)                           # [B, P, P, d]
         patches = patches.reshape(B, n_patch, self.cfg.d_patch)     # [B, P², d]
-        if patch_mask is not None:
-            patches = patches * patch_mask
 
         # Concatenate global capacity tokens
         tokens = torch.cat(

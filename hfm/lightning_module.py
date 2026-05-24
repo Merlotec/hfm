@@ -50,8 +50,6 @@ class HFMLightningModule(L.LightningModule):
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
-        hole_weight: float = 0.1,
-        hole_fill_sigma: float = 15.0,
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.3,
@@ -70,10 +68,7 @@ class HFMLightningModule(L.LightningModule):
         self.model           = HFM(cfg)
         self.context_encoder = ContextEncoder(cfg)
         self.discriminator   = HFMDiscriminator(cfg)
-        self.criterion       = FluidLoss(
-            l1_weight, pixel_mask=pixel_mask,
-            hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
-        )
+        self.criterion       = FluidLoss(l1_weight, pixel_mask=pixel_mask)
 
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)

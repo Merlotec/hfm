@@ -28,82 +28,28 @@ from .config import HFMConfig
 # ---------------------------------------------------------------------------
 
 class FluidLoss(nn.Module):
-    """
-    MSE + L1 reconstruction loss with optional hole-filling.
-
-    Valid pixels: loss against true target (full weight).
-    Hole pixels:  loss against Gaussian-weighted average of nearby valid pixels
-                  (weight = hole_weight).  pred must be unmasked so gradient
-                  flows back through hole regions.
-    """
+    """MSE + L1 reconstruction loss over valid (non-hole) pixels only."""
 
     def __init__(
         self,
         l1_weight: float = 0.1,
         pixel_mask: Optional[torch.Tensor] = None,
-        hole_weight: float = 0.1,
-        hole_fill_sigma: float = 15.0,
+        **kwargs,  # absorb removed hole_weight / hole_fill_sigma args
     ):
         super().__init__()
-        self.l1_weight  = l1_weight
-        self.hole_weight = hole_weight
+        self.l1_weight = l1_weight
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
-            self.register_buffer('fill_kernel', self._gauss1d(hole_fill_sigma))
         else:
-            self.pixel_mask:  Optional[torch.Tensor] = None
-            self.fill_kernel: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _gauss1d(sigma: float, truncate: float = 3.0) -> torch.Tensor:
-        r = int(sigma * truncate + 0.5)
-        x = torch.arange(-r, r + 1, dtype=torch.float)
-        k = torch.exp(-0.5 * (x / sigma) ** 2)
-        return k / k.sum()   # [K]
-
-    def _fill_holes(self, target: torch.Tensor) -> torch.Tensor:
-        """Separable Gaussian fill: hole pixels ← weighted avg of nearby valid pixels."""
-        pm = self.pixel_mask
-        fk = self.fill_kernel
-        assert pm is not None and fk is not None
-        B, C, H, W = target.shape
-        mask  = pm.float()                                  # [1, 1, H, W]
-        valid = target * mask
-
-        pad = fk.shape[0] // 2
-        kh  = fk.reshape(1, 1, -1, 1)                      # vertical kernel
-        kw  = fk.reshape(1, 1, 1, -1)                      # horizontal kernel
-
-        bc = B * C
-        v  = valid.reshape(bc, 1, H, W)
-        m  = mask.expand(B, C, H, W).reshape(bc, 1, H, W)
-
-        # Separable blur of values and mask weights
-        vb = F.conv2d(F.conv2d(v, kh, padding=(pad, 0)), kw, padding=(0, pad))
-        mb = F.conv2d(F.conv2d(m, kh, padding=(pad, 0)), kw, padding=(0, pad))
-
-        filled = (vb / mb.clamp(min=1e-6)).reshape(B, C, H, W)
-        return target * mask + filled * (1.0 - mask)       # valid pixels unchanged
-
-    def _pixel_loss(self, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        d = p - t
-        return d.pow(2).mean() + self.l1_weight * d.abs().mean()
+            self.pixel_mask: Optional[torch.Tensor] = None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.pixel_mask is None:
-            return self._pixel_loss(pred.reshape(-1), target.reshape(-1))
-
-        mask      = self.pixel_mask.expand_as(pred).bool()
-        hole_mask = ~mask
-
-        valid_loss = self._pixel_loss(pred[mask], target[mask])
-
-        if hole_mask.any() and self.hole_weight > 0.0:
-            filled = self._fill_holes(target.float())
-            hole_loss = self._pixel_loss(pred[hole_mask], filled.expand_as(pred)[hole_mask])
-            return valid_loss + self.hole_weight * hole_loss
-
-        return valid_loss
+            d = pred - target
+        else:
+            mask = self.pixel_mask.expand_as(pred).bool()
+            d = pred[mask] - target[mask]
+        return d.pow(2).mean() + self.l1_weight * d.abs().mean()
 
 
 # ---------------------------------------------------------------------------
