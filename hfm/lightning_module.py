@@ -211,13 +211,16 @@ class HFMLightningModule(L.LightningModule):
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         # Fill keys present in the current model but absent from the checkpoint
-        # (e.g. decoder.refine added after the checkpoint was saved) with their
-        # random-init values so Lightning's strict load_state_dict doesn't fail.
+        # (e.g. new layers added after checkpoint was saved) with random-init values.
+        # Drop keys that no longer exist (e.g. removed buffers like criterion.fill_kernel).
         current = self.state_dict()
         ckpt_sd = checkpoint['state_dict']
         for k, v in current.items():
             if k not in ckpt_sd:
                 ckpt_sd[k] = v
+        for k in list(ckpt_sd.keys()):
+            if k not in current:
+                del ckpt_sd[k]
 
 
 # ---------------------------------------------------------------------------
