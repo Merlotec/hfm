@@ -363,8 +363,9 @@ class HFM(nn.Module):
 
         skip_feats = self.skip_encoder(x)
 
-        # Augment input with mask channel: model jointly learns to use/discount holes
+        # Zero hole pixels explicitly for robustness, then augment with mask channel
         if pixel_mask is not None:
+            x = x * pixel_mask
             mask_ch = pixel_mask.float().expand(B, 1, x.shape[2], x.shape[3])
         else:
             mask_ch = torch.ones(B, 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
