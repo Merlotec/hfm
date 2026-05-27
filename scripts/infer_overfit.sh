@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-DATA_DIR="$(pwd)/../fvm_model/data/fvm_gen_overfit"
+DATA_DIR="$(pwd)/../data/fvm_gen_overfit"
 OUT_DIR="$(pwd)/out/overfit"
 CKPT_DIR="$(pwd)/checkpoints"
 

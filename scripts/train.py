@@ -30,7 +30,7 @@ from hfm.data import FVMDataModule, build_renderer, load_pixel_mask
 # ---------------------------------------------------------------------------
 
 _ROOT      = Path(__file__).resolve().parents[1]
-_DATA_ROOT = _ROOT.parent / 'fvm_model' / 'data'
+_DATA_ROOT = _ROOT.parent / 'data'
 
 DEFAULT_DATA_DIR = _DATA_ROOT / 'fvm_gen_datasets'
 CKPT_DIR         = _ROOT / 'checkpoints'

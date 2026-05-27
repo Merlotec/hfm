@@ -32,6 +32,6 @@ echo "Job ID:      $SLURM_JOB_ID"
 srun python scripts/train_lightning.py \
     --devices 4 \
     --nodes "$SLURM_NNODES" \
-    --data /data/phy-thetis/nk624/flsim/fvm_model/data/fvm_gen_datasets \
+    --data /data/phy-thetis/nk624/flsim/data/fvm_gen_datasets \
     --resume latest \
     --workers 8

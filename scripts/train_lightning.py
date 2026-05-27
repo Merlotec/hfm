@@ -36,7 +36,7 @@ from hfm.lightning_module import HFMLightningModule, FVMLightningDataModule
 # ---------------------------------------------------------------------------
 
 _ROOT            = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_DIR = _ROOT.parent / 'fvm_model' / 'data' / 'fvm_gen_datasets'
+DEFAULT_DATA_DIR = _ROOT.parent / 'data' / 'fvm_gen_datasets'
 CKPT_DIR         = _ROOT / 'checkpoints'
 HYPERPARAMS      = _ROOT / 'hyperparams.json'
 

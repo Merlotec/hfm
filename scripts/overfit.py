@@ -33,7 +33,7 @@ from hfm.data import FVMDataModule, build_renderer, FVMSequenceDataset, load_pix
 # Paths
 # ---------------------------------------------------------------------------
 
-DATA_ROOT   = Path(__file__).resolve().parents[2] / 'fvm_model' / 'data'
+DATA_ROOT   = Path(__file__).resolve().parents[2] / 'data'
 OVERFIT_DIR = DATA_ROOT / 'fvm_gen_overfit'
 FULL_DIR    = DATA_ROOT / 'fvm_gen_datasets-bk'
 
