@@ -239,7 +239,7 @@ class FVMDataModule:
         renderer = build_renderer(self.data_dir, self.resolution)
 
         sim_dirs = sorted([p for p in self.data_dir.iterdir()
-                           if p.is_dir() and not p.name.startswith('.')])
+                           if p.is_dir() and p.name.startswith('run')])
         if not sim_dirs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 
