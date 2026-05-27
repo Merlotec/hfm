@@ -38,11 +38,9 @@ from renderer import MeshRenderer  # noqa: E402  (needs path injection above)
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
                    device: str = 'cpu') -> MeshRenderer:
-    """Load renderer from cache if available, otherwise build and cache it."""
+    """Load renderer from cache if available and consistent, otherwise build and cache it."""
     H, W = resolution
     cache = dataset_dir / f'renderer_cache_{H}x{W}.pt'
-    if cache.exists():
-        return MeshRenderer.from_cache(str(cache), device=device)
 
     mesh_pkl = dataset_dir / 'shared_mesh.pkl'
     if not mesh_pkl.exists():
@@ -50,10 +48,18 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
     with open(mesh_pkl, 'rb') as f:
         mesh_dict = pickle.load(f)
     fvm_mesh = mesh_dict['mesh']
+    n_cells = int(fvm_mesh.cells.shape[0])
+
+    if cache.exists():
+        renderer = MeshRenderer.from_cache(str(cache), device=device)
+        if renderer._c2v_tri.max().item() < n_cells:
+            return renderer
+        print(f'  Renderer cache stale (mesh size mismatch), rebuilding...')
+        cache.unlink()
 
     renderer = MeshRenderer(
         fvm_mesh.vertices.cpu().numpy(),
-        fvm_mesh.triangles.cpu().numpy(),
+        fvm_mesh.cells.cpu().numpy(),
         resolution=resolution,
         device=device,
     )
