@@ -30,7 +30,7 @@ from hfm.config import HFMConfig
 from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
 from hfm.discriminator import HFMDiscriminator
 
-DATA_ROOT = Path(__file__).resolve().parents[1] / 'fvm_model' / 'data'
+DATA_ROOT = Path(__file__).resolve().parents[1] / 'data'
 FOUNDATION_STATS = Path(__file__).resolve().parents[1] / \
                    'fvm_model' / 'fvm_foundation' / 'input_stats.json'
 
@@ -281,7 +281,7 @@ def main():
     renderer   = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
     pixel_mask = load_pixel_mask(data_dir, renderer, (cfg.img_size, cfg.img_size)).to(device)
 
-    sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()])
+    sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith('run')])
     if not sim_dirs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
     print(f'  Found {len(sim_dirs)} simulation directories\n')
