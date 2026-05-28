@@ -162,6 +162,9 @@ def main():
     nan_streak = 0
 
     for epoch in range(n_epochs):
+        trainer.set_epoch(epoch)
+        if epoch == 5:
+            print(f'  [epoch {epoch}] MAE (L1) loss dropped — MSE only from here.')
         for batch in dm.train_dataloader():          # [B, T, C, H, W]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 

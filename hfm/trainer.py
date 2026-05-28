@@ -215,6 +215,7 @@ class GANTrainer:
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.3,
         pixel_mask: Optional[torch.Tensor] = None,
+        l1_dropoff_epoch: int = 5,
     ):
         self.cfg              = cfg
         self.model            = HFM(cfg)
@@ -238,6 +239,8 @@ class GANTrainer:
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
+        self._l1_base_weight       = l1_weight
+        self._l1_dropoff_epoch     = l1_dropoff_epoch
 
     def _current_adv_weight(self) -> float:
         if self.global_step < self.gan_start_step:
@@ -245,6 +248,10 @@ class GANTrainer:
         steps_in = self.global_step - self.gan_start_step
         ramp = min(1.0, steps_in / max(1, self.gan_ramp_steps))
         return self.cfg.disc_adv_weight * ramp
+
+    def set_epoch(self, epoch: int) -> None:
+        """Call at the start of each epoch. Drops MAE (L1) loss after l1_dropoff_epoch epochs."""
+        self.criterion.l1_weight = 0.0 if epoch >= self._l1_dropoff_epoch else self._l1_base_weight
 
     def to(self, device: torch.device) -> "GANTrainer":
         self.model           = self.model.to(device)
