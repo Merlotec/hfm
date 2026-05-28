@@ -213,16 +213,21 @@ def main():
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
     print(f'Discriminator:   {n_disc:.1f}M params')
     assert dm._dataset is not None
+    steps_per_epoch = math.ceil(len(dm._dataset) / train_hp['batch_size'])
+    start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len})')
-    print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
+    print(f'Curriculum:      GAN activates at step {GAN_START_STEP}')
+    if start_epoch > 0:
+        print(f'Resuming:        epoch {start_epoch} (step {trainer.global_step})')
+    print()
 
     CKPT_DIR.mkdir(exist_ok=True)
     loss_log_path  = CKPT_DIR / 'loss_log.csv'
     loss_plot_path = CKPT_DIR / 'loss_plot.png'
 
-    # Write CSV header (append mode so resuming doesn't clobber earlier rows)
+    # Append mode — safe for resume; write header only when starting fresh
     write_header = not loss_log_path.exists()
-    loss_csv = open(loss_log_path, 'a', newline='')
+    loss_csv    = open(loss_log_path, 'a', newline='')
     loss_writer = csv.writer(loss_csv)
     if write_header:
         loss_writer.writerow(['epoch', 'train_loss', 'val_loss'])
@@ -230,7 +235,7 @@ def main():
 
     nan_streak = 0
 
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
         epoch_recon_sum = 0.0
         epoch_recon_cnt = 0
 
