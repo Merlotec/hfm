@@ -1,0 +1,202 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="488" viewBox="0 0 960 488">
+<defs>
+  <marker id="mh"     viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#444"/></marker>
+  <marker id="mh-grn" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#228855"/></marker>
+  <marker id="mh-org" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#CC7722"/></marker>
+  <marker id="mh-pur" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#7733AA"/></marker>
+  <marker id="mh-red" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#BB2233"/></marker>
+  <marker id="mh-sla" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#5577CC"/></marker>
+</defs>
+<rect width="960" height="488" fill="white"/>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- GENERATOR PIPELINE  (top, horizontal L→R)                 -->
+<!-- boxes span y=62..292                                      -->
+<!-- ══════════════════════════════════════════════════════════ -->
+
+<!-- INPUT -->
+<rect x="18" y="100" width="120" height="36" rx="5"
+      fill="#F0F0F0" stroke="#777" stroke-width="1.5"/>
+<text x="78" y="123" text-anchor="middle"
+      font-family="Helvetica Neue,Helvetica,Arial,sans-serif"
+      font-size="12" font-weight="bold">Input  x<tspan dy="4" font-size="9">t</tspan></text>
+
+<line x1="138" y1="118" x2="154" y2="118" stroke="#444" stroke-width="1.5" marker-end="url(#mh)"/>
+
+<!-- MASK CONCAT -->
+<rect x="154" y="100" width="118" height="36" rx="5"
+      fill="#FFF5E0" stroke="#CC8833" stroke-width="1.4"/>
+<text x="213" y="123" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="12" font-weight="bold" fill="#774400">Mask concat</text>
+
+<line x1="272" y1="118" x2="288" y2="118" stroke="#444" stroke-width="1.5" marker-end="url(#mh)"/>
+
+<!-- PATCH EMBED -->
+<rect x="288" y="88" width="132" height="36" rx="5"
+      fill="#CCE5FF" stroke="#2255BB" stroke-width="1.5"/>
+<text x="354" y="111" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="12" font-weight="bold" fill="#1133AA">PatchEmbed</text>
+
+<!-- GLOBAL TOKENS — dashed, attached below -->
+<rect x="288" y="130" width="132" height="28" rx="4"
+      fill="#E6EEFF" stroke="#2255BB" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="354" y="149" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="10" font-weight="bold" fill="#224488">+ 16 global tokens</text>
+
+<!-- merge bracket → HFMLayer -->
+<line x1="420" y1="106" x2="436" y2="106" stroke="#444" stroke-width="1.2"/>
+<line x1="420" y1="144" x2="436" y2="144" stroke="#444" stroke-width="1.2"/>
+<line x1="436" y1="106" x2="436" y2="144" stroke="#444" stroke-width="1.2"/>
+<line x1="436" y1="125" x2="452" y2="125" stroke="#444" stroke-width="1.5" marker-end="url(#mh)"/>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- HFMLayer × 9   x=452..596, y=62..292                     -->
+<!-- ══════════════════════════════════════════════════════════ -->
+<rect x="452" y="62" width="146" height="230" rx="8"
+      fill="#FFFCF5" stroke="#CC7722" stroke-width="2" stroke-dasharray="8,4"/>
+<text x="525" y="83" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="12" font-weight="bold" fill="#774400">GeneratorLayer  × 9</text>
+
+<rect x="462" y="90" width="126" height="32" rx="4" fill="#FFE4BB" stroke="#CC7722" stroke-width="1.1"/>
+<text x="525" y="111" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#774400">Global Self-Attention</text>
+
+<line x1="525" y1="122" x2="525" y2="132" stroke="#CC7722" stroke-width="1.2" marker-end="url(#mh-org)"/>
+
+<rect x="462" y="132" width="126" height="32" rx="4" fill="#FFE4BB" stroke="#CC7722" stroke-width="1.1"/>
+<text x="525" y="153" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#774400">Context Cross-Attn</text>
+
+<line x1="525" y1="164" x2="525" y2="174" stroke="#CC7722" stroke-width="1.2" marker-end="url(#mh-org)"/>
+
+<rect x="462" y="174" width="126" height="32" rx="4" fill="#FFE4BB" stroke="#CC7722" stroke-width="1.1"/>
+<text x="525" y="195" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#774400">FFN</text>
+
+<line x1="525" y1="206" x2="525" y2="216" stroke="#CC7722" stroke-width="1.2" marker-end="url(#mh-org)"/>
+
+<rect x="462" y="216" width="126" height="28" rx="4"
+      fill="#FFF0D8" stroke="#CC8833" stroke-width="1"/>
+<text x="525" y="235" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#774400">Slice patch tokens</text>
+
+<!-- arrow right to decoder -->
+<line x1="598" y1="177" x2="614" y2="177" stroke="#CC7722" stroke-width="1.5" marker-end="url(#mh-org)"/>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- OVERLAPPING PATCH DECODER  x=614..800, y=62..292         -->
+<!-- ══════════════════════════════════════════════════════════ -->
+<rect x="614" y="62" width="186" height="230" rx="7"
+      fill="#F5EEFF" stroke="#7733AA" stroke-width="1.8"/>
+<text x="707" y="83" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="11" font-weight="bold" fill="#441188">Overlapping Patch Decoder</text>
+
+<!-- Step 1: Head MLP -->
+<rect x="624" y="90" width="166" height="32" rx="4" fill="#E8D4FF" stroke="#7733AA" stroke-width="1.1"/>
+<text x="707" y="111" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#551188">Head MLP  (per token)</text>
+
+<line x1="707" y1="122" x2="707" y2="132" stroke="#7733AA" stroke-width="1.2" marker-end="url(#mh-pur)"/>
+
+<!-- Step 2: Tent fold -->
+<rect x="624" y="132" width="166" height="32" rx="4" fill="#E8D4FF" stroke="#7733AA" stroke-width="1.1"/>
+<text x="707" y="153" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#551188">Tent fold  +  norm</text>
+
+<line x1="707" y1="164" x2="707" y2="174" stroke="#7733AA" stroke-width="1.2" marker-end="url(#mh-pur)"/>
+
+<!-- Step 3: post-conv + residual -->
+<rect x="624" y="174" width="166" height="32" rx="4" fill="#E8D4FF" stroke="#7733AA" stroke-width="1.1"/>
+<text x="707" y="195" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#551188">cat(skip)  →  post-conv  +  ⊕</text>
+
+<!-- SkipEncoder sub-box at bottom of decoder -->
+<rect x="628" y="226" width="158" height="28" rx="4"
+      fill="#E8EEFF" stroke="#5577CC" stroke-width="1.2"/>
+<text x="707" y="245" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="10" font-weight="bold" fill="#334499">SkipEncoder</text>
+
+<!-- SkipEncoder → step 3 (arrow up, dashed) -->
+<line x1="707" y1="226" x2="707" y2="206"
+      stroke="#5577CC" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#mh-sla)"/>
+
+<!-- skip path: input x → below all boxes → up into SkipEncoder -->
+<path d="M 78 136 L 78 306 L 707 306 L 707 254"
+      stroke="#5577CC" stroke-width="1.1" fill="none"
+      stroke-dasharray="4,3" marker-end="url(#mh-sla)"/>
+
+<!-- output arrow right -->
+<line x1="800" y1="177" x2="818" y2="177" stroke="#7733AA" stroke-width="1.5" marker-end="url(#mh-pur)"/>
+
+<!-- OUTPUT -->
+<rect x="818" y="159" width="122" height="36" rx="4"
+      fill="#F0F0F0" stroke="#777" stroke-width="1.5"/>
+<text x="879" y="177" text-anchor="middle" dominant-baseline="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="11" font-weight="bold">Output  x̂<tspan dy="4" font-size="8">t+1</tspan></text>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- CONTEXT FRAMES + CONTEXT ENCODER                         -->
+<!-- sit between pipeline and discriminator                    -->
+<!-- ══════════════════════════════════════════════════════════ -->
+
+<!-- Context frames input box -->
+<!-- Context frames — starts at x=160, safely right of the input line at x=78 -->
+<rect x="160" y="322" width="136" height="36" rx="5"
+      fill="#DDFAEB" stroke="#228855" stroke-width="1.4"/>
+<text x="228" y="345" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="11" font-weight="bold" fill="#115533">Context frames</text>
+
+<line x1="296" y1="340" x2="312" y2="340" stroke="#228855" stroke-width="1.4" marker-end="url(#mh-grn)"/>
+
+<!-- ContextEncoder box -->
+<rect x="312" y="322" width="448" height="36" rx="6"
+      fill="#BBEECC" stroke="#228855" stroke-width="1.8"/>
+<text x="536" y="345" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="13" font-weight="bold" fill="#115533">ContextEncoder</text>
+
+<!-- context → HFMLayer Context Cross-Attn: straight up from x=525 -->
+<line x1="525" y1="322" x2="525" y2="292"
+      stroke="#228855" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#mh-grn)"/>
+
+<!-- context → Discriminator: straight down from x=525 -->
+<line x1="525" y1="358" x2="525" y2="400"
+      stroke="#228855" stroke-width="1.4" stroke-dasharray="5,3" marker-end="url(#mh-grn)"/>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- DISCRIMINATOR                                             -->
+<!-- ══════════════════════════════════════════════════════════ -->
+<rect x="160" y="400" width="700" height="56" rx="6"
+      fill="#FFF5F5" stroke="#BB2233" stroke-width="1.5" stroke-dasharray="6,3"/>
+<text x="510" y="434" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif"
+      font-size="13" font-weight="bold" fill="#881122">Discriminator</text>
+
+<!-- x → disc: runs straight down at x=78, turns right below context frames, enters disc left -->
+<path d="M 78 136 L 78 428 L 160 428"
+      stroke="#BB2233" stroke-width="1.1" fill="none"
+      stroke-dasharray="3,4" marker-end="url(#mh-red)" opacity="0.8"/>
+<text x="96" y="390" font-family="Helvetica,Arial,sans-serif"
+      font-size="9" fill="#BB2233" font-style="italic">x</text>
+
+<!-- x̂_t → disc right side -->
+<path d="M 940 177 L 940 428 L 860 428"
+      stroke="#BB2233" stroke-width="1.1" fill="none"
+      stroke-dasharray="3,4" marker-end="url(#mh-red)" opacity="0.8"/>
+<text x="948" y="390" text-anchor="end" font-family="Helvetica,Arial,sans-serif"
+      font-size="9" fill="#BB2233" font-style="italic">x̂<tspan dy="3" font-size="7">t+1</tspan></text>
+
+<!-- real/fake label below disc -->
+<line x1="510" y1="456" x2="510" y2="468" stroke="#BB2233" stroke-width="1.3" marker-end="url(#mh-red)"/>
+<text x="510" y="480" text-anchor="middle"
+      font-family="Helvetica,Arial,sans-serif" font-size="9" fill="#BB2233">real / fake</text>
+
+</svg>

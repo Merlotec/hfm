@@ -93,8 +93,15 @@ def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
     """Return cached pixel mask, building and saving it if not yet cached."""
     H, W = resolution
     cache = dataset_dir / f'pixel_mask_{H}x{W}.pt'
+    n_interior = len(renderer._interior_idx)
     if cache.exists():
-        return torch.load(cache, weights_only=True)
+        m = torch.load(cache, weights_only=True)
+        if (m.shape == (1, 1, H, W)
+                and int(m.sum()) == n_interior
+                and m.view(-1)[renderer._interior_idx].all()):
+            return m
+        print('  Pixel mask stale (renderer mismatch), rebuilding...')
+        cache.unlink()
     mask = build_pixel_mask(renderer, resolution)
     torch.save(mask, cache)
     print(f'  Pixel mask saved — {mask.sum().item()} fluid / {mask.numel()} total pixels')
