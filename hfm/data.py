@@ -245,6 +245,8 @@ class FVMDataModule:
         num_workers: int = 4,
         first_frame: int = 20,
         cache_frames: bool = False,
+        mean: Optional[torch.Tensor] = None,
+        std:  Optional[torch.Tensor] = None,
     ):
         self.data_dir     = Path(data_dir)
         self.seq_len      = seq_len
@@ -254,8 +256,8 @@ class FVMDataModule:
         self.first_frame  = first_frame
         self.cache_frames = cache_frames
         self._dataset: Optional[ConcatDataset] = None
-        self.mean: Optional[torch.Tensor] = None
-        self.std:  Optional[torch.Tensor] = None
+        self.mean: Optional[torch.Tensor] = mean
+        self.std:  Optional[torch.Tensor] = std
 
     def setup(self, recompute_stats: bool = False):
         renderer = build_renderer(self.data_dir, self.resolution)
@@ -265,20 +267,21 @@ class FVMDataModule:
         if not sim_dirs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 
-        # Load or compute normalisation stats
-        stats_path = self.data_dir / self.STATS_FILE
-        if stats_path.exists() and not recompute_stats:
-            with open(stats_path) as f:
-                s = json.load(f)
-            self.mean = torch.tensor(s['mean'])
-            self.std  = torch.tensor(s['std'])
-        else:
-            print('Computing normalisation stats...')
-            self.mean, self.std = compute_normalisation_stats(
-                sim_dirs, renderer, first_frame=self.first_frame)
-            with open(stats_path, 'w') as f:
-                json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
-            print(f'Stats saved to {stats_path}')
+        # Load or compute normalisation stats (skip if already provided externally)
+        if self.mean is None or self.std is None:
+            stats_path = self.data_dir / self.STATS_FILE
+            if stats_path.exists() and not recompute_stats:
+                with open(stats_path) as f:
+                    s = json.load(f)
+                self.mean = torch.tensor(s['mean'])
+                self.std  = torch.tensor(s['std'])
+            else:
+                print('Computing normalisation stats...')
+                self.mean, self.std = compute_normalisation_stats(
+                    sim_dirs, renderer, first_frame=self.first_frame)
+                with open(stats_path, 'w') as f:
+                    json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
+                print(f'Stats saved to {stats_path}')
 
         builder = FVMSequenceDataset.with_cache if self.cache_frames else (
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
@@ -299,6 +302,17 @@ class FVMDataModule:
             self._dataset,
             batch_size         = self.batch_size,
             shuffle            = True,
+            num_workers        = self.num_workers,
+            pin_memory         = True,
+            persistent_workers = self.num_workers > 0,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        assert self._dataset is not None, 'Call setup() first'
+        return DataLoader(
+            self._dataset,
+            batch_size         = self.batch_size,
+            shuffle            = False,
             num_workers        = self.num_workers,
             pin_memory         = True,
             persistent_workers = self.num_workers > 0,

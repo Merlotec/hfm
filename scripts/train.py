@@ -13,6 +13,7 @@ Run from the hfm/ root:
 """
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -33,6 +34,7 @@ _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
 
 DEFAULT_DATA_DIR = _DATA_ROOT / 'fvm_gen_datasets'
+DEFAULT_TEST_DIR = _DATA_ROOT / 'test'
 CKPT_DIR         = _ROOT / 'checkpoints'
 HYPERPARAMS      = _ROOT / 'hyperparams.json'
 
@@ -87,6 +89,36 @@ def get_device() -> torch.device:
     return torch.device('cpu')
 
 
+def _save_loss_plot(log_path: Path, plot_path: Path) -> None:
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    epochs, train_losses, val_losses = [], [], []
+    with open(log_path) as f:
+        for row in csv.DictReader(f):
+            epochs.append(int(row['epoch']))
+            train_losses.append(float(row['train_loss']))
+            v = row['val_loss']
+            val_losses.append(float(v) if v and v != 'nan' else float('nan'))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epochs, train_losses, label='train', linewidth=1.5)
+    if any(math.isfinite(v) for v in val_losses):
+        ax.plot(epochs, val_losses, label='val (test set)', linewidth=1.5)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Reconstruction loss')
+    ax.set_title('HFM training loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=120)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -95,6 +127,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
     parser.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR,
                         help='Dataset directory containing simulation subdirs')
+    parser.add_argument('--test-data',  type=Path, default=DEFAULT_TEST_DIR,
+                        help='Test/validation directory for out-of-sample loss (default: ../data/test)')
     parser.add_argument('--resume',     type=str, default=None, nargs='?', const='latest',
                         help='Checkpoint to resume from. Omit value to pick the latest train_step checkpoint.')
     parser.add_argument('--epochs',     type=int,  default=None,
@@ -110,7 +144,7 @@ def main():
     n_epochs = args.epochs or train_hp['n_epochs']
     seq_len  = cfg.n_context_frames + 2   # context frames + input frame + target frame
 
-    # ---- data ----
+    # ---- training data ----
     dm = FVMDataModule(
         data_dir    = args.data,
         seq_len     = seq_len,
@@ -123,6 +157,30 @@ def main():
     pixel_mask = load_pixel_mask(
         args.data, renderer, (cfg.img_size, cfg.img_size)
     ).to(device)
+
+    # ---- test/validation data (optional) ----
+    val_dl         = None
+    val_pixel_mask = None
+    if args.test_data.exists():
+        print(f'Test data: {args.test_data}')
+        val_dm = FVMDataModule(
+            data_dir    = args.test_data,
+            seq_len     = seq_len,
+            batch_size  = train_hp['batch_size'],
+            num_workers = 4,
+            mean        = dm.mean,
+            std         = dm.std,
+        )
+        val_dm.setup()
+        val_renderer   = build_renderer(args.test_data, (cfg.img_size, cfg.img_size))
+        val_pixel_mask = load_pixel_mask(
+            args.test_data, val_renderer, (cfg.img_size, cfg.img_size)
+        ).to(device)
+        val_dl = val_dm.val_dataloader()
+        assert val_dm._dataset is not None
+        print(f'Test dataset:    {len(val_dm._dataset)} sequences\n')
+    else:
+        print(f'Test data dir not found ({args.test_data}) — val loss will not be computed\n')
 
     # ---- trainer ----
     trainer = GANTrainer(
@@ -148,9 +206,9 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
-    n_gen  = sum(p.numel() for p in trainer.model.parameters())         / 1e6
+    n_gen  = sum(p.numel() for p in trainer.model.parameters())           / 1e6
     n_ctx  = sum(p.numel() for p in trainer.context_encoder.parameters()) / 1e6
-    n_disc = sum(p.numel() for p in trainer.discriminator.parameters()) / 1e6
+    n_disc = sum(p.numel() for p in trainer.discriminator.parameters())   / 1e6
     print(f'Generator:       {n_gen:.1f}M params')
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
     print(f'Discriminator:   {n_disc:.1f}M params')
@@ -159,12 +217,23 @@ def main():
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
 
     CKPT_DIR.mkdir(exist_ok=True)
+    loss_log_path  = CKPT_DIR / 'loss_log.csv'
+    loss_plot_path = CKPT_DIR / 'loss_plot.png'
+
+    # Write CSV header (append mode so resuming doesn't clobber earlier rows)
+    write_header = not loss_log_path.exists()
+    loss_csv = open(loss_log_path, 'a', newline='')
+    loss_writer = csv.writer(loss_csv)
+    if write_header:
+        loss_writer.writerow(['epoch', 'train_loss', 'val_loss'])
+        loss_csv.flush()
+
     nan_streak = 0
 
     for epoch in range(n_epochs):
-        trainer.set_epoch(epoch)
-        if epoch == 5:
-            print(f'  [epoch {epoch}] MAE (L1) loss dropped — MSE only from here.')
+        epoch_recon_sum = 0.0
+        epoch_recon_cnt = 0
+
         for batch in dm.train_dataloader():          # [B, T, C, H, W]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
@@ -179,9 +248,13 @@ def main():
                     path = CKPT_DIR / f'train_EMERGENCY_step{step:06d}.pt'
                     trainer.save(str(path))
                     print(f'10 consecutive NaN steps — saved emergency checkpoint and stopping.')
+                    loss_csv.close()
                     sys.exit(1)
                 continue
             nan_streak = 0
+
+            epoch_recon_sum += recon
+            epoch_recon_cnt += 1
 
             if step % args.log_every == 0:
                 print(
@@ -191,10 +264,26 @@ def main():
                     f'adv_w={info["adv_weight"]:.3f}'
                 )
 
+        train_loss = epoch_recon_sum / epoch_recon_cnt if epoch_recon_cnt > 0 else float('nan')
+
+        val_loss = float('nan')
+        if val_dl is not None:
+            val_loss = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
+
+        print(
+            f'  [epoch {epoch:3d}] train_loss={train_loss:.4f}  '
+            f'val_loss={val_loss:.4f}'
+        )
+        loss_writer.writerow([epoch, f'{train_loss:.6f}', f'{val_loss:.6f}'])
+        loss_csv.flush()
+        _save_loss_plot(loss_log_path, loss_plot_path)
+
         if (epoch + 1) % 2 == 0:
             path = CKPT_DIR / f'train_epoch{epoch:03d}.pt'
             trainer.save(str(path))
             print(f'  [ckpt] {path.name}')
+
+    loss_csv.close()
 
 
 if __name__ == '__main__':

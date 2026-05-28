@@ -40,7 +40,7 @@
     "lr_schedule": "cosine",
     "cosine_t_max": 10000,
 
-    "l1_weight": 0.1,
+    "l1_weight": 0.01,
     "hole_loss_weight": 0.1,
     "hole_fill_sigma": 15.0
   }

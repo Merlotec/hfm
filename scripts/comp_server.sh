@@ -12,10 +12,10 @@
 set -e
 cd "$(dirname "$0")/.."
 
-REAL_DIR="$(pwd)/../data/fvm_gen_overfit"
+REAL_DIR="$(pwd)/../fvm_model/data/fvm_gen_overfit"
 GEN_DIR="$(pwd)/out/overfit/viewer"
 VIEWER="$(pwd)/../fvm_model/fvm_viewer/viewer.py"
-PORT="${1:-8050}"
+PORT="${1:-8051}"
 
 if [ ! -d "$GEN_DIR" ]; then
     echo "Viewer output not found at $GEN_DIR"
