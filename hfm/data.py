@@ -48,17 +48,26 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
     with open(mesh_pkl, 'rb') as f:
         mesh_dict = pickle.load(f)
     fvm_mesh = mesh_dict['mesh']
+    verts = fvm_mesh.vertices.cpu().numpy()
     n_cells = int(fvm_mesh.cells.shape[0])
+    x0, x1 = float(verts[:, 0].min()), float(verts[:, 0].max())
+    y0, y1 = float(verts[:, 1].min()), float(verts[:, 1].max())
 
     if cache.exists():
         renderer = MeshRenderer.from_cache(str(cache), device=device)
-        if renderer._c2v_tri.max().item() < n_cells:
+        eps = 1e-3
+        cache_ok = (
+            renderer._c2v_tri.max().item() + 1 == n_cells
+            and abs(renderer.xlim[0] - x0) < eps and abs(renderer.xlim[1] - x1) < eps
+            and abs(renderer.ylim[0] - y0) < eps and abs(renderer.ylim[1] - y1) < eps
+        )
+        if cache_ok:
             return renderer
-        print(f'  Renderer cache stale (mesh size mismatch), rebuilding...')
+        print('  Renderer cache stale (mesh mismatch), rebuilding...')
         cache.unlink()
 
     renderer = MeshRenderer(
-        fvm_mesh.vertices.cpu().numpy(),
+        verts,
         fvm_mesh.cells.cpu().numpy(),
         resolution=resolution,
         device=device,
