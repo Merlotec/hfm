@@ -137,6 +137,7 @@ class OverlappingPatchDecoder(nn.Module):
         self,
         patches: torch.Tensor,
         skip_feats: Optional[List[torch.Tensor]] = None,
+        pixel_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, ph, pw, d = patches.shape
         P      = ph * pw
@@ -157,6 +158,11 @@ class OverlappingPatchDecoder(nn.Module):
             padding=p // 4,
         )
         output = output / self.norm_map.clamp(min=1e-6)
+
+        # Zero holes before post_conv so hole patch values don't bleed into
+        # adjacent fluid pixels through the 3×3 replicate-padded kernel.
+        if pixel_mask is not None:
+            output = output * pixel_mask
 
         post_in = (
             torch.cat([output, skip_feats[0]], dim=1)
@@ -361,29 +367,26 @@ class HFM(nn.Module):
         if self.training and self.cfg.noise_std > 0.0:
             x = x + torch.randn_like(x) * self.cfg.noise_std
 
-        skip_feats = self.skip_encoder(x)
-
-        # Zero hole pixels explicitly for robustness, then augment with mask channel
+        # Zero hole pixels and augment with mask channel before any feature extraction
         if pixel_mask is not None:
             x = x * pixel_mask
             mask_ch = pixel_mask.float().expand(B, 1, x.shape[2], x.shape[3])
         else:
             mask_ch = torch.ones(B, 1, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+
+        # Skip features computed from the masked input so hole pixels are 0
+        # and cannot bleed into adjacent fluid pixels via the 3×3 skip conv.
+        skip_feats = self.skip_encoder(x)
+
         x_aug = torch.cat([x, mask_ch], dim=1)
 
-        # Encode input patches — hole pixels are 0.0 from the renderer so fully-hole
-        # patch tokens are naturally zero without explicit masking.
         patches = self.patch_embed(x_aug)                           # [B, P, P, d]
         patches = patches.reshape(B, n_patch, self.cfg.d_patch)     # [B, P², d]
 
-        # Concatenate global capacity tokens
         tokens = torch.cat(
             [patches, self.global_tokens.expand(B, -1, -1)], dim=1
         )   # [B, P² + n_global, d]
 
-        # Transformer layers — hole patches start at zero but evolve freely via
-        # attention, allowing the transformer to inpaint them and receive gradient
-        # from the hole-filling loss.
         for layer in self.layers:
             if self.cfg.gradient_checkpointing and self.training:
                 tokens = _checkpointed_layer(
@@ -392,9 +395,8 @@ class HFM(nn.Module):
             else:
                 tokens = layer(tokens, context, self.rope_cos, self.rope_sin)
 
-        # Decode from patch tokens only
         patch_tokens = tokens[:, :n_patch].reshape(B, P, P, self.cfg.d_patch)
-        return self.decoder(patch_tokens, skip_feats)
+        return self.decoder(patch_tokens, skip_feats, pixel_mask=pixel_mask)
 
 
 def _checkpointed_layer(

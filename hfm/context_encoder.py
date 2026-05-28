@@ -104,6 +104,8 @@ class ContextEncoder(nn.Module):
 
         tokens: List[torch.Tensor] = []
         for t, frame in enumerate(frames):
+            if pixel_mask is not None:
+                frame = frame * pixel_mask
             frame_aug = torch.cat([frame, mask_ch], dim=1)
             tok = self.spatial_pos(self.patch_embed(frame_aug))  # [B, P, P, d_ctx]
             tok = rearrange(tok, 'b h w d -> b (h w) d')         # [B, P², d_ctx]

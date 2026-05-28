@@ -95,9 +95,7 @@ def train_step_gan(
     # ---- predict ----
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         pred = model(x_in, context, pixel_mask=pixel_mask)
-    # pred_disc: holes zeroed for discriminator consistency with real frames.
-    # pred (unmasked) goes to criterion so gradient flows through hole regions.
-    pred_disc = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
+    pred_masked = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
@@ -107,7 +105,7 @@ def train_step_gan(
 
     # ---- reconstruction only ----
     if adv_weight == 0.0:
-        recon_loss = criterion(pred, x_target)
+        recon_loss = criterion(pred_masked, x_target)
         if not torch.isfinite(recon_loss):
             _zero_and_restore()
             return float('nan'), 0.0
@@ -127,7 +125,7 @@ def train_step_gan(
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         real_logit = discriminator(x_target,            x_in, ctx_detach)
-        fake_logit = discriminator(pred_disc.detach(),  x_in, ctx_detach)
+        fake_logit = discriminator(pred_masked.detach(),  x_in, ctx_detach)
 
     real_labels = torch.full_like(real_logit, 0.9)
     d_loss = (
@@ -151,12 +149,12 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(False)
 
-    recon_loss = criterion(pred, x_target)
+    recon_loss = criterion(pred_masked, x_target)
 
     disc_healthy = disc_update_threshold < d_loss_val < 2.0
     if disc_healthy:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            adv_logit = discriminator(pred_disc, x_in, context)
+            adv_logit = discriminator(pred_masked, x_in, context)
         adv_loss = F.binary_cross_entropy_with_logits(
             adv_logit, torch.ones_like(adv_logit)
         )
@@ -266,7 +264,8 @@ class GANTrainer:
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
                 context = self.context_encoder(frames[:self.cfg.n_context_frames], pixel_mask=pixel_mask)
                 pred    = self.model(x_in, context, pixel_mask=pixel_mask)
-            loss = self.criterion(pred.float(), x_target)
+            pred_m = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
+            loss = self.criterion(pred_m, x_target)
             if torch.isfinite(loss):
                 total += loss.item()
                 count += 1
@@ -323,6 +322,9 @@ class GANTrainer:
     ) -> torch.Tensor:
         self.model.eval()
         self.context_encoder.eval()
+        if pixel_mask is not None:
+            context_frames = [f * pixel_mask for f in context_frames]
+            x = x * pixel_mask
         context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
         pred = self.model(x, context, pixel_mask=pixel_mask)
         if pixel_mask is not None:
