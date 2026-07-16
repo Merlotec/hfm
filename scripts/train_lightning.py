@@ -189,7 +189,7 @@ def main() -> None:
     # ---- trainer ----
     multi_gpu = args.devices > 1 or args.nodes > 1
     trainer = L.Trainer(
-        accelerator          = 'gpu' if torch.cuda.is_available() else 'cpu',
+        accelerator          = 'auto',
         devices              = args.devices,
         num_nodes            = args.nodes,
         strategy             = 'ddp_find_unused_parameters_true' if multi_gpu else 'auto',
