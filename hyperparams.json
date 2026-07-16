@@ -40,6 +40,7 @@
     "lr_schedule": "cosine",
     "cosine_t_max": 10000,
 
-    "l1_weight": 0.01
+    "l1_weight": 0.01,
+    "precision": "bf16-true"
   }
 }

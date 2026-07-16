@@ -199,7 +199,7 @@ def main() -> None:
         log_every_n_steps    = args.log_every,
         num_sanity_val_steps = 0,
         enable_progress_bar  = True,
-        precision            = 'bf16-mixed',
+        precision            = train_hp.get('precision', 'bf16-true'),
     )
 
     trainer.fit(module, dm, ckpt_path=resume)
