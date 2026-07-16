@@ -151,8 +151,17 @@ class HFMLightningModule(L.LightningModule):
             F.binary_cross_entropy_with_logits(real_logit, torch.full_like(real_logit, 0.9)) +
             F.binary_cross_entropy_with_logits(fake_logit, torch.zeros_like(fake_logit))
         )
+        
+        # In DDP, sync the loss scalar across ranks so all GPUs make the exact same decision 
+        # on whether to run manual_backward. Differing decisions lead to NCCL timeouts.
+        d_loss_val = d_loss.detach().clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(d_loss_val, op=torch.distributed.ReduceOp.AVG)
+            
+        disc_healthy = self.disc_update_threshold < d_loss_val.item() < 2.0
+
         disc_opt.zero_grad()
-        if self.disc_update_threshold < d_loss.item() < 2.0:
+        if disc_healthy:
             self.manual_backward(d_loss)
             self.clip_gradients(disc_opt, gradient_clip_val=1.0, gradient_clip_algorithm='norm')  # type: ignore[arg-type]
             disc_opt.step()
@@ -163,9 +172,7 @@ class HFMLightningModule(L.LightningModule):
             p.requires_grad_(False)
 
         recon = self.criterion(pred, x_target)
-        # Only apply adversarial loss when the discriminator is in the healthy range —
-        # same gate as the discriminator update, so generator never chases a runaway disc.
-        disc_healthy = self.disc_update_threshold < d_loss.item() < 2.0
+        # Only apply adversarial loss when the discriminator is in the healthy range
         if disc_healthy:
             adv_logit = self.discriminator(pred_disc, x_in, context)
             adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
