@@ -20,7 +20,8 @@ from .config import HFMConfig
 
 # HFMConfig is stored as a Python object in checkpoints; allowlist it so
 # Lightning's torch.load (weights_only=True default in PyTorch 2.6) doesn't fail.
-torch.serialization.add_safe_globals([HFMConfig])
+if hasattr(torch.serialization, 'add_safe_globals'):
+    torch.serialization.add_safe_globals([HFMConfig])
 from .context_encoder import ContextEncoder
 from .data import FVMDataModule
 from .discriminator import HFMDiscriminator
