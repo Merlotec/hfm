@@ -113,18 +113,17 @@ def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
 # ---------------------------------------------------------------------------
 
 def compute_normalisation_stats(
-    sim_dirs: list[Path],
-    renderer: MeshRenderer,
+    runs: list[tuple[Path, MeshRenderer]],
     n_samples: int = 300,
     first_frame: int = 20,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Estimate per-channel mean and std by sampling frames across all runs."""
-    all_files: list[Path] = []
-    for d in sim_dirs:
-        all_files.extend(sorted(
+    all_files: list[tuple[Path, MeshRenderer]] = []
+    for d, renderer in runs:
+        all_files.extend([(f, renderer) for f in sorted(
             [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
             key=lambda f: float(f.stem[2:]),
-        )[first_frame:])
+        )[first_frame:]])
 
     n = min(n_samples, len(all_files))
     idx = torch.randperm(len(all_files))[:n].tolist()
@@ -134,7 +133,8 @@ def compute_normalisation_stats(
     s2 = torch.zeros(C)
     cnt = torch.zeros(C)
     for i in idx:
-        d = np.load(all_files[i])
+        fpath, renderer = all_files[i]
+        d = np.load(fpath)
         vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
         frame = renderer.render_cell_smooth(vals)   # [C, H, W]
         for c in range(C):
@@ -260,11 +260,26 @@ class FVMDataModule:
         self.std:  Optional[torch.Tensor] = std
 
     def setup(self, recompute_stats: bool = False):
-        renderer = build_renderer(self.data_dir, self.resolution)
+        mesh_dirs = []
+        if (self.data_dir / 'shared_mesh.pkl').exists():
+            mesh_dirs.append(self.data_dir)
+        else:
+            for p in self.data_dir.iterdir():
+                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                    mesh_dirs.append(p)
+                    
+        if not mesh_dirs:
+            raise RuntimeError(f'No shared_mesh.pkl found in {self.data_dir} or its subdirectories')
 
-        sim_dirs = sorted([p for p in self.data_dir.iterdir()
-                           if p.is_dir() and p.name.startswith('run')])
-        if not sim_dirs:
+        runs: list[tuple[Path, MeshRenderer]] = []
+        for mdir in mesh_dirs:
+            renderer = build_renderer(mdir, self.resolution)
+            sim_dirs = sorted([p for p in mdir.iterdir()
+                               if p.is_dir() and p.name.startswith('run')])
+            for sdir in sim_dirs:
+                runs.append((sdir, renderer))
+
+        if not runs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 
         # Load or compute normalisation stats (skip if already provided externally)
@@ -278,7 +293,7 @@ class FVMDataModule:
             else:
                 print('Computing normalisation stats...')
                 self.mean, self.std = compute_normalisation_stats(
-                    sim_dirs, renderer, first_frame=self.first_frame)
+                    runs, first_frame=self.first_frame)
                 with open(stats_path, 'w') as f:
                     json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
                 print(f'Stats saved to {stats_path}')
@@ -288,13 +303,13 @@ class FVMDataModule:
         )
         datasets = [
             builder(d, renderer, self.seq_len, self.mean, self.std, self.first_frame)
-            for d in sim_dirs
+            for d, renderer in runs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
             raise RuntimeError('No usable sequences found — try reducing seq_len or first_frame')
         self._dataset = ConcatDataset(datasets)
-        print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs')
+        print(f'Dataset ready: {len(self._dataset)} sequences across {len(runs)} runs')
 
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'

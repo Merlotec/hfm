@@ -75,7 +75,26 @@ def load_fixed_batch(device: torch.device) -> tuple[list[torch.Tensor], torch.Te
     """
     print(f'Loading overfit data from {OVERFIT_DIR}')
 
-    renderer = build_renderer(OVERFIT_DIR, (256, 256), device='cpu')
+    mesh_dirs = []
+    if (OVERFIT_DIR / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(OVERFIT_DIR)
+    else:
+        for p in OVERFIT_DIR.iterdir():
+            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                mesh_dirs.append(p)
+                
+    if not mesh_dirs:
+        raise RuntimeError(f'No shared_mesh.pkl found in {OVERFIT_DIR} or its subdirectories')
+
+    runs = []
+    for mdir in mesh_dirs:
+        renderer = build_renderer(mdir, (256, 256), device='cpu')
+        sim_dirs = sorted([p for p in mdir.iterdir() if p.is_dir() and p.name.startswith('run')])
+        for sdir in sim_dirs:
+            runs.append((sdir, renderer, mdir))
+            
+    if not runs:
+        raise RuntimeError(f'No simulation subdirectories found in {OVERFIT_DIR}')
 
     # Load or compute normalisation stats from the overfit run
     stats_path = OVERFIT_DIR / 'hfm_input_stats.json'
@@ -97,20 +116,20 @@ def load_fixed_batch(device: torch.device) -> tuple[list[torch.Tensor], torch.Te
             print('Using fvm_foundation normalisation stats')
         else:
             from hfm.data import compute_normalisation_stats
-            sim_dirs = [p for p in OVERFIT_DIR.iterdir() if p.is_dir()]
-            mean, std = compute_normalisation_stats(sim_dirs, renderer,
-                                                     first_frame=FIRST_FRAME)
+            runs_for_stats = [(sdir, rend) for sdir, rend, _ in runs]
+            mean, std = compute_normalisation_stats(runs_for_stats, first_frame=FIRST_FRAME)
             with open(stats_path, 'w') as f:
                 json.dump({'mean': mean.tolist(), 'std': std.tolist()}, f)
             print('Computed and saved normalisation stats')
 
-    sim_dir = sorted([p for p in OVERFIT_DIR.iterdir() if p.is_dir()])[0]
+    # Just use the first available run
+    sim_dir, renderer, mdir = runs[0]
     ds = FVMSequenceDataset.with_cache(
         sim_dir, renderer, SEQ_LEN, mean, std, first_frame=FIRST_FRAME
     )
     print(f'  Run: {sim_dir.name}  —  {len(ds)} sequences available')
 
-    pixel_mask = load_pixel_mask(OVERFIT_DIR, renderer, (256, 256)).to(device)
+    pixel_mask = load_pixel_mask(mdir, renderer, (256, 256)).to(device)
 
     # Use the middle of the sequence for stability
     mid = len(ds) // 2

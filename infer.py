@@ -278,18 +278,35 @@ def main():
     # ---- load data ----
     print(f'\nLoading data from {data_dir}')
     mean, std = load_stats(data_dir)
-    renderer   = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
-    pixel_mask = load_pixel_mask(data_dir, renderer, (cfg.img_size, cfg.img_size)).to(device)
+    renderer_cache = {}
+    
+    mesh_dirs = []
+    if (data_dir / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(data_dir)
+    else:
+        for p in data_dir.iterdir():
+            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                mesh_dirs.append(p)
 
-    sim_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith('run')])
-    if not sim_dirs:
+    if not mesh_dirs:
+        raise RuntimeError(f'No shared_mesh.pkl found in {data_dir} or its subdirectories')
+
+    runs = []
+    for mdir in mesh_dirs:
+        renderer = build_renderer(mdir, (cfg.img_size, cfg.img_size), device='cpu')
+        pixel_mask = load_pixel_mask(mdir, renderer, (cfg.img_size, cfg.img_size)).to(device)
+        sim_dirs = sorted([p for p in mdir.iterdir() if p.is_dir() and p.name.startswith('run')])
+        for sdir in sim_dirs:
+            runs.append((sdir, renderer, pixel_mask))
+
+    if not runs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
-    print(f'  Found {len(sim_dirs)} simulation directories\n')
+    print(f'  Found {len(runs)} simulation runs across {len(mesh_dirs)} meshes\n')
 
     seq_len = n_context + args.n_predict + 1
 
-    for sim_idx, sim_dir in enumerate(sim_dirs):
-        print(f'[{sim_idx+1}/{len(sim_dirs)}] {sim_dir.name}')
+    for sim_idx, (sim_dir, renderer, pixel_mask) in enumerate(runs):
+        print(f'[{sim_idx+1}/{len(runs)}] {sim_dir.name}')
         run_out = out_dir / sim_dir.name
         run_out.mkdir(parents=True, exist_ok=True)
 
