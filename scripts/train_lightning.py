@@ -15,6 +15,7 @@ Resume from specific checkpoint:
 """
 
 from __future__ import annotations
+from typing import Optional, Union
 
 import argparse
 import json
@@ -128,7 +129,7 @@ def main() -> None:
     pixel_mask = load_pixel_mask(first_mdir, renderer, (cfg.img_size, cfg.img_size))
 
     # ---- resolve checkpoint ----
-    resume: str | None = args.resume
+    resume: Optional[str] = args.resume
     if resume == 'latest':
         candidates = sorted(CKPT_DIR.glob('ckpt-step*.ckpt'))
         if not candidates:

@@ -9,6 +9,7 @@ Three variants are needed:
 """
 
 from __future__ import annotations
+from typing import Optional, Union
 
 import math
 import torch
@@ -22,7 +23,7 @@ from einops import rearrange
 # ---------------------------------------------------------------------------
 
 def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                mask: torch.Tensor | None = None) -> torch.Tensor:
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """q/k/v: [..., L, head_dim].  Returns [..., L, head_dim]."""
     scale = math.sqrt(q.shape[-1])
     attn = torch.matmul(q, k.transpose(-2, -1)) / scale

@@ -302,7 +302,7 @@ class HFM(nn.Module):
             )
         )
 
-        # Pre-compute 2-D RoPE cos/sin for [patch tokens | global tokens].
+        # Pre-compute 2-D RoPE cos/sin for [patch Union[tokens, global] tokens].
         # Patch tokens at grid positions (i//P, i%P); global tokens use identity rotation.
         # Registered as buffers so they move with the model to any device.
         assert hd % 4 == 0, "d_patch // n_heads must be divisible by 4 for 2-D RoPE"

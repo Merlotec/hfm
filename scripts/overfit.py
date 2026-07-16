@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 Overfit sanity check for HFM.
 
@@ -258,8 +259,8 @@ def roundtrip_check(model: HFM, device: torch.device):
         z    = torch.randn(1, CFG.d_patch, CFG.n_patch, CFG.n_patch, device=device)
         z_hw = z.permute(0, 2, 3, 1)                    # [B, P, P, d]
         err  = (model.patch_embed(model.decoder(z_hw)) - z_hw).abs()
-        print(f'  mean |encode(decode(z)) - z|: {err.mean().item():.2e}')
-        print(f'  max  |encode(decode(z)) - z|: {err.max().item():.2e}')
+        print(f'  Union[mean, encode](decode(z)) - z|: {err.mean().item():.2e}')
+        print(f'  Union[max, encode](decode(z)) - z|: {err.max().item():.2e}')
 
 
 # ---------------------------------------------------------------------------
