@@ -153,9 +153,21 @@ def main():
     )
     dm.setup()
 
-    renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
+    mesh_dirs = []
+    if (args.data / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(args.data)
+    else:
+        for p in args.data.iterdir():
+            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                mesh_dirs.append(p)
+                
+    if not mesh_dirs:
+        raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
+        
+    first_mdir = mesh_dirs[0]
+    renderer   = build_renderer(first_mdir, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(
-        args.data, renderer, (cfg.img_size, cfg.img_size)
+        first_mdir, renderer, (cfg.img_size, cfg.img_size)
     ).to(device)
 
     # ---- test/validation data (optional) ----
@@ -172,9 +184,21 @@ def main():
             std         = dm.std,
         )
         val_dm.setup()
-        val_renderer   = build_renderer(args.test_data, (cfg.img_size, cfg.img_size))
+        val_mesh_dirs = []
+        if (args.test_data / 'shared_mesh.pkl').exists():
+            val_mesh_dirs.append(args.test_data)
+        else:
+            for p in args.test_data.iterdir():
+                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                    val_mesh_dirs.append(p)
+                    
+        if not val_mesh_dirs:
+            raise RuntimeError(f'No shared_mesh.pkl found in {args.test_data} or its subdirectories')
+            
+        first_val_mdir = val_mesh_dirs[0]
+        val_renderer   = build_renderer(first_val_mdir, (cfg.img_size, cfg.img_size))
         val_pixel_mask = load_pixel_mask(
-            args.test_data, val_renderer, (cfg.img_size, cfg.img_size)
+            first_val_mdir, val_renderer, (cfg.img_size, cfg.img_size)
         ).to(device)
         val_dl = val_dm.val_dataloader()
         assert val_dm._dataset is not None

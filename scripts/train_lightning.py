@@ -112,8 +112,20 @@ def main() -> None:
     seq_len    = cfg.n_context_frames + 2
 
     # ---- pixel mask (loaded once in main process; moved to each GPU as a buffer) ----
-    renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
-    pixel_mask = load_pixel_mask(args.data, renderer, (cfg.img_size, cfg.img_size))
+    mesh_dirs = []
+    if (args.data / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(args.data)
+    else:
+        for p in args.data.iterdir():
+            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                mesh_dirs.append(p)
+                
+    if not mesh_dirs:
+        raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
+        
+    first_mdir = mesh_dirs[0]
+    renderer   = build_renderer(first_mdir, (cfg.img_size, cfg.img_size))
+    pixel_mask = load_pixel_mask(first_mdir, renderer, (cfg.img_size, cfg.img_size))
 
     # ---- resolve checkpoint ----
     resume: str | None = args.resume
