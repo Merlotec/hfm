@@ -123,7 +123,7 @@ def save_images(gt: np.ndarray, pred: np.ndarray, out_dir: Path,
 
             axes[0].set_title(f'Ground truth — {CHANNEL_NAMES[c]}')
             axes[1].set_title(f'Prediction   — {CHANNEL_NAMES[c]}')
-            axes[2].set_title(f'|Union[Error, max]={err.max():.3f}')
+            axes[2].set_title(f'|Error| max={err.max():.3f}')
             for ax in axes:
                 ax.axis('off')
 
