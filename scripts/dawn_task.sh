@@ -44,15 +44,34 @@ export OMP_NUM_THREADS=$(( _CPT > 1 ? _CPT - 1 : 1 ))   # leave 1 core for the C
 _LOCALID="${SLURM_LOCALID:-0}"
 export CCL_WORKER_AFFINITY=$(( _LOCALID * _CPT + _CPT - 1 ))
 
-# Uncomment to diagnose oneCCL bring-up (very verbose, rank 0 is enough):
-# export CCL_LOG_LEVEL=info
+# oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
+# this prints the actual reason.  Set CCL_DEBUG=0 in the environment to silence.
+export CCL_LOG_LEVEL="${CCL_LOG_LEVEL:-info}"
+
+# Backend override: torch>=2.7 with an XPU build ships a NATIVE 'xccl' backend that
+# does not go through oneccl_bindings_for_pytorch at all.  Set HFM_DDP_BACKEND=xccl
+# to force it (hfm/distributed.py auto-detects, but only if is_xccl_available()).
+# export HFM_DDP_BACKEND=xccl
 
 # ---- fail fast, with the reason, instead of silently training on CPU --------
 # rank 0 prints what torch can actually see; init_distributed() hard-errors if a
 # multi-rank job resolves to CPU (override: HFM_ALLOW_CPU=1).
 if [ "${SLURM_PROCID:-0}" = "0" ]; then
-  python -c "import torch; print('torch', torch.__version__, '| xpu',
-        torch.xpu.is_available() if hasattr(torch,'xpu') else 'ABSENT')" || true
+  echo "=== rank0 env ==="
+  echo "  nodes=${SLURM_NNODES:-?} ntasks=${SLURM_NTASKS:-?} localid=${SLURM_LOCALID:-?} cpus/task=${SLURM_CPUS_PER_TASK:-?}"
+  echo "  OMP_NUM_THREADS=$OMP_NUM_THREADS CCL_WORKER_COUNT=$CCL_WORKER_COUNT CCL_WORKER_AFFINITY=$CCL_WORKER_AFFINITY"
+  echo "  CCL_ATL_TRANSPORT=$CCL_ATL_TRANSPORT HFM_DDP_BACKEND=${HFM_DDP_BACKEND:-<auto>}"
+  echo "  cpus visible to this rank: $(nproc) | affinity: $(taskset -pc $$ 2>/dev/null || echo n/a)"
+  python - <<'PY' || true
+import torch, torch.distributed as d
+print('  torch', torch.__version__,
+      '| xpu', torch.xpu.is_available() if hasattr(torch, 'xpu') else 'ABSENT',
+      '| count', torch.xpu.device_count() if hasattr(torch, 'xpu') else 0)
+for b in ('xccl', 'ccl', 'mpi', 'gloo'):
+    fn = getattr(d, f'is_{b}_available', None)
+    print(f'   backend {b:5s}: ', fn() if fn else 'no probe')
+PY
+  echo "================="
 fi
 
 # NOTE: we do NOT use Lightning on Dawn.  Lightning's accelerator registry is
