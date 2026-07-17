@@ -48,8 +48,22 @@ _NCORES=$(python -c 'import os; print(len(os.sched_getaffinity(0)))')
 export CCL_WORKER_AFFINITY=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
 export OMP_NUM_THREADS=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))   # leave that core free
 
+# oneCCL SEGFAULTS during Level-Zero topology discovery on Dawn:
+#   ccl::topo_manager::build_fabric_connectivity_matrix()
+#   ccl::topo_manager::ze_base_init() -> ccl_comm::init() -> ProcessGroupXCCL::getXCCLComm()
+# It is probing Xe Link fabric ports between tiles; the config dump shows
+# `CCL_ZE_TYPE2_TUNE_PORTS: undetected`, i.e. port detection had already failed.
+# Turn off the fabric-vertex connection check (and its port auto-tuning) so the
+# communicator is built without topology awareness.  Collectives still work — they
+# fall back to non-topo algorithms, costing some intra-node bandwidth, not
+# correctness.  Revisit if you later run multiple ranks per node and want Xe Link.
+export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
+export CCL_ZE_AUTO_TUNE_PORTS=0
+export CCL_ZE_DISABLE_PORT_CHECK=1
+
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
-# this prints the actual reason.  Set CCL_DEBUG=0 in the environment to silence.
+# this prints the actual reason.  Set CCL_LOG_LEVEL=warn once it works — info is
+# hundreds of lines per rank.
 export CCL_LOG_LEVEL="${CCL_LOG_LEVEL:-info}"
 
 # Backend override: torch>=2.7 with an XPU build ships a NATIVE 'xccl' backend that
