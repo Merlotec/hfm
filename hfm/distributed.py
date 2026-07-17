@@ -87,6 +87,13 @@ def _ddp_backend(device: torch.device) -> str:
     if device.type == 'cuda':
         return 'nccl'
     if device.type == 'xpu':
+        # torch >= 2.7 ships a native XCCL backend for XPU — no oneccl_bindings
+        # needed.  Fall back to the 'ccl' bindings on older stacks.
+        try:
+            if torch.distributed.is_xccl_available():   # type: ignore[attr-defined]
+                return 'xccl'
+        except Exception:
+            pass
         return 'ccl'          # oneCCL via oneccl_bindings_for_pytorch (torch-ccl)
     return 'gloo'
 
