@@ -43,7 +43,7 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 # GAN curriculum constants (not in hyperparams.json)
 # ---------------------------------------------------------------------------
 
-GAN_START_STEP        = 10_000  # step at which adversarial loss switches on
+GAN_START_STEP        = 2_500   # step at which adversarial loss switches on
 GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
 DISC_UPDATE_THRESHOLD = 0.5     # skip disc update when d_loss <= this
 
@@ -135,6 +135,9 @@ def main():
                         help='Override n_epochs from hyperparams.json')
     parser.add_argument('--log-every',  type=int,  default=50,
                         help='Print a log line every N steps')
+    parser.add_argument('--ckpt-every', type=int,  default=1000,
+                        help='Save train_step<N>.pt every N steps (0 disables). '
+                             'These are what `--resume latest` looks for.')
     args = parser.parse_args()
 
     # Raw torch DDP (NOMAD's launcher).  Lightning is not usable on Dawn: its
@@ -311,6 +314,14 @@ def main():
                     f'disc={disc:.4f}  '
                     f'adv_w={info["adv_weight"]:.3f}'
                 )
+
+            # Step-based checkpoints.  An epoch over 18k sequences is long, so
+            # epoch-only saves risk losing hours to a crash — and `--resume latest`
+            # globs train_step*.pt, which nothing was writing until now.
+            if is_main() and args.ckpt_every > 0 and step > 0 and step % args.ckpt_every == 0:
+                path = CKPT_DIR / f'train_step{step:06d}.pt'
+                trainer.save(str(path))
+                print(f'  [ckpt] {path.name}  (step {step})')
 
         train_loss = epoch_recon_sum / epoch_recon_cnt if epoch_recon_cnt > 0 else float('nan')
 

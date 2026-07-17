@@ -32,6 +32,20 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT           # expose each PVC tile as its own
 export CCL_ZE_IPC_EXCHANGE=sockets             # robust IPC handle exchange on SLURM
 export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun launch)
 
+# libfabric provider.  We deliberately do NOT load the oneAPI modules (see above),
+# so FI_PROVIDER_PATH points at the PIP-BUNDLED providers in the venv, which ship
+# little more than tcp/shm.  oneCCL therefore selects the *tcp* provider, and
+# multi-node allreduce over tcp falls over under load with:
+#   atl_ofi.cpp: prov_ep_handle_cq_err: fi_cq_readerr: err: 265,
+#                prov_err: Resource temporarily unavailable(11)     <- EAGAIN
+#   recv_reduce_entry.hpp:88 update: RECV_REDUCE entry failed
+# Best fix is to not cross the network at all: run 8 ranks on ONE node so every
+# collective stays intra-node (shm / Xe Link).  If you must go multi-node, point
+# FI_PROVIDER_PATH at the SYSTEM libfabric (which has verbs/psm3 for Dawn's fabric)
+# and set FI_PROVIDER accordingly — check `fi_info -l` on a compute node first.
+# export FI_PROVIDER=tcp                       # explicit; slow but functional
+# export FI_PROVIDER_PATH=/usr/lib64/libfabric # system providers, if available
+
 # oneCCL spawns worker THREADS and pins them to cores.  If it pins to a core outside
 # this rank's cgroup cpuset, pthread_create fails with EINVAL(22) and you get:
 #   CCL_ERROR| base_thread.cpp:22 start: pthread_create returns 22
