@@ -29,6 +29,14 @@ export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib64:${VIRTUAL_ENV}/lib:${LD_LIBRARY_PAT
 # ---- XPU / oneCCL configuration --------------------------------------------
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT           # expose each PVC tile as its own XPU
                                                # (2 tiles/card -> xpu:0..7 per node)
+# Each rank sees ONLY its own tile.  With all 8 tiles visible to all 8 ranks, the
+# first allreduce's direct peer reads page-faulted (GPU "NotPresent (PDE)" abort in
+# compute-runtime 25.18) with the topo checks BOTH on and off — i.e. the fault is
+# in the implicit multi-device peer mappings, not the checks.  Masking to one tile
+# per process is the canonical PVC recipe: oneCCL then builds cross-tile access
+# explicitly via IPC handles instead of assuming a shared multi-device context.
+# (pick_device() handles the consequence: every rank's one visible tile is xpu:0.)
+export ZE_AFFINITY_MASK="${SLURM_LOCALID:-0}"
 export CCL_ZE_IPC_EXCHANGE=sockets             # robust IPC handle exchange on SLURM
 export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun launch)
 
@@ -86,12 +94,17 @@ export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
 #    ("Segmentation fault from GPU ... NotPresent (PDE)") in the compute runtime.
 # 8 ranks/node is the layout the topology code expects; let it actually probe.
 #
-# FALLBACK LADDER if topo init crashes again at 8 ranks/node — try in order,
-# one at a time, each trades bandwidth for robustness:
+# FALLBACK LADDER — status so far: checks-off faulted, checks-on faulted, so the
+# current attempt is ZE_AFFINITY_MASK (one tile per rank, above).  If THIS run
+# still hits the GPU "NotPresent (PDE)" abort, take the rungs in order, one per
+# run, each trading bandwidth for robustness:
 #   1. export CCL_SYCL_SINGLE_NODE_ALGORITHM=0   # no direct-P2P single-node algos
 #   2. export CCL_ENABLE_SYCL_KERNELS=0          # no device-side collective kernels
-#   3. export CCL_ZE_ENABLE=0                    # host-staged collectives (slowest,
-#                                                # most robust; correctness first)
+#   3. export CCL_ZE_ENABLE=0                    # host-staged collectives: D2H ->
+#        host allreduce -> H2D.  ~170MB grads/step for this model => tens of ms;
+#        slowest but near-certain.  If even this fails the problem is not oneCCL.
+# After rung 3, stop and mail Dawn support (torch 2.8+xpu native XCCL, 8 ranks/
+# node pvc9, GPU PDE fault on first allreduce, compute-runtime 25.18).
 
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
 # this prints the actual reason.  Set CCL_LOG_LEVEL=warn once it works — info is

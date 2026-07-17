@@ -74,7 +74,10 @@ def pick_device(local_rank: int = 0) -> torch.device:
     if torch.cuda.is_available():
         return torch.device(f'cuda:{local_rank}')
     if _has_xpu():
-        return torch.device(f'xpu:{local_rank}')
+        # Under ZE_AFFINITY_MASK each rank sees exactly ONE tile, always index 0 —
+        # indexing by local_rank would be out of range for every rank but 0.
+        n = torch.xpu.device_count()
+        return torch.device(f'xpu:{local_rank if local_rank < n else 0}')
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
