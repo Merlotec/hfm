@@ -154,11 +154,12 @@ def main():
     seq_len  = cfg.n_context_frames + 2   # context frames + input frame + target frame
 
     # ---- training data ----
+    num_workers = train_hp.get('num_workers', 8)
     dm = FVMDataModule(
         data_dir    = args.data,
         seq_len     = seq_len,
         batch_size  = train_hp['batch_size'],
-        num_workers = 4,
+        num_workers = num_workers,
     )
     dm.setup()
 
@@ -188,7 +189,7 @@ def main():
             data_dir    = args.test_data,
             seq_len     = seq_len,
             batch_size  = train_hp['batch_size'],
-            num_workers = 4,
+            num_workers = num_workers,
             mean        = dm.mean,
             std         = dm.std,
         )
@@ -226,6 +227,7 @@ def main():
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
         pixel_mask            = pixel_mask,
         self_input_prob       = SELF_INPUT_PROB,
+        cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
     )
     trainer.to(device)
 
@@ -251,7 +253,10 @@ def main():
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
     print(f'Discriminator:   {n_disc:.1f}M params')
     assert dm._dataset is not None
-    steps_per_epoch = math.ceil(len(dm._dataset) / train_hp['batch_size'])
+    # Under DDP the sampler shards the dataset, so each rank takes len/(B*world)
+    # optimizer steps per epoch — forgetting `world` here made resume land on the
+    # wrong epoch.
+    steps_per_epoch = math.ceil(len(dm._dataset) / (train_hp['batch_size'] * max(1, world)))
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len})')
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}')

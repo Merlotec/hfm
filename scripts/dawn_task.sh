@@ -60,7 +60,12 @@ export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun lau
 export CCL_WORKER_COUNT=1
 _NCORES=$(python -c 'import os; print(len(os.sched_getaffinity(0)))')
 export CCL_WORKER_AFFINITY=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
-export OMP_NUM_THREADS=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))   # leave that core free
+# Compute runs on the XPU; the host cores mostly feed the DataLoader (num_workers=8
+# renderer processes per rank share this same 12-core cpuset).  A big OMP pool in
+# the main process would just fight them — cap it, and keep the last core free for
+# the CCL worker pinned above.
+_OMP=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))
+export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
 
 # oneCCL SEGFAULTS during Level-Zero topology discovery on Dawn:
 #   ccl::topo_manager::build_fabric_connectivity_matrix()

@@ -90,7 +90,9 @@ def train_step_gan(
     disc_optimizer.zero_grad()
 
     device_type = frames[0].device.type
-    amp = device_type == 'cuda'
+    # bf16 autocast on CUDA *and* XPU — PVC's matrix engines run bf16; leaving this
+    # cuda-only silently trains fp32 on Dawn at a large throughput cost.
+    amp = device_type in ('cuda', 'xpu')
 
     x_in     = frames[n_context]
     x_target = frames[n_context + 1]
@@ -241,8 +243,10 @@ class GANTrainer:
         disc_update_threshold: float = 0.3,
         pixel_mask: Optional[torch.Tensor] = None,
         self_input_prob: float = 0.5,
+        cosine_t_max: int = 10_000,
     ):
         self.self_input_prob  = self_input_prob
+        self.cosine_t_max     = cosine_t_max
         self.cfg              = cfg
         self.model            = HFM(cfg)
         self.context_encoder  = ContextEncoder(cfg)
@@ -258,7 +262,7 @@ class GANTrainer:
             self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999)
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.gen_optimizer, T_max=10_000
+            self.gen_optimizer, T_max=cosine_t_max
         )
 
         self.gan_start_step        = gan_start_step
@@ -284,7 +288,7 @@ class GANTrainer:
         self.context_encoder.eval()
         device      = next(self.model.parameters()).device
         device_type = device.type
-        amp         = device_type == 'cuda'
+        amp         = device_type in ('cuda', 'xpu')
         total, count = 0.0, 0
         for batch in dataloader:
             frames   = [batch[:, t].to(device) for t in range(batch.shape[1])]
