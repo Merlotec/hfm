@@ -16,6 +16,11 @@ export CCL_ZE_IPC_EXCHANGE=sockets             # robust IPC handle exchange on S
 export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun launch)
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-# PyTorch Lightning reads SLURM env vars automatically
+# NOTE: we do NOT use Lightning on Dawn.  Lightning's accelerator registry is
+# {cpu, cuda, mps, tpu} — there is no XPU accelerator — so accelerator='auto'
+# silently falls back to CPU on a PVC node (and 'bf16-true' then dies on a
+# fp32-input/bf16-weight mismatch).  scripts/train.py uses raw torch DDP via
+# hfm/distributed.py, which imports IPEX + oneCCL, selects xpu:<SLURM_LOCALID>
+# and uses the 'ccl' backend.  Rank/size come from SLURM_* env vars.
 cd "$SLURM_SUBMIT_DIR"
-exec python scripts/train_lightning.py --devices 8 --nodes ${SLURM_NNODES:-1}
+exec python scripts/train.py

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hfm import HFMConfig, GANTrainer
 from hfm.data import FVMDataModule, build_renderer, load_pixel_mask
+from hfm.distributed import barrier, cleanup, init_distributed, is_main
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -82,11 +83,10 @@ def load_config() -> tuple[HFMConfig, dict]:
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
+    """Single-process device pick.  Multi-rank runs go through
+    hfm.distributed.init_distributed() instead, which also selects XPU."""
+    from hfm.distributed import pick_device
+    return pick_device()
 
 
 def _save_loss_plot(log_path: Path, plot_path: Path) -> None:
@@ -137,8 +137,13 @@ def main():
                         help='Print a log line every N steps')
     args = parser.parse_args()
 
-    device = get_device()
-    print(f'Device: {device}')
+    # Raw torch DDP (NOMAD's launcher).  Lightning is not usable on Dawn: its
+    # accelerator registry has no XPU entry, so accelerator='auto' picks CPU on a
+    # PVC node.  init_distributed() imports IPEX/oneCCL, selects xpu:<local_rank>
+    # and brings up the 'ccl' process group.  No-op when world_size == 1.
+    rank, world, local, device = init_distributed()
+    if is_main():
+        print(f'World size: {world}   device: {device}')
 
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
@@ -230,6 +235,10 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
+    # AFTER load(): checkpoints are stored unwrapped, and DDP reuses the same
+    # Parameter objects so the optimizers built in GANTrainer.__init__ stay valid.
+    trainer.wrap_ddp(device)
+
     n_gen  = sum(p.numel() for p in trainer.model.parameters())           / 1e6
     n_ctx  = sum(p.numel() for p in trainer.context_encoder.parameters()) / 1e6
     n_disc = sum(p.numel() for p in trainer.discriminator.parameters())   / 1e6
@@ -245,25 +254,32 @@ def main():
         print(f'Resuming:        epoch {start_epoch} (step {trainer.global_step})')
     print()
 
-    CKPT_DIR.mkdir(exist_ok=True)
+    loss_csv = loss_writer = None
     loss_log_path  = CKPT_DIR / 'loss_log.csv'
     loss_plot_path = CKPT_DIR / 'loss_plot.png'
-
-    # Append mode — safe for resume; write header only when starting fresh
-    write_header = not loss_log_path.exists()
-    loss_csv    = open(loss_log_path, 'a', newline='')
-    loss_writer = csv.writer(loss_csv)
-    if write_header:
-        loss_writer.writerow(['epoch', 'train_loss', 'val_loss'])
-        loss_csv.flush()
+    if is_main():                       # only rank 0 writes logs/plots/checkpoints
+        CKPT_DIR.mkdir(exist_ok=True)
+        # Append mode — safe for resume; write header only when starting fresh
+        write_header = not loss_log_path.exists()
+        loss_csv    = open(loss_log_path, 'a', newline='')
+        loss_writer = csv.writer(loss_csv)
+        if write_header:
+            loss_writer.writerow(['epoch', 'train_loss', 'val_loss'])
+            loss_csv.flush()
 
     nan_streak = 0
+    # Build the loader ONCE.  Rebuilding it per-epoch would hand each epoch a fresh
+    # DistributedSampler stuck at epoch=0, i.e. the identical shuffle order every
+    # epoch on every rank; set_epoch below is what actually reshuffles.
+    train_dl = dm.train_dataloader()
 
     for epoch in range(start_epoch, n_epochs):
         epoch_recon_sum = 0.0
         epoch_recon_cnt = 0
+        if hasattr(train_dl.sampler, 'set_epoch'):
+            train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
-        for batch in dm.train_dataloader():          # [B, T, C, H, W]
+        for batch in train_dl:                       # [B, T, C, H, W]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
             recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
@@ -272,12 +288,15 @@ def main():
 
             if not math.isfinite(recon):
                 nan_streak += 1
-                print(f'  [WARN] step {step}: NaN/inf loss (streak={nan_streak})')
+                if is_main():
+                    print(f'  [WARN] step {step}: NaN/inf loss (streak={nan_streak})')
                 if nan_streak >= 10:
-                    path = CKPT_DIR / f'train_EMERGENCY_step{step:06d}.pt'
-                    trainer.save(str(path))
-                    print(f'10 consecutive NaN steps — saved emergency checkpoint and stopping.')
-                    loss_csv.close()
+                    if is_main():
+                        path = CKPT_DIR / f'train_EMERGENCY_step{step:06d}.pt'
+                        trainer.save(str(path))
+                        print('10 consecutive NaN steps — saved emergency checkpoint and stopping.')
+                        if loss_csv is not None:
+                            loss_csv.close()
                     sys.exit(1)
                 continue
             nan_streak = 0
@@ -285,7 +304,7 @@ def main():
             epoch_recon_sum += recon
             epoch_recon_cnt += 1
 
-            if step % args.log_every == 0:
+            if is_main() and step % args.log_every == 0:
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
                     f'recon={recon:.4f}  '
@@ -295,24 +314,31 @@ def main():
 
         train_loss = epoch_recon_sum / epoch_recon_cnt if epoch_recon_cnt > 0 else float('nan')
 
+        # Validation on rank 0 only: val_dl has no DistributedSampler, so every rank
+        # would redundantly score the whole set.  Cheaper to do it once.
         val_loss = float('nan')
-        if val_dl is not None:
+        if val_dl is not None and is_main():
             val_loss = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
 
-        print(
-            f'  [epoch {epoch:3d}] train_loss={train_loss:.4f}  '
-            f'val_loss={val_loss:.4f}'
-        )
-        loss_writer.writerow([epoch, f'{train_loss:.6f}', f'{val_loss:.6f}'])
-        loss_csv.flush()
-        _save_loss_plot(loss_log_path, loss_plot_path)
+        if is_main():
+            print(
+                f'  [epoch {epoch:3d}] train_loss={train_loss:.4f}  '
+                f'val_loss={val_loss:.4f}'
+            )
+            if loss_writer is not None and loss_csv is not None:
+                loss_writer.writerow([epoch, f'{train_loss:.6f}', f'{val_loss:.6f}'])
+                loss_csv.flush()
+            _save_loss_plot(loss_log_path, loss_plot_path)
 
-        if (epoch + 1) % 2 == 0:
-            path = CKPT_DIR / f'train_epoch{epoch:03d}.pt'
-            trainer.save(str(path))
-            print(f'  [ckpt] {path.name}')
+            if (epoch + 1) % 2 == 0:
+                path = CKPT_DIR / f'train_epoch{epoch:03d}.pt'
+                trainer.save(str(path))
+                print(f'  [ckpt] {path.name}')
+        barrier()      # keep ranks together while rank 0 validates / writes
 
-    loss_csv.close()
+    if is_main() and loss_csv is not None:
+        loss_csv.close()
+    cleanup()
 
 
 if __name__ == '__main__':

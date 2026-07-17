@@ -278,6 +278,24 @@ class GANTrainer:
         self.criterion       = self.criterion.to(device)
         return self
 
+    def wrap_ddp(self, device: torch.device) -> "GANTrainer":
+        """Wrap the three modules for DistributedDataParallel.  No-op single-process.
+
+        Call AFTER .to(device) and AFTER any .load().  DDP reuses the same Parameter
+        objects, so gen_optimizer/disc_optimizer (built in __init__ over the raw
+        modules) stay valid.
+
+        find_unused_parameters=True is required here: the generator backward touches
+        no discriminator params and the discriminator backward touches no generator
+        params, so each reducer sees params that never receive a grad.  This is the
+        same reason the Lightning path used 'ddp_find_unused_parameters_true'.
+        """
+        from .distributed import wrap_ddp as _wrap
+        self.model           = _wrap(self.model, device, find_unused_parameters=True)
+        self.context_encoder = _wrap(self.context_encoder, device, find_unused_parameters=True)
+        self.discriminator   = _wrap(self.discriminator, device, find_unused_parameters=True)
+        return self
+
     def step(
         self,
         frames: List[torch.Tensor],
@@ -332,10 +350,16 @@ class GANTrainer:
         return pred
 
     def save(self, path: str):
+        # Unwrap DDP first: a wrapped module's state_dict keys carry a 'module.'
+        # prefix, which would make the checkpoint unloadable by single-process
+        # code (infer.py) and by a resumed non-DDP run.
+        _m = getattr(self.model, 'module', self.model)
+        _c = getattr(self.context_encoder, 'module', self.context_encoder)
+        _d = getattr(self.discriminator, 'module', self.discriminator)
         torch.save({
-            'model':           self.model.state_dict(),
-            'context_encoder': self.context_encoder.state_dict(),
-            'discriminator':   self.discriminator.state_dict(),
+            'model':           _m.state_dict(),
+            'context_encoder': _c.state_dict(),
+            'discriminator':   _d.state_dict(),
             'gen_optimizer':   self.gen_optimizer.state_dict(),
             'disc_optimizer':  self.disc_optimizer.state_dict(),
             'scheduler':       self.scheduler.state_dict(),
@@ -345,6 +369,12 @@ class GANTrainer:
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        # Load into the raw modules — checkpoints are always saved unwrapped (see
+        # save()), so loading through a DDP wrapper would look for 'module.*' keys.
+        # Normally load() runs before wrap_ddp(), but stay correct either way.
+        self.model           = getattr(self.model, 'module', self.model)
+        self.context_encoder = getattr(self.context_encoder, 'module', self.context_encoder)
+        self.discriminator   = getattr(self.discriminator, 'module', self.discriminator)
         missing, unexpected = self.model.load_state_dict(ckpt['model'], strict=False)
         if unexpected:
             print(f'  [warn] model unexpected keys: {unexpected}')

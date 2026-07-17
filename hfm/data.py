@@ -19,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, DistributedSampler
 
 # ---- inject solver path so MeshRenderer is importable ----
 _FLSIM_ROOT = Path(__file__).resolve().parents[2]  # .../flsim
@@ -313,10 +313,18 @@ class FVMDataModule:
 
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'
+        # Under DDP each rank must see a DISJOINT shard of the data, otherwise every
+        # rank trains on the same samples and the gradient averaging buys nothing.
+        # sampler and shuffle are mutually exclusive, so shuffling moves into the
+        # sampler (train.py calls set_epoch each epoch to reshuffle).
+        sampler = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler(self._dataset, shuffle=True, drop_last=True)
         return DataLoader(
             self._dataset,
             batch_size         = self.batch_size,
-            shuffle            = True,
+            shuffle            = (sampler is None),
+            sampler            = sampler,
             num_workers        = self.num_workers,
             pin_memory         = True,
             persistent_workers = self.num_workers > 0,
