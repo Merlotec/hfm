@@ -91,21 +91,24 @@ export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
 #    ("Segmentation fault from GPU ... NotPresent (PDE)") in the compute runtime.
 # 8 ranks/node is the layout the topology code expects; let it actually probe.
 #
-# COLLECTIVES: HOST-STAGED (Level-Zero disabled in oneCCL).  Everything tried on
-# this driver (compute-runtime 25.18) faulted somewhere in oneCCL's ZE path:
-#   * topo checks off  -> GPU PDE page fault, first backward allreduce
-#   * topo checks on   -> same GPU PDE page fault
-#   * + ZE_AFFINITY_MASK (1 tile/rank) -> host SIGSEGV in the DDP-wrap allgather
-# So: no device-side collectives at all.  Gradients go D2H -> host allreduce
-# (shm/OFI) -> H2D.  For this ~43M-param model that is ~170MB/step => tens of ms;
-# a real but acceptable tax, and it removes the entire faulting code path.
-# Once a run has completed cleanly, you can try winning bandwidth back one run at
-# a time: re-enable (delete this line) together with CCL_ENABLE_SYCL_KERNELS=0,
-# then CCL_SYCL_SINGLE_NODE_ALGORITHM=0.  In parallel, this belongs with Dawn
-# support: "torch 2.8+xpu native XCCL, 8 ranks/node on pvc9: GPU NotPresent(PDE)
-# fault on first allreduce; host SIGSEGV in comm init with ZE_AFFINITY_MASK —
-# what is the supported oneCCL config for this stack?"
-export CCL_ZE_ENABLE=0
+# COLLECTIVES: NO oneCCL AT ALL.  Every configuration of oneCCL's ZE path fails
+# on this driver (compute-runtime 25.18):
+#   * topo checks off            -> GPU PDE page fault, first backward allreduce
+#   * topo checks on             -> same GPU PDE page fault
+#   * + ZE_AFFINITY_MASK         -> host SIGSEGV in the DDP-wrap allgather
+#   * CCL_ZE_ENABLE=0            -> "ze_data was not initialized": XCCL cannot
+#                                   build a device communicator without ZE, so
+#                                   oneCCL is simply unusable here.
+# Bypass the layer entirely: gloo process group on the HOST + manual gradient
+# averaging (hfm/distributed.py: allreduce_grads, called in train_step_gan).
+# Compute stays on the XPUs; only gradients cross rank boundaries, D2H -> gloo
+# shm allreduce -> H2D (~170MB/step for this model => tens of ms).
+# The CCL_* variables above are now inert; kept for the day oneCCL works again.
+# Still worth a Dawn support ticket: "torch 2.8+xpu native XCCL on pvc9,
+# 8 ranks/node: GPU NotPresent(PDE) fault on first allreduce; SIGSEGV in comm
+# init under ZE_AFFINITY_MASK — is there a supported oneCCL config?"
+export HFM_DDP_BACKEND=gloo
+export HFM_HOST_GRAD_SYNC=1
 
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
 # this prints the actual reason.  Set CCL_LOG_LEVEL=warn once it works — info is

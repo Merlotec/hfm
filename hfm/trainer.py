@@ -21,6 +21,7 @@ from .model import HFM
 from .context_encoder import ContextEncoder
 from .discriminator import HFMDiscriminator
 from .config import HFMConfig
+from .distributed import allreduce_grads, allreduce_stats, host_grad_sync_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +126,15 @@ def train_step_gan(
     # ---- reconstruction only ----
     if adv_weight == 0.0:
         recon_loss = criterion(pred_masked, x_target)
-        if not torch.isfinite(recon_loss):
+        # NaN bail must be GLOBAL: if one rank bailed while others proceeded to a
+        # collective (DDP reducer or host allreduce), the job would hang/diverge.
+        (bad,) = allreduce_stats(0.0 if torch.isfinite(recon_loss) else 1.0)
+        if bad > 0.0:
             _zero_and_restore()
             return float('nan'), 0.0
         recon_loss.backward()
+        if host_grad_sync_enabled():
+            allreduce_grads([model, context_encoder])   # average, THEN clip (DDP semantics)
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(context_encoder.parameters()), clip_grad
@@ -163,12 +169,21 @@ def train_step_gan(
     )
     d_loss_val = d_loss.item()
 
-    if not math.isfinite(d_loss_val):
+    # The health gate and NaN bail must be decided on the GLOBAL disc loss: gating
+    # on the local value lets ranks take different branches around a backward/step,
+    # which desyncs weights (and hangs any collective).  Mean over ranks.
+    finite = math.isfinite(d_loss_val)
+    n, d_sum, bad_sum = allreduce_stats(1.0, d_loss_val if finite else 0.0,
+                                        0.0 if finite else 1.0)
+    if bad_sum > 0.0:
         _zero_and_restore()
         return float('nan'), float('nan')
+    d_gate = d_sum / n                       # global mean disc loss
 
-    if disc_update_threshold < d_loss_val < 2.0:
+    if disc_update_threshold < d_gate < 2.0:
         d_loss.backward()
+        if host_grad_sync_enabled():
+            allreduce_grads([discriminator])
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(discriminator.parameters(), clip_grad)
         disc_optimizer.step()
@@ -180,7 +195,7 @@ def train_step_gan(
 
     recon_loss = criterion(pred_masked, x_target)
 
-    disc_healthy = disc_update_threshold < d_loss_val < 2.0
+    disc_healthy = disc_update_threshold < d_gate < 2.0   # same GLOBAL gate as above
     if disc_healthy:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             adv_logit = discriminator(pred_masked, x_in_d, context)
@@ -190,11 +205,14 @@ def train_step_gan(
         total_loss = recon_loss + adv_weight * adv_loss
     else:
         total_loss = recon_loss
-    if not torch.isfinite(total_loss):
+    (bad,) = allreduce_stats(0.0 if torch.isfinite(total_loss) else 1.0)
+    if bad > 0.0:
         _zero_and_restore()
         return float('nan'), d_loss_val
 
     total_loss.backward()
+    if host_grad_sync_enabled():
+        allreduce_grads([model, context_encoder])
     if clip_grad > 0:
         nn.utils.clip_grad_norm_(
             list(model.parameters()) + list(context_encoder.parameters()), clip_grad
@@ -324,6 +342,11 @@ class GANTrainer:
         same reason the Lightning path used 'ddp_find_unused_parameters_true'.
         """
         from .distributed import wrap_ddp as _wrap
+        if host_grad_sync_enabled():
+            # No DDP wrapper at all: gradients are averaged manually on the host in
+            # train_step_gan (gloo group).  Used where no device collective backend
+            # works — DDP's own reducer/verify collectives are exactly what crashes.
+            return self
         self.model           = _wrap(self.model, device, find_unused_parameters=True)
         self.context_encoder = _wrap(self.context_encoder, device, find_unused_parameters=True)
         self.discriminator   = _wrap(self.discriminator, device, find_unused_parameters=True)

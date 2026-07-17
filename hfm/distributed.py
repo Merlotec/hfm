@@ -163,6 +163,52 @@ def unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return getattr(module, 'module', module)
 
 
+def host_grad_sync_enabled() -> bool:
+    """Manual host-side gradient averaging instead of DDP (HFM_HOST_GRAD_SYNC=1).
+
+    For stacks where NO device collective backend works (Dawn: oneCCL's ZE path
+    faults on this driver, and XCCL cannot run with ZE disabled — 'ze_data was
+    not initialized').  The process group is gloo over host memory; compute stays
+    on the XPU; gradients cross rank boundaries via allreduce_grads() below."""
+    return os.environ.get('HFM_HOST_GRAD_SYNC') == '1'
+
+
+def allreduce_grads(modules) -> None:
+    """Average .grad across ranks on the HOST (works with a gloo process group).
+
+    Call between loss.backward() and optimizer.step().  No-op when not
+    distributed.  All ranks must call this with the same modules and the same
+    set of grad-bearing params (keep any conditional backward globally
+    consistent — see allreduce_stats).  ~4B/param of host traffic per call.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    world = torch.distributed.get_world_size()
+    grads = [p.grad for m in modules for p in m.parameters() if p.grad is not None]
+    if not grads:
+        return
+    flat = torch.cat([g.detach().reshape(-1).to('cpu', torch.float32) for g in grads])
+    torch.distributed.all_reduce(flat)
+    flat.div_(world)
+    off = 0
+    for g in grads:
+        n = g.numel()
+        g.copy_(flat[off:off + n].view_as(g).to(g.device, g.dtype))
+        off += n
+
+
+def allreduce_stats(*vals: float):
+    """Sum a few scalars across ranks (host-side).  Returns the summed list, or
+    the inputs unchanged when not distributed.  Use it to make control-flow
+    decisions (health gates, NaN bails) IDENTICAL on every rank — a per-rank
+    branch around a backward/step desyncs both DDP and manual grad averaging."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return list(vals)
+    t = torch.tensor(vals, dtype=torch.float64)
+    torch.distributed.all_reduce(t)
+    return t.tolist()
+
+
 def is_main() -> bool:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
