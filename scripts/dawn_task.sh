@@ -32,17 +32,21 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT           # expose each PVC tile as its own
 export CCL_ZE_IPC_EXCHANGE=sockets             # robust IPC handle exchange on SLURM
 export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun launch)
 
-# oneCCL spawns worker THREADS and pins them to cores.  Under SLURM each rank is
-# confined to a cgroup cpuset; if oneCCL picks a core outside it, the pin fails and
-# you get:  oneCCL: exec.cpp:122 start_workers: EXCEPTION: failed to start worker # 0
-# Give it exactly one worker and reserve a core for it by leaving OMP one short,
-# then pin that worker to a core we know is inside this rank's allocation.
+# oneCCL spawns worker THREADS and pins them to cores.  If it pins to a core outside
+# this rank's cgroup cpuset, pthread_create fails with EINVAL(22) and you get:
+#   CCL_ERROR| base_thread.cpp:22 start: pthread_create returns 22
+#   oneCCL: exec.cpp:122 start_workers: failed to start worker # 0
+#
+# Do NOT compute the core id from SLURM_LOCALID/CPUS_PER_TASK: Dawn does not hand out
+# contiguous blocks.  A real rank's mask looks like
+#   0,2,4,6,8,10,12,14,16,18,20,22          (even cores only — HT siblings)
+# so arithmetic like localid*cpus+cpus-1 lands on an odd core that is NOT in the set.
+# oneCCL's default ('auto') is just as wrong — it picks high cores like 95.
+# Ask the kernel instead: pin the worker to the LAST core actually allowed here.
 export CCL_WORKER_COUNT=1
-_CPT="${SLURM_CPUS_PER_TASK:-2}"
-export OMP_NUM_THREADS=$(( _CPT > 1 ? _CPT - 1 : 1 ))   # leave 1 core for the CCL worker
-# Last core of THIS rank's slice (ranks are laid out contiguously by local id).
-_LOCALID="${SLURM_LOCALID:-0}"
-export CCL_WORKER_AFFINITY=$(( _LOCALID * _CPT + _CPT - 1 ))
+_NCORES=$(python -c 'import os; print(len(os.sched_getaffinity(0)))')
+export CCL_WORKER_AFFINITY=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
+export OMP_NUM_THREADS=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))   # leave that core free
 
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
 # this prints the actual reason.  Set CCL_DEBUG=0 in the environment to silence.
