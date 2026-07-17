@@ -69,6 +69,7 @@ def train_step_gan(
     clip_grad: float = 1.0,
     pixel_mask: Optional[torch.Tensor] = None,
     disc_update_threshold: float = 0.3,
+    self_input_prob: float = 0.0,
 ) -> Tuple[float, float]:
     """
     One training step.
@@ -76,6 +77,12 @@ def train_step_gan(
     frames[0 .. n_context-1]  → ContextEncoder → context
     frames[n_context]         → HFM(context)   → pred
     frames[n_context + 1]     → target
+
+    self_input_prob: scheduled sampling (exposure-bias fix).  With this
+    probability the input frame is replaced by the model's own no-grad
+    prediction of it (from frames[n_context-1]), so the model trains on the
+    blurred/artifacted inputs it actually produces at rollout — teacher forcing
+    alone leaves those off-manifold and errors compound autoregressively.
 
     Returns (recon_loss, disc_loss).  disc_loss is 0.0 when adv_weight == 0.
     """
@@ -91,6 +98,16 @@ def train_step_gan(
     # ---- encode context (gradients flow through context_encoder) ----
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         context = context_encoder(frames[:n_context], pixel_mask=pixel_mask)
+
+    # ---- scheduled sampling: sometimes feed the model its own prediction ----
+    # frames[n_context-1] always exists (n_context >= 1); the supervision target
+    # stays the TRUE frame n_context+1, exactly the pushforward setup.
+    if self_input_prob > 0.0 and float(torch.rand(())) < self_input_prob:
+        with torch.no_grad(), torch.autocast(device_type=device_type,
+                                             dtype=torch.bfloat16, enabled=amp):
+            x_in = model(frames[n_context - 1], context, pixel_mask=pixel_mask).float()
+        if pixel_mask is not None:
+            x_in = x_in * pixel_mask
 
     # ---- predict ----
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
@@ -120,12 +137,22 @@ def train_step_gan(
     # ---- discriminator update ----
     ctx_detach = context.detach()
 
+    # The discriminator must see real and fake with IDENTICAL hole treatment.
+    # Raw target frames carry the renderer's constant fill at hole pixels (raw 0 =>
+    # up to -4.4 sigma after normalisation) while pred_masked has exact 0 there —
+    # an unmasked x_target lets the disc win by reading a single hole pixel.  The
+    # generator can't change its holes (the mask zeroes their gradient), so the adv
+    # term instead distorts the fluid ring around the collider (the visible hue) and
+    # the health gate keeps collapsing.  Mask both sides so holes are non-informative.
+    x_target_d = x_target * pixel_mask if pixel_mask is not None else x_target
+    x_in_d     = x_in     * pixel_mask if pixel_mask is not None else x_in
+
     for p in discriminator.parameters():
         p.requires_grad_(True)
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        real_logit = discriminator(x_target,            x_in, ctx_detach)
-        fake_logit = discriminator(pred_masked.detach(),  x_in, ctx_detach)
+        real_logit = discriminator(x_target_d,            x_in_d, ctx_detach)
+        fake_logit = discriminator(pred_masked.detach(),  x_in_d, ctx_detach)
 
     real_labels = torch.full_like(real_logit, 0.9)
     d_loss = (
@@ -154,7 +181,7 @@ def train_step_gan(
     disc_healthy = disc_update_threshold < d_loss_val < 2.0
     if disc_healthy:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            adv_logit = discriminator(pred_masked, x_in, context)
+            adv_logit = discriminator(pred_masked, x_in_d, context)
         adv_loss = F.binary_cross_entropy_with_logits(
             adv_logit, torch.ones_like(adv_logit)
         )
@@ -213,7 +240,9 @@ class GANTrainer:
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.3,
         pixel_mask: Optional[torch.Tensor] = None,
+        self_input_prob: float = 0.5,
     ):
+        self.self_input_prob  = self_input_prob
         self.cfg              = cfg
         self.model            = HFM(cfg)
         self.context_encoder  = ContextEncoder(cfg)
@@ -318,6 +347,7 @@ class GANTrainer:
             adv_weight=self._current_adv_weight(),
             pixel_mask=pixel_mask,
             disc_update_threshold=self.disc_update_threshold,
+            self_input_prob=self.self_input_prob,
         )
 
         self.scheduler.step()

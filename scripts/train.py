@@ -46,6 +46,7 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 GAN_START_STEP        = 2_500   # step at which adversarial loss switches on
 GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
 DISC_UPDATE_THRESHOLD = 0.5     # skip disc update when d_loss <= this
+SELF_INPUT_PROB       = 0.5     # scheduled sampling: P(input = own prediction)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -224,6 +225,7 @@ def main():
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
         pixel_mask            = pixel_mask,
+        self_input_prob       = SELF_INPUT_PROB,
     )
     trainer.to(device)
 

@@ -56,6 +56,7 @@ class HFMLightningModule(L.LightningModule):
         disc_update_threshold: float = 0.3,
         cosine_t_max: int = 10_000,
         pixel_mask: Optional[torch.Tensor] = None,
+        self_input_prob: float = 0.5,
     ):
         super().__init__()
         self.automatic_optimization = False
@@ -126,6 +127,16 @@ class HFMLightningModule(L.LightningModule):
         adv_w    = self._adv_weight()
 
         context = self.context_encoder(frames[:n], pixel_mask=mask)
+
+        # scheduled sampling (exposure-bias fix): with probability self_input_prob,
+        # feed the model its own no-grad prediction of frame n instead of the GT —
+        # the target stays GT frame n+1 (see trainer.train_step_gan for rationale).
+        if float(torch.rand(())) < self.hparams['self_input_prob']:
+            with torch.no_grad():
+                x_in = self.model(frames[n - 1], context, pixel_mask=mask).float()
+            if mask is not None:
+                x_in = x_in * mask
+
         pred    = self.model(x_in, context, pixel_mask=mask)
 
         # ---- reconstruction only (pre-GAN) ----
@@ -144,9 +155,15 @@ class HFMLightningModule(L.LightningModule):
         pred_disc = pred.float() * mask if mask is not None else pred.float()
 
         # ---- discriminator update ----
+        # Mask BOTH disc inputs: raw target frames carry the renderer's hole fill
+        # (up to -4.4 sigma after normalisation) while pred_disc has holes at 0, so
+        # an unmasked x_target lets the disc win from a single hole pixel (see
+        # trainer.train_step_gan for the full explanation).
         ctx_d      = context.detach()
-        real_logit = self.discriminator(x_target,           x_in, ctx_d)
-        fake_logit = self.discriminator(pred_disc.detach(), x_in, ctx_d)
+        x_target_d = x_target * mask if mask is not None else x_target
+        x_in_d     = x_in     * mask if mask is not None else x_in
+        real_logit = self.discriminator(x_target_d,         x_in_d, ctx_d)
+        fake_logit = self.discriminator(pred_disc.detach(), x_in_d, ctx_d)
         d_loss = (
             F.binary_cross_entropy_with_logits(real_logit, torch.full_like(real_logit, 0.9)) +
             F.binary_cross_entropy_with_logits(fake_logit, torch.zeros_like(fake_logit))
@@ -174,7 +191,7 @@ class HFMLightningModule(L.LightningModule):
         recon = self.criterion(pred, x_target)
         # Only apply adversarial loss when the discriminator is in the healthy range
         if disc_healthy:
-            adv_logit = self.discriminator(pred_disc, x_in, context)
+            adv_logit = self.discriminator(pred_disc, x_in_d, context)
             adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
             g_loss    = recon + adv_w * adv_loss
         else:
