@@ -24,18 +24,43 @@ import torch
 
 # Importing these registers the `xpu` device and the `ccl` distributed backend.
 # Guarded so nothing breaks on CUDA / MPS / CPU machines that lack the Intel stack.
+# The failure reason is KEPT: silently swallowing it is how a job ends up training
+# on CPU for 24h on a GPU allocation with no clue why (see xpu_status()).
 try:
     import intel_extension_for_pytorch as ipex  # noqa: F401
-except Exception:
+    _IPEX_ERR = None
+except Exception as e:                                     # pragma: no cover
     ipex = None
+    _IPEX_ERR = e
 try:
     import oneccl_bindings_for_pytorch  # noqa: F401  (registers the 'ccl' backend)
-except Exception:
-    pass
+    _CCL_ERR = None
+except Exception as e:                                     # pragma: no cover
+    _CCL_ERR = e
 
 
 def _has_xpu() -> bool:
     return hasattr(torch, 'xpu') and torch.xpu.is_available()
+
+
+def xpu_status() -> str:
+    """Why XPU is (or is not) usable — printed when a multi-rank job lands on CPU."""
+    lines = [f'torch={torch.__version__}']
+    lines.append(f'intel_extension_for_pytorch: '
+                 + (f'OK {getattr(ipex, "__version__", "")}' if ipex is not None
+                    else f'IMPORT FAILED -> {type(_IPEX_ERR).__name__}: {_IPEX_ERR}'))
+    lines.append('oneccl_bindings_for_pytorch: '
+                 + ('OK' if _CCL_ERR is None
+                    else f'IMPORT FAILED -> {type(_CCL_ERR).__name__}: {_CCL_ERR}'))
+    if hasattr(torch, 'xpu'):
+        try:
+            lines.append(f'torch.xpu.is_available()={torch.xpu.is_available()} '
+                         f'device_count={torch.xpu.device_count()}')
+        except Exception as e:
+            lines.append(f'torch.xpu probe raised {type(e).__name__}: {e}')
+    else:
+        lines.append('torch.xpu attribute ABSENT (this torch build has no XPU support)')
+    return '\n  '.join(lines)
 
 
 def _env_int(*names, default: int = 0) -> int:
@@ -73,6 +98,19 @@ def init_distributed():
     local = _env_int('LOCAL_RANK', 'MPI_LOCALRANKID', 'PALS_LOCAL_RANKID',
                      'OMPI_COMM_WORLD_LOCAL_RANK', 'SLURM_LOCALID', default=0)
     device = pick_device(local)
+
+    # A multi-rank job on CPU is almost always a broken accelerator env, not intent:
+    # it means hours of cluster time at ~1% throughput.  Refuse, and say why.
+    # Set HFM_ALLOW_CPU=1 for a deliberate CPU-parallel run.
+    if world > 1 and device.type == 'cpu' and os.environ.get('HFM_ALLOW_CPU') != '1':
+        raise RuntimeError(
+            f'Distributed run (world_size={world}) resolved to device=cpu — no '
+            f'accelerator was found, so this would train on CPU.\n'
+            f'  {xpu_status()}\n'
+            'Fix the environment (activate the XPU venv / `pip install '
+            'intel_extension_for_pytorch oneccl_bind_pt`), or set HFM_ALLOW_CPU=1 '
+            'to run on CPU deliberately.  Run scripts/check_xpu.py for detail.'
+        )
 
     if world > 1:
         os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
