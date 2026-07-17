@@ -31,7 +31,21 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT           # expose each PVC tile as its own
                                                # (2 tiles/card -> xpu:0..7 per node)
 export CCL_ZE_IPC_EXCHANGE=sockets             # robust IPC handle exchange on SLURM
 export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun launch)
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+
+# oneCCL spawns worker THREADS and pins them to cores.  Under SLURM each rank is
+# confined to a cgroup cpuset; if oneCCL picks a core outside it, the pin fails and
+# you get:  oneCCL: exec.cpp:122 start_workers: EXCEPTION: failed to start worker # 0
+# Give it exactly one worker and reserve a core for it by leaving OMP one short,
+# then pin that worker to a core we know is inside this rank's allocation.
+export CCL_WORKER_COUNT=1
+_CPT="${SLURM_CPUS_PER_TASK:-2}"
+export OMP_NUM_THREADS=$(( _CPT > 1 ? _CPT - 1 : 1 ))   # leave 1 core for the CCL worker
+# Last core of THIS rank's slice (ranks are laid out contiguously by local id).
+_LOCALID="${SLURM_LOCALID:-0}"
+export CCL_WORKER_AFFINITY=$(( _LOCALID * _CPT + _CPT - 1 ))
+
+# Uncomment to diagnose oneCCL bring-up (very verbose, rank 0 is enough):
+# export CCL_LOG_LEVEL=info
 
 # ---- fail fast, with the reason, instead of silently training on CPU --------
 # rank 0 prints what torch can actually see; init_distributed() hard-errors if a
