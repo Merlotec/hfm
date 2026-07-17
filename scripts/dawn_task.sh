@@ -76,18 +76,22 @@ export CCL_WORKER_AFFINITY=$(python -c "print(','.join(['$_LASTCORE'] * $_LOCALN
 _OMP=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))
 export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
 
-# oneCCL SEGFAULTS during Level-Zero topology discovery on Dawn:
-#   ccl::topo_manager::build_fabric_connectivity_matrix()
-#   ccl::topo_manager::ze_base_init() -> ccl_comm::init() -> ProcessGroupXCCL::getXCCLComm()
-# It is probing Xe Link fabric ports between tiles; the config dump shows
-# `CCL_ZE_TYPE2_TUNE_PORTS: undetected`, i.e. port detection had already failed.
-# Turn off the fabric-vertex connection check (and its port auto-tuning) so the
-# communicator is built without topology awareness.  Collectives still work — they
-# fall back to non-topo algorithms, costing some intra-node bandwidth, not
-# correctness.  Revisit if you later run multiple ranks per node and want Xe Link.
-export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
-export CCL_ZE_AUTO_TUNE_PORTS=0
-export CCL_ZE_DISABLE_PORT_CHECK=1
+# --- oneCCL topology checks: LEAVE ON with 8 ranks/node -----------------------
+# History, because every one of these lines was paid for in failed jobs:
+#  * 1 rank/node: topo discovery segfaulted in build_fabric_connectivity_matrix
+#    (a degenerate layout with no local peers), so we disabled the port/fabric
+#    checks to get past it.
+#  * 8 ranks/node WITH those checks disabled: first allreduce ran direct SYCL
+#    peer reads over links oneCCL never verified -> GPU page fault
+#    ("Segmentation fault from GPU ... NotPresent (PDE)") in the compute runtime.
+# 8 ranks/node is the layout the topology code expects; let it actually probe.
+#
+# FALLBACK LADDER if topo init crashes again at 8 ranks/node — try in order,
+# one at a time, each trades bandwidth for robustness:
+#   1. export CCL_SYCL_SINGLE_NODE_ALGORITHM=0   # no direct-P2P single-node algos
+#   2. export CCL_ENABLE_SYCL_KERNELS=0          # no device-side collective kernels
+#   3. export CCL_ZE_ENABLE=0                    # host-staged collectives (slowest,
+#                                                # most robust; correctness first)
 
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
 # this prints the actual reason.  Set CCL_LOG_LEVEL=warn once it works — info is

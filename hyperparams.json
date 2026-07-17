@@ -31,16 +31,16 @@
   },
 
   "training": {
-    "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. cosine_t_max ~= total optimizer steps: 100 epochs x ceil(17976/(32*8)) ~= 7100. num_workers per rank (12 cpus/task).",
+    "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic — training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",
     "batch_size": 32,
-    "n_epochs": 100,
+    "n_epochs": 20,
     "num_workers": 8,
 
     "lr": 4e-4,
     "weight_decay": 1e-5,
     "clip_grad": 1.0,
     "lr_schedule": "cosine",
-    "cosine_t_max": 7000,
+    "cosine_t_max": 50000,
 
     "l1_weight": 0.01,
     "precision": "bf16-true"
