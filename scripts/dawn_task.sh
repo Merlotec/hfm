@@ -59,7 +59,16 @@ export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun lau
 # Ask the kernel instead: pin the worker to the LAST core actually allowed here.
 export CCL_WORKER_COUNT=1
 _NCORES=$(python -c 'import os; print(len(os.sched_getaffinity(0)))')
-export CCL_WORKER_AFFINITY=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
+_LASTCORE=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
+# oneCCL parses CCL_WORKER_AFFINITY as a NODE-WIDE list of length
+# local_proc_count * CCL_WORKER_COUNT and gives local process i slot i.  A bare
+# integer parses only when local_proc_count == 1; with 8 ranks/node it dies with
+#   env.cpp:1363 env_2_worker_affinity: failed to parse worker affinity
+# Each rank gets its own copy of this env (per-task shell) and only ever reads
+# its own slot, so filling EVERY slot with our own last core keeps the list the
+# right length while guaranteeing the slot we read is inside our cpuset.
+_LOCALN="${SLURM_NTASKS_PER_NODE:-${SLURM_NTASKS:-1}}"
+export CCL_WORKER_AFFINITY=$(python -c "print(','.join(['$_LASTCORE'] * $_LOCALN))")
 # Compute runs on the XPU; the host cores mostly feed the DataLoader (num_workers=8
 # renderer processes per rank share this same 12-core cpuset).  A big OMP pool in
 # the main process would just fight them — cap it, and keep the last core free for
