@@ -168,10 +168,14 @@ class CellSampler(nn.Module):
         level: torch.Tensor,
         row: torch.Tensor,
         col: torch.Tensor,
+        max_depth: int,
     ) -> torch.Tensor:
         """
         x     : [B, C, H, W]
         level : [B, N] long, row/col: [B, N] long (indices at their own level)
+        max_depth : deepest level that may occur, as a plain int.  Passed in
+            rather than read off `level` so this stays free of host syncs —
+            `level.max().item()` would serialise the device on every call.
         returns [B, N, C, p, p]
         """
         B, C = x.shape[0], x.shape[1]
@@ -194,12 +198,13 @@ class CellSampler(nn.Module):
         gy = (2.0 * gy - 1.0).unsqueeze(3).expand(B, N, p, p)          # varies along H
         grid = torch.stack([gx, gy], dim=-1).reshape(B, N * p, p, 2)
 
-        mips = self._mips(x, int(level.max().item()))
+        # Every depth is sampled and masked unconditionally: skipping empty
+        # depths would need a device→host sync per depth, which costs far more
+        # than the sample it saves.
+        mips = self._mips(x, max_depth)
         out = x.new_zeros(B, C, N * p, p)
         for d, mip in enumerate(mips):
             sel = (level == d).to(x.dtype)                             # [B, N]
-            if not bool(sel.any()):
-                continue
             samp = F.grid_sample(mip, grid, mode='bilinear',
                                  padding_mode='border', align_corners=False)
             w = sel.repeat_interleave(p, dim=1)[:, None, :, None]      # [B,1,N*p,1]
@@ -289,6 +294,7 @@ class QuadtreeDecoder(nn.Module):
         level: torch.Tensor,
         row: torch.Tensor,
         col: torch.Tensor,
+        max_depth: int,
         skip_feats: Optional[List[torch.Tensor]] = None,
         pixel_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -300,10 +306,8 @@ class QuadtreeDecoder(nn.Module):
         acc = tokens.new_zeros(B, C, self.img_size, self.img_size)
         acc_w = tokens.new_zeros(B, 1, self.img_size, self.img_size)
 
-        for d in range(int(level.max().item()) + 1):
+        for d in range(max_depth + 1):
             sel = (level == d).to(tokens.dtype)                        # [B, N]
-            if not bool(sel.any()):
-                continue
             G = self.base_grid * 2 ** d
 
             # Never fold into a canvas larger than the image itself.
@@ -433,10 +437,11 @@ class QuadtreeHFM(nn.Module):
     # -- pieces -------------------------------------------------------------
 
     def _embed_cells(self, x_aug: torch.Tensor, level: torch.Tensor,
-                     row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
+                     row: torch.Tensor, col: torch.Tensor,
+                     max_depth: int) -> torch.Tensor:
         """Sample each cell's region and encode it. → [B, N, d]"""
         B, N = level.shape
-        crops = self.sampler(x_aug, level, row, col)                   # [B,N,C,p,p]
+        crops = self.sampler(x_aug, level, row, col, max_depth)        # [B,N,C,p,p]
         flat = crops.reshape(B * N, *crops.shape[2:])
         return self.cell_embed(flat).reshape(B, N, self.cfg.d_patch)
 
@@ -517,7 +522,7 @@ class QuadtreeHFM(nn.Module):
         c_row = (p_row * 2).repeat(1, 4) + offs_r.repeat_interleave(k)[None]
         c_col = (p_col * 2).repeat(1, 4) + offs_c.repeat_interleave(k)[None]
 
-        fresh = self._embed_cells(x_aug, c_lvl, c_row, c_col)          # [B, 4k, d]
+        fresh = self._embed_cells(x_aug, c_lvl, c_row, c_col, max_level)   # [B, 4k, d]
         inherited = p_tok.repeat(1, 4, 1)
         c_tok = inherited + self.child_mix(fresh)
 
@@ -571,7 +576,7 @@ class QuadtreeHFM(nn.Module):
         col = ar.repeat(G)[None].expand(B, -1).contiguous()
         level = torch.zeros_like(row)
 
-        tokens = self._embed_cells(x_aug, level, row, col)
+        tokens = self._embed_cells(x_aug, level, row, col, 0)
 
         for r in range(rounds + 1):
             tokens = self._encode(tokens, level, row, col, context)
@@ -586,4 +591,5 @@ class QuadtreeHFM(nn.Module):
             'col': col.detach(),
         }
 
-        return self.decoder(tokens, level, row, col, skip_feats, pixel_mask=pixel_mask)
+        return self.decoder(tokens, level, row, col, rounds,
+                            skip_feats, pixel_mask=pixel_mask)

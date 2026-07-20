@@ -352,7 +352,10 @@ def main():
                 path = CKPT_DIR / f'train_epoch{epoch:03d}.pt'
                 trainer.save(str(path))
                 print(f'  [ckpt] {path.name}')
-        barrier()      # keep ranks together while rank 0 validates / writes
+        # Long timeout: rank 0 may spend many minutes validating and writing,
+        # and the quadtree model costs ~2.4x a flat forward, so the default
+        # 300 s collective timeout is not a safe bound here.
+        barrier(long=True)   # keep ranks together while rank 0 validates / writes
 
     if is_main() and loss_csv is not None:
         loss_csv.close()

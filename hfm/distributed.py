@@ -221,9 +221,31 @@ def is_main() -> bool:
     return True
 
 
-def barrier():
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
+_LONG_GROUP = None
+
+
+def barrier(long: bool = False):
+    """
+    Rendezvous all ranks.
+
+    `long=True` selects a process group with a much longer timeout, for the
+    barriers that wait on genuinely open-ended single-rank work (validation,
+    checkpoint writes).  The default 300 s group stays in force everywhere else
+    so a dead rank still surfaces quickly rather than hanging for half an hour.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    if not long:
         torch.distributed.barrier()
+        return
+
+    global _LONG_GROUP
+    if _LONG_GROUP is None:
+        # Collective — every rank must reach this, which they do via this call.
+        import datetime
+        _LONG_GROUP = torch.distributed.new_group(
+            timeout=datetime.timedelta(seconds=7200))
+    torch.distributed.barrier(group=_LONG_GROUP)
 
 
 def cleanup():
