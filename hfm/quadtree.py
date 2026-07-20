@@ -205,8 +205,16 @@ class CellSampler(nn.Module):
         out = x.new_zeros(B, C, N * p, p)
         for d, mip in enumerate(mips):
             sel = (level == d).to(x.dtype)                             # [B, N]
-            samp = F.grid_sample(mip, grid, mode='bilinear',
-                                 padding_mode='border', align_corners=False)
+            # Clamp into the pixel-centre range instead of asking for 'border'
+            # padding: for bilinear sampling the two are exactly equivalent, and
+            # MPS does not implement the border mode.  The bound is per-mip
+            # because each level has its own resolution.
+            mh, mw = mip.shape[-2], mip.shape[-1]
+            bx, by = 1.0 - 1.0 / mw, 1.0 - 1.0 / mh
+            g = torch.stack([grid[..., 0].clamp(-bx, bx),
+                             grid[..., 1].clamp(-by, by)], dim=-1)
+            samp = F.grid_sample(mip, g, mode='bilinear',
+                                 padding_mode='zeros', align_corners=False)
             w = sel.repeat_interleave(p, dim=1)[:, None, :, None]      # [B,1,N*p,1]
             out = out + samp * w
 
@@ -256,9 +264,16 @@ class QuadtreeDecoder(nn.Module):
             nn.Linear(d, out_channels * self.kernel * self.kernel),
         )
 
+        # The mask rides along as an extra channel.  Without it these convs see
+        # a hole as exact 0, which in normalised space is the dataset mean and
+        # is indistinguishable from real fluid sitting at the mean — so they
+        # have to guess where the wall is from a step in the data alone.  Their
+        # receptive field (+-3 px with the skip conv) is precisely the shell
+        # where the boundary artefact lives.
         mid = max(out_channels * 8, 64)
         self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
+            nn.Conv2d(out_channels + skip_ch + 1, mid, 3, padding=1,
+                      padding_mode='replicate'),
             nn.GELU(),
             nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
         )
@@ -348,13 +363,15 @@ class QuadtreeDecoder(nn.Module):
 
         if pixel_mask is not None:
             output = output * pixel_mask
+            mask_ch = pixel_mask.to(output.dtype).expand(
+                output.shape[0], 1, self.img_size, self.img_size)
+        else:
+            mask_ch = torch.ones(output.shape[0], 1, self.img_size, self.img_size,
+                                 device=output.device, dtype=output.dtype)
 
-        post_in = (
-            torch.cat([output, skip_feats[0]], dim=1)
-            if self.skip_ch > 0 and skip_feats
-            else output
-        )
-        return output + self.post_conv(post_in)
+        parts = [output, skip_feats[0]] if (self.skip_ch > 0 and skip_feats) else [output]
+        parts.append(mask_ch)
+        return output + self.post_conv(torch.cat(parts, dim=1))
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +407,8 @@ class QuadtreeHFM(nn.Module):
                                     kernel_size=cfg.qt_sample_px,
                                     stride=cfg.qt_sample_px, bias=False)
         self.scale_enc = RelativeScaleEncoding(d, cfg.qt_scale_freqs)
-        self.skip_encoder = SkipEncoder(cfg.in_channels, cfg.skip_ch)
+        # +1 for the mask channel — see QuadtreeDecoder.post_conv.
+        self.skip_encoder = SkipEncoder(cfg.in_channels + 1, cfg.skip_ch)
 
         self.global_tokens = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(1, cfg.n_global_tokens, d), std=0.02)
@@ -566,8 +584,11 @@ class QuadtreeHFM(nn.Module):
             mask_ch = torch.ones(B, 1, x.shape[2], x.shape[3],
                                  device=x.device, dtype=x.dtype)
 
-        skip_feats = self.skip_encoder(x)
         x_aug = torch.cat([x, mask_ch], dim=1)
+        # Skip features are built from the mask-augmented input so the decoder's
+        # convs can see where the walls are instead of inferring them from a
+        # step to zero.
+        skip_feats = self.skip_encoder(x_aug)
 
         # Root: a uniform base_grid × base_grid tiling at depth 0.
         G = self.base_grid
