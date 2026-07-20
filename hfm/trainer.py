@@ -72,19 +72,29 @@ def train_step_gan(
     pixel_mask: Optional[torch.Tensor] = None,
     disc_update_threshold: float = 0.3,
     self_input_prob: float = 0.0,
+    rollout_horizon: int = 1,
 ) -> Tuple[float, float]:
     """
     One training step.
 
-    frames[0 .. n_context-1]  → ContextEncoder → context
-    frames[n_context]         → HFM(context)   → pred
-    frames[n_context + 1]     → target
+    frames[0 .. n_context-1]      → ContextEncoder → context (encoded ONCE)
+    frames[n_context]             → HFM(context)   → pred_0
+    frames[n_context + 1 + k]     → target for step k
+
+    rollout_horizon: number of autoregressive steps to unroll with gradient.
+    With horizon H the model predicts H frames, feeding each prediction back as
+    the next input, and the reconstruction loss is averaged over all H targets.
+    Gradient flows through the whole chain (backprop-through-time), so the model
+    is optimised to propagate the dynamics rather than to reproduce a single
+    near-identity step — and because the one context is reused across H evolving
+    states, it is forced to encode the invariant dynamics (BCs/forcing) instead
+    of collapsing to a constant.  horizon=1 recovers the original single-step
+    behaviour exactly.
 
     self_input_prob: scheduled sampling (exposure-bias fix).  With this
-    probability the input frame is replaced by the model's own no-grad
-    prediction of it (from frames[n_context-1]), so the model trains on the
-    blurred/artifacted inputs it actually produces at rollout — teacher forcing
-    alone leaves those off-manifold and errors compound autoregressively.
+    probability the FIRST input frame is replaced by the model's own no-grad
+    prediction of it (from frames[n_context-1]).  Largely subsumed by horizon>1,
+    but kept for horizon=1.
 
     Returns (recon_loss, disc_loss).  disc_loss is 0.0 when adv_weight == 0.
     """
@@ -113,10 +123,24 @@ def train_step_gan(
         if pixel_mask is not None:
             x_in = x_in * pixel_mask
 
-    # ---- predict ----
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        pred = model(x_in, context, pixel_mask=pixel_mask)
-    pred_masked = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
+    # ---- unrolled prediction (backprop-through-time over the horizon) ----
+    # The reconstruction loss is the mean over all horizon targets.  pred_0 (the
+    # first step) is also what the discriminator / adv term operate on below, so
+    # the GAN behaviour is unchanged relative to single-step training.
+    horizon = max(1, min(rollout_horizon, len(frames) - n_context - 1))
+    recon_terms = []
+    pred_masked = None
+    x_cur = x_in
+    for k in range(horizon):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+            pred_k = model(x_cur, context, pixel_mask=pixel_mask)
+        pred_k = pred_k.float() * pixel_mask if pixel_mask is not None else pred_k.float()
+        recon_terms.append(criterion(pred_k, frames[n_context + 1 + k]))
+        if pred_masked is None:
+            pred_masked = pred_k          # first step feeds the GAN, as before
+        x_cur = pred_k                    # feed prediction forward (keeps grad)
+    assert pred_masked is not None
+    recon_rollout = torch.stack(recon_terms).mean()
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
@@ -126,7 +150,7 @@ def train_step_gan(
 
     # ---- reconstruction only ----
     if adv_weight == 0.0:
-        recon_loss = criterion(pred_masked, x_target)
+        recon_loss = recon_rollout
         # NaN bail must be GLOBAL: if one rank bailed while others proceeded to a
         # collective (DDP reducer or host allreduce), the job would hang/diverge.
         (bad,) = allreduce_stats(0.0 if torch.isfinite(recon_loss) else 1.0)
@@ -194,7 +218,7 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(False)
 
-    recon_loss = criterion(pred_masked, x_target)
+    recon_loss = recon_rollout
 
     disc_healthy = disc_update_threshold < d_gate < 2.0   # same GLOBAL gate as above
     if disc_healthy:
@@ -308,18 +332,25 @@ class GANTrainer:
         device      = next(self.model.parameters()).device
         device_type = device.type
         amp         = device_type in ('cuda', 'xpu')
+        nc      = self.cfg.n_context_frames
         total, count = 0.0, 0
         for batch in dataloader:
             frames   = [batch[:, t].to(device) for t in range(batch.shape[1])]
-            x_in     = frames[self.cfg.n_context_frames]
-            x_target = frames[self.cfg.n_context_frames + 1]
+            horizon  = max(1, min(getattr(self.cfg, 'rollout_horizon', 1),
+                                  len(frames) - nc - 1))
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-                context = self.context_encoder(frames[:self.cfg.n_context_frames], pixel_mask=pixel_mask)
-                pred    = self.model(x_in, context, pixel_mask=pixel_mask)
-            pred_m = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
-            loss = self.criterion(pred_m, x_target)
-            if torch.isfinite(loss):
-                total += loss.item()
+                context = self.context_encoder(frames[:nc], pixel_mask=pixel_mask)
+                # Same unrolled metric as training: predict horizon steps,
+                # feeding predictions forward, average loss over the horizon.
+                x_cur, terms = frames[nc], []
+                for k in range(horizon):
+                    pred = self.model(x_cur, context, pixel_mask=pixel_mask)
+                    pred_m = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
+                    terms.append(self.criterion(pred_m, frames[nc + 1 + k]).item())
+                    x_cur = pred_m
+            loss = sum(terms) / len(terms)
+            if loss == loss:   # finite check (NaN != NaN)
+                total += loss
                 count += 1
         return total / count if count > 0 else float('nan')
 
@@ -358,7 +389,7 @@ class GANTrainer:
         frames: List[torch.Tensor],
         pixel_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
-        """frames: list of (n_context_frames + 2) tensors [B, C, H, W]."""
+        """frames: list of (n_context_frames + 1 + rollout_horizon) tensors [B, C, H, W]."""
         self.model.train()
         self.context_encoder.train()
         self.discriminator.train()
@@ -376,6 +407,7 @@ class GANTrainer:
             pixel_mask=pixel_mask,
             disc_update_threshold=self.disc_update_threshold,
             self_input_prob=self.self_input_prob,
+            rollout_horizon=getattr(self.cfg, 'rollout_horizon', 1),
         )
 
         self.scheduler.step()

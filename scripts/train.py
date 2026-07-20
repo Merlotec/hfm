@@ -69,6 +69,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         n_layers               = m['n_layers'],
         mlp_ratio              = m['mlp_ratio'],
         dropout                = m['dropout'],
+        rollout_horizon        = m.get('rollout_horizon', 4),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
         d_ctx                  = m['d_ctx'],
@@ -151,7 +152,8 @@ def main():
 
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
-    seq_len  = cfg.n_context_frames + 2   # context frames + input frame + target frame
+    # context frames + input frame + one target per rollout step
+    seq_len  = cfg.n_context_frames + 1 + getattr(cfg, 'rollout_horizon', 1)
 
     # ---- training data ----
     num_workers = train_hp.get('num_workers', 8)

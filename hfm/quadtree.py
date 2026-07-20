@@ -247,7 +247,8 @@ class QuadtreeDecoder(nn.Module):
     """
 
     def __init__(self, d: int, out_channels: int, img_size: int,
-                 base_grid: int, out_px: int, skip_ch: int = 0):
+                 base_grid: int, out_px: int, skip_ch: int = 0,
+                 mask_aware: bool = True):
         super().__init__()
         assert out_px % 4 == 0, "out_px must be divisible by 4 for 25% overlap"
         self.img_size = img_size
@@ -255,6 +256,7 @@ class QuadtreeDecoder(nn.Module):
         self.out_px = out_px
         self.out_channels = out_channels
         self.skip_ch = skip_ch
+        self.mask_aware = mask_aware
         self.kernel = out_px + out_px // 2
 
         self.head = nn.Sequential(
@@ -272,7 +274,7 @@ class QuadtreeDecoder(nn.Module):
         # where the boundary artefact lives.
         mid = max(out_channels * 8, 64)
         self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch + 1, mid, 3, padding=1,
+            nn.Conv2d(out_channels + skip_ch + int(mask_aware), mid, 3, padding=1,
                       padding_mode='replicate'),
             nn.GELU(),
             nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
@@ -370,7 +372,8 @@ class QuadtreeDecoder(nn.Module):
                                  device=output.device, dtype=output.dtype)
 
         parts = [output, skip_feats[0]] if (self.skip_ch > 0 and skip_feats) else [output]
-        parts.append(mask_ch)
+        if self.mask_aware:
+            parts.append(mask_ch)
         return output + self.post_conv(torch.cat(parts, dim=1))
 
 
@@ -408,7 +411,10 @@ class QuadtreeHFM(nn.Module):
                                     stride=cfg.qt_sample_px, bias=False)
         self.scale_enc = RelativeScaleEncoding(d, cfg.qt_scale_freqs)
         # +1 for the mask channel — see QuadtreeDecoder.post_conv.
-        self.skip_encoder = SkipEncoder(cfg.in_channels + 1, cfg.skip_ch)
+        self.mask_aware = getattr(cfg, 'mask_aware_decoder', True)
+        self.residual_prediction = getattr(cfg, 'residual_prediction', True)
+        self.skip_encoder = SkipEncoder(
+            cfg.in_channels + int(self.mask_aware), cfg.skip_ch)
 
         self.global_tokens = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(1, cfg.n_global_tokens, d), std=0.02)
@@ -424,7 +430,7 @@ class QuadtreeHFM(nn.Module):
 
         self.decoder = QuadtreeDecoder(
             d, cfg.in_channels, cfg.img_size, cfg.qt_base_grid,
-            cfg.qt_out_px, cfg.skip_ch
+            cfg.qt_out_px, cfg.skip_ch, self.mask_aware
         )
 
         self.last_tree: Dict[str, torch.Tensor] = {}
@@ -574,6 +580,10 @@ class QuadtreeHFM(nn.Module):
         B = x.shape[0]
         rounds = self.n_rounds if n_rounds is None else n_rounds
 
+        # Base for the residual: the CLEAN masked input.  Taken before the
+        # training noise so the noise does not land straight in the output.
+        x_base = x * pixel_mask if pixel_mask is not None else x
+
         if self.training and self.cfg.noise_std > 0.0:
             x = x + torch.randn_like(x) * self.cfg.noise_std
 
@@ -588,7 +598,7 @@ class QuadtreeHFM(nn.Module):
         # Skip features are built from the mask-augmented input so the decoder's
         # convs can see where the walls are instead of inferring them from a
         # step to zero.
-        skip_feats = self.skip_encoder(x_aug)
+        skip_feats = self.skip_encoder(x_aug if self.mask_aware else x)
 
         # Root: a uniform base_grid × base_grid tiling at depth 0.
         G = self.base_grid
@@ -612,5 +622,16 @@ class QuadtreeHFM(nn.Module):
             'col': col.detach(),
         }
 
-        return self.decoder(tokens, level, row, col, rounds,
-                            skip_feats, pixel_mask=pixel_mask)
+        out = self.decoder(tokens, level, row, col, rounds,
+                           skip_feats, pixel_mask=pixel_mask)
+
+        if self.residual_prediction:
+            # Predict the change, not the whole field.  Consecutive frames
+            # differ by only ~2% of signal, so an absolute model has to
+            # reconstruct everything to better than that just to tie with
+            # copying its input — a bar it does not clear.  With the decoder
+            # zero-initialised this starts training at exact persistence.
+            out = x_base + out
+            if pixel_mask is not None:
+                out = out * pixel_mask
+        return out

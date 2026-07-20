@@ -233,6 +233,10 @@ def main():
                         help='Skip PNG generation')
     parser.add_argument('--disc-saliency', action='store_true',
                         help='Compute and save discriminator saliency heatmaps')
+    parser.add_argument('--no-residual', action='store_true',
+                        help='Force residual_prediction=False (for checkpoints trained '
+                             'as absolute predictors, where adding the residual at '
+                             'inference double-counts the input and blows up the rollout)')
     args = parser.parse_args()
 
     device   = get_device()
@@ -248,6 +252,10 @@ def main():
     cfg: HFMConfig = ckpt['cfg']
     step = ckpt.get('global_step', '?')
     print(f'  step={step}')
+
+    if args.no_residual:
+        cfg.residual_prediction = False
+        print('  [--no-residual] residual_prediction forced OFF for this run')
 
     model = build_model(cfg).to(device)
     missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
