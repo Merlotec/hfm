@@ -132,7 +132,13 @@ def init_distributed():
             torch.cuda.set_device(device)
         elif device.type == 'xpu':
             torch.xpu.set_device(device)
+        # Short collective timeout: when one rank dies (OOM-kill, crash), the
+        # others block at the next collective — with gloo's default that is a
+        # silent 30-MINUTE hang before anyone reports anything.  5 minutes is
+        # generous for any real collective here and surfaces failures fast.
+        import datetime
         torch.distributed.init_process_group(
+            timeout=datetime.timedelta(seconds=300),
             backend=_ddp_backend(device), rank=rank, world_size=world)
     return rank, world, local, device
 

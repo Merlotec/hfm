@@ -41,6 +41,17 @@ class HFMConfig:
     disc_adv_weight: float = 0.02
     disc_lr: float = 1e-4
 
+    # --- dynamic quadtree ---
+    # Set False to fall back to the flat fixed-grid HFM.
+    use_quadtree: bool = True
+    qt_base_grid: int = 4        # root tiling is qt_base_grid² cells at depth 0
+    qt_rounds: int = 3           # refinement rounds (max depth); overridable at inference
+    qt_split_k: int = 24         # leaves split per round → +3k tokens per round
+    qt_sample_px: int = 8        # every cell is resampled to this crop, at any depth
+    qt_out_px: int = 8           # pixels each leaf predicts, in its own local frame
+    qt_rope_octaves: float = 6.0 # octaves spanned by the 2-D RoPE frequency band
+    qt_scale_freqs: int = 6      # Fourier features on relative depth
+
     # --- memory ---
     gradient_checkpointing: bool = False
 

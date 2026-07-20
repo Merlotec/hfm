@@ -18,6 +18,7 @@ import torch.optim as optim
 from typing import List, Optional, Tuple
 
 from .model import HFM
+from .quadtree import QuadtreeHFM
 from .context_encoder import ContextEncoder
 from .discriminator import HFMDiscriminator
 from .config import HFMConfig
@@ -266,7 +267,7 @@ class GANTrainer:
         self.self_input_prob  = self_input_prob
         self.cosine_t_max     = cosine_t_max
         self.cfg              = cfg
-        self.model            = HFM(cfg)
+        self.model            = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
         self.context_encoder  = ContextEncoder(cfg)
         self.discriminator    = HFMDiscriminator(cfg)
         self.criterion        = FluidLoss(

@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hfm import HFM, ContextEncoder
+from hfm import HFM, ContextEncoder, build_model
 from hfm.config import HFMConfig
 from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
 from hfm.discriminator import HFMDiscriminator
@@ -249,7 +249,7 @@ def main():
     step = ckpt.get('global_step', '?')
     print(f'  step={step}')
 
-    model = HFM(cfg).to(device)
+    model = build_model(cfg).to(device)
     missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
     if unexpected:
         print(f'  [warn] model unexpected keys: {unexpected}')

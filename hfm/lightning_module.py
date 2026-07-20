@@ -26,6 +26,7 @@ from .context_encoder import ContextEncoder
 from .data import FVMDataModule
 from .discriminator import HFMDiscriminator
 from .model import HFM
+from .quadtree import QuadtreeHFM
 from .trainer import FluidLoss
 
 
@@ -67,7 +68,7 @@ class HFMLightningModule(L.LightningModule):
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
 
-        self.model           = HFM(cfg)
+        self.model           = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
         self.context_encoder = ContextEncoder(cfg)
         self.discriminator   = HFMDiscriminator(cfg)
         self.criterion       = FluidLoss(l1_weight, pixel_mask=pixel_mask)
