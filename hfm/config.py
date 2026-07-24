@@ -47,16 +47,31 @@ class HFMConfig:
     disc_adv_weight: float = 0.02
     disc_lr: float = 1e-4
 
-    # --- dynamic quadtree ---
+    # --- fixed multilevel quadtree ---
     # Set False to fall back to the flat fixed-grid HFM.
     use_quadtree: bool = True
-    qt_base_grid: int = 4        # root tiling is qt_base_grid² cells at depth 0
-    qt_rounds: int = 3           # refinement rounds (max depth); overridable at inference
-    qt_split_k: int = 24         # leaves split per round → +3k tokens per round
-    qt_sample_px: int = 8        # every cell is resampled to this crop, at any depth
-    qt_out_px: int = 8           # pixels each leaf predicts, in its own local frame
-    qt_rope_octaves: float = 6.0 # octaves spanned by the 2-D RoPE frequency band
-    qt_scale_freqs: int = 6      # Fourier features on relative depth
+    # A complete quadtree of `ml_levels` levels tiles the image.  Level 0 is the
+    # finest (`ml_finest_px`×`ml_finest_px` blocks, encoded losslessly); each level
+    # up doubles the block side.  For a 256px image with finest_px=4 and 4 levels:
+    #   L0 4px  → 64×64,  L1 8px  → 32×32,  L2 16px → 16×16,  L3 32px → 8×8.
+    ml_levels: int = 4
+    ml_finest_px: int = 4                    # smallest unit side (encoded losslessly)
+    # Per-level token dim — a bell curve peaking at level 1 (see model docstring).
+    # Each dim must be divisible by n_heads, and dim//n_heads divisible by 4 (2-D RoPE).
+    ml_dims: tuple = (64, 384, 256, 96)
+    # Per-level self-attn pass budget, non-increasing (pyramid).  The last entry is
+    # the "number of layers" = how many times level `ml_levels-1` iterates.  Coarse
+    # budgets exhaust first, so late passes touch only fine levels (pyramidal tail).
+    ml_passes: tuple = (8, 6, 5, 4)
+
+    # --- legacy dynamic-quadtree fields (kept for config/checkpoint compat) ---
+    qt_base_grid: int = 4
+    qt_rounds: int = 3
+    qt_split_k: int = 24
+    qt_sample_px: int = 8
+    qt_out_px: int = 8
+    qt_rope_octaves: float = 6.0
+    qt_scale_freqs: int = 6
     # Feed the geometry mask to the decoder's convs.  Set False to load
     # checkpoints written before this channel was added.
     mask_aware_decoder: bool = True

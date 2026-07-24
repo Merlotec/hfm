@@ -1,380 +1,169 @@
 """
-Dynamic-quadtree fluid model.
+Fixed 4-level quadtree fluid model.
 
-Instead of a fixed P×P grid of patches, the field is represented by the leaves
-of a quadtree, so different quadrants can carry different resolutions.  Each
-refinement round picks k leaves and replaces them with their four children.
+The image is tiled by a *complete* quadtree: every level is fully populated, and a
+block at level ``l`` covers ``finest_px · 2**l`` pixels.  For a 256px frame with
+``finest_px = 4`` and 4 levels::
 
-Where to spend that resolution is a discrete, non-differentiable choice, so for
-this first training stage `choose_splits` simply picks the k leaves **at
-random**.  That is deliberate: random trees expose the model to every possible
-mix of depths, which is exactly what the scale-invariant machinery below needs
-in order to learn the detail axis rather than memorise one particular layout.
-Override `choose_splits` to plug in a real criterion later.
+    level 0 :  4px blocks → 64×64 grid  (4096 tokens)   finest, encoded losslessly
+    level 1 :  8px blocks → 32×32 grid  (1024 tokens)
+    level 2 : 16px blocks → 16×16 grid  ( 256 tokens)
+    level 3 : 32px blocks →  8×8  grid  (  64 tokens)   coarsest
 
-Scale invariance
-----------------
-The whole point is that refinement is a *self-similar* operation, so the model
-can be run for more rounds than it was trained with and keep behaving sensibly.
-Three things enforce that:
+Each level carries its own token dimension (a bell curve peaking at level 1) and its
+own attention:
 
-1.  **Scale-invariant sampling.**  Every cell — whatever its physical size — is
-    resampled to the same `sample_px × sample_px` crop (from a mip pyramid, so a
-    coarse cell sees a properly prefiltered view).  The *same* patch-embed
-    weights therefore always see the same kind of picture, just at a different
-    scale.
+* **Self-attention** is local with 2-D RoPE over a ``(k+1)×(k+1)`` block window, where
+  ``k`` is the block's pixel side.  Level 0 sees a 5×5 window, level 1 a 9×9 window;
+  by level 2 the window (17×17) already covers the whole 16×16 grid, so levels 2–3 are
+  effectively global.
 
-2.  **Shared weights across rounds.**  One layer stack is applied at every
-    round.  There are no per-round parameters at all — anything the model needs
-    to know about "where it is" on the detail axis has to arrive through the
-    scale encoding, which is what forces that axis to be learned as a
-    continuous, extrapolatable quantity.
+* **Cross-attention** couples adjacent levels bidirectionally — every parent attends to
+  its 4 children and every child to its parent (:class:`AdjacentCrossAttn`).  Composed
+  across passes this is what lets a parent update a child and vice versa, and what
+  reaches all descendants over the course of the schedule.
 
-3.  **Relative scale encodings.**  Depth is measured relative to the coarsest
-    live cell in the current tree (`d_rel`), and position is measured in units
-    of that coarsest cell.  A tree occupying depths {2,3,4} therefore produces
-    *identical* encodings to one occupying {0,1,2} — the model literally cannot
-    tell absolute depth, only relative depth.  `d_rel` is fed through a
-    continuous Fourier featurisation (not a per-level lookup table), so depths
-    never seen during training still land somewhere sensible.
+Update schedule (red / black + pyramidal tail)
+-----------------------------------------------
+Levels {0, 2} self-attend on one pass, {1, 3} on the next — the two halves run "in
+parallel", which also halves the cost of the expensive fine-level self-attention.
+Cross-attention runs on every pass between still-live adjacent levels, so a {0,2} pass
+still writes into levels 1 and 3.  Each level has a self-attention *budget*
+(``ml_passes``, non-increasing); coarse budgets run out first, so late passes touch
+only the fine levels — a pyramidal tail that spends no compute refining coarse tokens
+that are never decoded.  The output is decoded from level 0 alone, which fully tiles
+the image.
 
-Token vocabulary
-----------------
-cells   : [B, N_r, d_patch]   quadtree leaves, N_r grows each round
-global  : [B, n_global, d_patch]   learnable capacity tokens (identity rotation)
+The number of times the coarsest level iterates (``ml_passes[-1]``) is what the user
+calls the "number of layers".
 """
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .config import HFMConfig
-from .model import FeedForward, HFMLayer, SkipEncoder, _checkpointed_layer
+from .model import (
+    FeedForward, GlobalSelfAttn, OverlappingPatchDecoder, SkipEncoder,
+)
+from .attention import CrossAttention, LocalSelfAttentionRoPE
 
 
 # ---------------------------------------------------------------------------
-# Scale / position encoding
+# 2-D RoPE tables
 # ---------------------------------------------------------------------------
 
-class RelativeScaleEncoding(nn.Module):
+def build_grid_rope(grid: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Continuous encoding of a cell's depth on the detail axis.
+    Standard 2-D RoPE cos/sin for a ``grid × grid`` field in row-major order.
 
-    Takes the *relative* depth d_rel = level - min(level) and maps it through a
-    Fourier featurisation to a FiLM (gain, bias) pair.  Because the map is a
-    smooth function of a scalar rather than an embedding table, depths outside
-    the training range extrapolate instead of hitting an undefined row.
+    Returns cos/sin of shape ``[1, 1, grid², head_dim]`` — the layout consumed by
+    :class:`GlobalSelfAttn` and :class:`LocalSelfAttentionRoPE`.
     """
-
-    def __init__(self, dim: int, n_freqs: int = 6):
-        super().__init__()
-        self.n_freqs = n_freqs
-        # Octave-spaced frequencies: the band is self-similar under d → d+1.
-        self.register_buffer('freqs', math.pi * 2.0 ** torch.arange(n_freqs).float())
-        self.mlp = nn.Sequential(nn.Linear(1 + 2 * n_freqs, dim), nn.GELU())
-        self.out = nn.Linear(dim, 2 * dim)
-        self.reset_film()
-
-    def reset_film(self):
-        """Start as an identity FiLM so early training is unperturbed."""
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    freqs: torch.Tensor
-
-    def forward(self, tokens: torch.Tensor, d_rel: torch.Tensor) -> torch.Tensor:
-        """tokens: [B, N, d];  d_rel: [B, N] float → [B, N, d]."""
-        ang = d_rel.unsqueeze(-1) * self.freqs                      # [B, N, F]
-        feat = torch.cat([d_rel.unsqueeze(-1), ang.sin(), ang.cos()], dim=-1)
-        gain, bias = self.out(self.mlp(feat)).chunk(2, dim=-1)
-        return tokens * (1.0 + gain) + bias
-
-
-def build_rope(
-    u: torch.Tensor,
-    v: torch.Tensor,
-    head_dim: int,
-    n_global: int,
-    n_octaves: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    2-D RoPE for continuous cell centres.
-
-    u, v : [B, N] cell centre coordinates *in units of the coarsest live cell*.
-           Renormalising by the coarsest cell is what makes a uniformly refined
-           tree indistinguishable from the original one.
-
-    Frequencies are octave-spaced, which is the natural band for a quadtree:
-    shifting every cell one level finer shifts the band by exactly one octave,
-    so the set of phase differences the model sees is unchanged apart from the
-    endpoints.  Global tokens receive identity rotation.
-
-    Returns cos/sin of shape [B, 1, N + n_global, head_dim].
-    """
+    assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2-D RoPE"
     quarter = head_dim // 4
-    j = torch.arange(quarter, device=u.device, dtype=u.dtype)
-    omega = math.pi * 2.0 ** (j * (n_octaves / max(quarter - 1, 1)))   # [quarter]
-
-    rf = v.unsqueeze(-1) * omega                                       # [B, N, q]
-    cf = u.unsqueeze(-1) * omega
-    half_c = torch.cat([rf.cos(), cf.cos()], dim=-1)                   # [B, N, hd/2]
+    theta = 1.0 / (10000 ** (torch.arange(quarter, dtype=torch.float) / quarter))
+    rows = torch.arange(grid).repeat_interleave(grid).float()   # [grid²]
+    cols = torch.arange(grid).repeat(grid).float()
+    rf = torch.outer(rows, theta)                               # [grid², quarter]
+    cf = torch.outer(cols, theta)
+    half_c = torch.cat([rf.cos(), cf.cos()], dim=-1)            # [grid², hd/2]
     half_s = torch.cat([rf.sin(), cf.sin()], dim=-1)
-    cos = torch.cat([half_c, half_c], dim=-1).unsqueeze(1)             # [B, 1, N, hd]
-    sin = torch.cat([half_s, half_s], dim=-1).unsqueeze(1)
-
-    B = u.shape[0]
-    ones = torch.ones(B, 1, n_global, head_dim, device=u.device, dtype=u.dtype)
-    zeros = torch.zeros_like(ones)
-    return torch.cat([cos, ones], dim=2), torch.cat([sin, zeros], dim=2)
+    cos = torch.cat([half_c, half_c], dim=-1)[None, None]       # [1, 1, grid², hd]
+    sin = torch.cat([half_s, half_s], dim=-1)[None, None]
+    return cos, sin
 
 
 # ---------------------------------------------------------------------------
-# Cell sampling
+# Per-level transformer block
 # ---------------------------------------------------------------------------
 
-class CellSampler(nn.Module):
+class LevelBlock(nn.Module):
     """
-    Resample every quadtree cell to a fixed `sample_px × sample_px` crop.
+    One level's update: RoPE self-attention → context cross-attention → FFN.
 
-    A cell at depth d covers img_size / (base_grid · 2^d) pixels, so coarse
-    cells are heavy downsamples.  Sampling those directly from the full-res
-    frame would alias badly and break the self-similarity the model relies on,
-    so each depth is sampled from the matching level of a mip pyramid.
+    Self-attention is local (:class:`LocalSelfAttentionRoPE`) when the ``(k+1)`` block
+    window is smaller than the grid, and global (:class:`GlobalSelfAttn`) once the
+    window covers the whole grid.  Tokens are kept in grid form ``[B, G, G, d]``.
     """
 
-    def __init__(self, base_grid: int, sample_px: int):
+    def __init__(self, d: int, n_heads: int, d_ctx: int, grid: int, radius: int,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
-        self.base_grid = base_grid
-        self.sample_px = sample_px
-
-    def _mips(self, x: torch.Tensor, max_depth: int) -> List[torch.Tensor]:
-        """mip[d] is prefiltered for cells at depth d (coarsest cells → smallest mip)."""
-        mips = [x]
-        for _ in range(max_depth):
-            prev = mips[-1]
-            mips.append(prev if prev.shape[-1] <= self.sample_px
-                        else F.avg_pool2d(prev, 2))
-        # mips[0] is the least-detailed (deepest downsample) view.
-        return mips[::-1]
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        level: torch.Tensor,
-        row: torch.Tensor,
-        col: torch.Tensor,
-        max_depth: int,
-    ) -> torch.Tensor:
-        """
-        x     : [B, C, H, W]
-        level : [B, N] long, row/col: [B, N] long (indices at their own level)
-        max_depth : deepest level that may occur, as a plain int.  Passed in
-            rather than read off `level` so this stays free of host syncs —
-            `level.max().item()` would serialise the device on every call.
-        returns [B, N, C, p, p]
-        """
-        B, C = x.shape[0], x.shape[1]
-        N = level.shape[1]
-        p = self.sample_px
-
-        # Cell bounds in [0, 1] image coordinates.
-        side = (self.base_grid * 2 ** level).to(x.dtype)               # [B, N]
-        x0 = col.to(x.dtype) / side
-        y0 = row.to(x.dtype) / side
-        step = 1.0 / side
-
-        # Sample points at pixel centres of the p×p crop.
-        t = (torch.arange(p, device=x.device, dtype=x.dtype) + 0.5) / p
-        gx = x0.unsqueeze(-1) + step.unsqueeze(-1) * t                 # [B, N, p]
-        gy = y0.unsqueeze(-1) + step.unsqueeze(-1) * t
-
-        # grid_sample wants normalised [-1, 1] coords, laid out [B, N*p, p, 2].
-        gx = (2.0 * gx - 1.0).unsqueeze(2).expand(B, N, p, p)          # varies along W
-        gy = (2.0 * gy - 1.0).unsqueeze(3).expand(B, N, p, p)          # varies along H
-        grid = torch.stack([gx, gy], dim=-1).reshape(B, N * p, p, 2)
-
-        # Every depth is sampled and masked unconditionally: skipping empty
-        # depths would need a device→host sync per depth, which costs far more
-        # than the sample it saves.
-        mips = self._mips(x, max_depth)
-        out = x.new_zeros(B, C, N * p, p)
-        for d, mip in enumerate(mips):
-            sel = (level == d).to(x.dtype)                             # [B, N]
-            # Clamp into the pixel-centre range instead of asking for 'border'
-            # padding: for bilinear sampling the two are exactly equivalent, and
-            # MPS does not implement the border mode.  The bound is per-mip
-            # because each level has its own resolution.
-            mh, mw = mip.shape[-2], mip.shape[-1]
-            bx, by = 1.0 - 1.0 / mw, 1.0 - 1.0 / mh
-            g = torch.stack([grid[..., 0].clamp(-bx, bx),
-                             grid[..., 1].clamp(-by, by)], dim=-1)
-            samp = F.grid_sample(mip, g, mode='bilinear',
-                                 padding_mode='zeros', align_corners=False)
-            w = sel.repeat_interleave(p, dim=1)[:, None, :, None]      # [B,1,N*p,1]
-            out = out + samp * w
-
-        return out.reshape(B, C, N, p, p).permute(0, 2, 1, 3, 4)
-
-
-# ---------------------------------------------------------------------------
-# Adaptive-resolution decoder
-# ---------------------------------------------------------------------------
-
-def _tent(k: int) -> torch.Tensor:
-    """Normalised bilinear tent kernel, k×k, peaking at 1 in the centre."""
-    coords = torch.arange(k).float() + 0.5
-    centre = k / 2.0
-    w1d = (centre - (coords - centre).abs()).clamp(min=0)
-    wk = w1d.unsqueeze(1) * w1d.unsqueeze(0)
-    return wk / wk.max()
-
-
-class QuadtreeDecoder(nn.Module):
-    """
-    Splat quadtree leaves back onto the pixel grid.
-
-    Each leaf predicts a fixed `out_px × out_px` tile *in its own local frame*,
-    plus a 25% overlap margin blended with a tent kernel — the same operation at
-    every scale.  Leaves are folded per depth into that depth's canvas, each
-    canvas is resized to full resolution, and the canvases are combined by their
-    accumulated tent weights.  Where the tree is deep the fine canvas dominates;
-    where it is shallow the coarse one carries the region.
-    """
-
-    def __init__(self, d: int, out_channels: int, img_size: int,
-                 base_grid: int, out_px: int, skip_ch: int = 0,
-                 mask_aware: bool = True):
-        super().__init__()
-        assert out_px % 4 == 0, "out_px must be divisible by 4 for 25% overlap"
-        self.img_size = img_size
-        self.base_grid = base_grid
-        self.out_px = out_px
-        self.out_channels = out_channels
-        self.skip_ch = skip_ch
-        self.mask_aware = mask_aware
-        self.kernel = out_px + out_px // 2
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.GELU(),
-            nn.Linear(d, out_channels * self.kernel * self.kernel),
+        self.grid = grid
+        self.is_global = (2 * radius + 1) >= grid
+        self.norm1 = nn.LayerNorm(d)
+        self.self_attn = (
+            GlobalSelfAttn(d, n_heads, dropout=dropout) if self.is_global
+            else LocalSelfAttentionRoPE(d, n_heads, radius, dropout=dropout)
         )
+        self.norm2 = nn.LayerNorm(d)
+        self.cross_ctx = CrossAttention(d, d_ctx, n_heads, dropout=dropout)
+        self.norm3 = nn.LayerNorm(d)
+        self.ffn = FeedForward(d, mlp_ratio, dropout=dropout)
 
-        # The mask rides along as an extra channel.  Without it these convs see
-        # a hole as exact 0, which in normalised space is the dataset mean and
-        # is indistinguishable from real fluid sitting at the mean — so they
-        # have to guess where the wall is from a step in the data alone.  Their
-        # receptive field (+-3 px with the skip conv) is precisely the shell
-        # where the boundary artefact lives.
-        mid = max(out_channels * 8, 64)
-        self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch + int(mask_aware), mid, 3, padding=1,
-                      padding_mode='replicate'),
-            nn.GELU(),
-            nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
-        )
-
-        self.register_buffer('weight_kernel', _tent(self.kernel))
-
-    weight_kernel: torch.Tensor
-
-    def _tile_bank(self, preds: torch.Tensor, p_eff: int
-                   ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """
-        Resize the fixed K×K prediction tiles to the stride actually used at
-        this depth.  Deep levels would otherwise fold into a canvas far larger
-        than the image; shrinking the tile keeps the canvas at most img_size
-        while leaving the prediction itself scale-invariant.
-        """
-        B, N, C, _ = preds.shape
-        K = self.kernel
-        if p_eff == self.out_px:
-            return preds, self.weight_kernel.flatten(), K
-
-        K_eff = p_eff + p_eff // 2
-        tiles = F.interpolate(
-            preds.reshape(B * N * C, 1, K, K), size=K_eff,
-            mode='bilinear', align_corners=False,
-        ).reshape(B, N, C, K_eff * K_eff)
-        wk = _tent(K_eff).to(preds.device, preds.dtype).flatten()
-        return tiles, wk, K_eff
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        level: torch.Tensor,
-        row: torch.Tensor,
-        col: torch.Tensor,
-        max_depth: int,
-        skip_feats: Optional[List[torch.Tensor]] = None,
-        pixel_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, N, _ = tokens.shape
-        C, K = self.out_channels, self.kernel
-
-        preds = self.head(tokens).reshape(B, N, C, K * K)              # [B,N,C,K²]
-
-        acc = tokens.new_zeros(B, C, self.img_size, self.img_size)
-        acc_w = tokens.new_zeros(B, 1, self.img_size, self.img_size)
-
-        for d in range(max_depth + 1):
-            sel = (level == d).to(tokens.dtype)                        # [B, N]
-            G = self.base_grid * 2 ** d
-
-            # Never fold into a canvas larger than the image itself.
-            p_eff = min(self.out_px, max(4, (self.img_size // G) // 4 * 4))
-            tiles, wk, K_eff = self._tile_bank(preds, p_eff)
-            canvas_px = G * p_eff
-            idx = (row * G + col).clamp(0, G * G - 1)                  # [B, N]
-
-            # Scatter this depth's leaves into a dense [B, C·K², G²] fold input.
-            KK = K_eff * K_eff
-            vals = (tiles * wk * sel[:, :, None, None]).reshape(B, N, C * KK)
-            dense = tokens.new_zeros(B, G * G, C * KK)
-            dense.scatter_add_(1, idx[:, :, None].expand(-1, -1, C * KK), vals)
-            dense = dense.permute(0, 2, 1)                             # [B, C·K², G²]
-
-            wvals = (sel[:, :, None] * wk).reshape(B, N, KK)
-            wdense = tokens.new_zeros(B, G * G, KK)
-            wdense.scatter_add_(1, idx[:, :, None].expand(-1, -1, KK), wvals)
-            wdense = wdense.permute(0, 2, 1)
-
-            fold_kw = dict(output_size=(canvas_px, canvas_px), kernel_size=K_eff,
-                           stride=p_eff, padding=p_eff // 4)
-            canvas = F.fold(dense.contiguous(), **fold_kw)             # [B, C, cp, cp]
-            wcanvas = F.fold(wdense.contiguous(), **fold_kw)           # [B, 1, cp, cp]
-
-            if canvas_px != self.img_size:
-                mode = 'bilinear'
-                canvas = F.interpolate(canvas, size=self.img_size, mode=mode,
-                                       align_corners=False)
-                wcanvas = F.interpolate(wcanvas, size=self.img_size, mode=mode,
-                                        align_corners=False)
-
-            # Finer levels get more say, matching their higher spatial confidence.
-            acc = acc + canvas * (2.0 ** d)
-            acc_w = acc_w + wcanvas * (2.0 ** d)
-
-        output = acc / acc_w.clamp(min=1e-6)
-
-        if pixel_mask is not None:
-            output = output * pixel_mask
-            mask_ch = pixel_mask.to(output.dtype).expand(
-                output.shape[0], 1, self.img_size, self.img_size)
+    def forward(self, tok: torch.Tensor, context: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, G, _, d = tok.shape
+        n = self.norm1(tok)
+        if self.is_global:
+            a = self.self_attn(n.reshape(B, G * G, d), cos, sin).reshape(B, G, G, d)
         else:
-            mask_ch = torch.ones(output.shape[0], 1, self.img_size, self.img_size,
-                                 device=output.device, dtype=output.dtype)
+            a = self.self_attn(n, cos, sin)
+        tok = tok + a
+        tok = tok + self.cross_ctx(self.norm2(tok), context)   # CrossAttention handles [B,G,G,d]
+        tok = tok + self.ffn(self.norm3(tok))
+        return tok
 
-        parts = [output, skip_feats[0]] if (self.skip_ch > 0 and skip_feats) else [output]
-        if self.mask_aware:
-            parts.append(mask_ch)
-        return output + self.post_conv(torch.cat(parts, dim=1))
+
+# ---------------------------------------------------------------------------
+# Bidirectional parent <-> child cross-attention between adjacent levels
+# ---------------------------------------------------------------------------
+
+class AdjacentCrossAttn(nn.Module):
+    """
+    Couple a coarse (parent) level and the next finer (child) level, both ways.
+
+    The child grid is exactly ``2×`` the parent grid, so every parent block owns a
+    disjoint 2×2 group of children.  Each parent attends to its 4 children, and each
+    child attends to its (single) parent.  Both updates are residual, so the two levels
+    can update each other within one pass.
+    """
+
+    def __init__(self, dp: int, dc: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm_p = nn.LayerNorm(dp)
+        self.norm_c = nn.LayerNorm(dc)
+        self.parent_from_child = CrossAttention(dp, dc, n_heads, dropout=dropout)
+        self.child_from_parent = CrossAttention(dc, dp, n_heads, dropout=dropout)
+
+    def forward(self, parent: torch.Tensor, child: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, Gp, _, dp = parent.shape
+        dc = child.shape[-1]
+
+        np_ = self.norm_p(parent)                                    # [B, Gp, Gp, dp]
+        nc_ = self.norm_c(child)                                     # [B, 2Gp, 2Gp, dc]
+
+        # Group children under their parent: [B, Gp·Gp, 4, dc].
+        ncg = (nc_.reshape(B, Gp, 2, Gp, 2, dc)
+                  .permute(0, 1, 3, 2, 4, 5)
+                  .reshape(B * Gp * Gp, 4, dc))
+        pq = np_.reshape(B * Gp * Gp, 1, dp)
+
+        # parent ← its 4 children
+        p_upd = self.parent_from_child(pq, ncg).reshape(B, Gp, Gp, dp)
+
+        # child ← its parent (broadcast to the 2×2 group)
+        c_upd = (self.child_from_parent(ncg, pq)
+                 .reshape(B, Gp, Gp, 2, 2, dc)
+                 .permute(0, 1, 3, 2, 4, 5)
+                 .reshape(B, 2 * Gp, 2 * Gp, dc))
+
+        return parent + p_upd, child + c_upd
 
 
 # ---------------------------------------------------------------------------
@@ -383,58 +172,103 @@ class QuadtreeDecoder(nn.Module):
 
 class QuadtreeHFM(nn.Module):
     """
-    Fluid model over an adaptively-refined quadtree.
+    Fixed complete-quadtree fluid model.
 
-    forward(x, context, pixel_mask) → [B, C, H, W]   (same contract as HFM)
-
-    The tree realised on each forward pass is stashed on `self.last_tree`
-    rather than returned, so existing call sites are unchanged.
+    forward(x, context, pixel_mask) → [B, C, H, W]   (same contract as flat HFM)
     """
 
     def __init__(self, cfg: HFMConfig):
         super().__init__()
         self.cfg = cfg
-        d = cfg.d_patch
-        hd = d // cfg.n_heads
-        assert hd % 4 == 0, "d_patch // n_heads must be divisible by 4 for 2-D RoPE"
+        L = cfg.ml_levels
+        self.n_levels = L
+        self.dims = list(cfg.ml_dims)
+        nh = cfg.n_heads
+        assert len(self.dims) == L, "ml_dims must have ml_levels entries"
+        assert len(cfg.ml_passes) == L, "ml_passes must have ml_levels entries"
 
-        self.base_grid = cfg.qt_base_grid
-        self.n_rounds = cfg.qt_rounds
-        self.split_k = cfg.qt_split_k
+        # Per-level geometry.  Level l blocks are finest_px·2^l pixels; the grid is
+        # img_size / block_px on a side; the self-attn window is (block_px + 1) blocks,
+        # i.e. radius = block_px // 2.
+        self.block_px = [cfg.ml_finest_px * (2 ** l) for l in range(L)]
+        self.grids = [cfg.img_size // bp for bp in self.block_px]
+        self.radii = [bp // 2 for bp in self.block_px]
+        for d in self.dims:
+            assert d % nh == 0 and (d // nh) % 4 == 0, \
+                f"each ml_dim must be divisible by n_heads and dim//n_heads%4==0 (got {d})"
 
-        self.sampler = CellSampler(cfg.qt_base_grid, cfg.qt_sample_px)
-
-        # Scale-invariant cell encoder: one crop → one token, same weights at
-        # every depth.  This is the "self-similar operation at a smaller scale".
-        self.cell_embed = nn.Conv2d(cfg.in_channels + 1, d,
-                                    kernel_size=cfg.qt_sample_px,
-                                    stride=cfg.qt_sample_px, bias=False)
-        self.scale_enc = RelativeScaleEncoding(d, cfg.qt_scale_freqs)
-        # +1 for the mask channel — see QuadtreeDecoder.post_conv.
         self.mask_aware = getattr(cfg, 'mask_aware_decoder', True)
         self.residual_prediction = getattr(cfg, 'residual_prediction', True)
-        self.skip_encoder = SkipEncoder(
-            cfg.in_channels + int(self.mask_aware), cfg.skip_ch)
 
-        self.global_tokens = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(1, cfg.n_global_tokens, d), std=0.02)
-        )
-
-        self.layers = nn.ModuleList([
-            HFMLayer(d, cfg.n_heads, cfg.d_ctx, cfg.mlp_ratio, cfg.dropout)
-            for _ in range(cfg.n_layers)
+        # Per-level lossless-capable patch embeds from the mask-augmented frame.
+        self.embeds = nn.ModuleList([
+            nn.Conv2d(cfg.in_channels + 1, self.dims[l],
+                      kernel_size=self.block_px[l], stride=self.block_px[l], bias=False)
+            for l in range(L)
         ])
 
-        # Blends a freshly sampled child crop into the state inherited from its parent.
-        self.child_mix = nn.Sequential(nn.LayerNorm(d), FeedForward(d, 2.0))
+        # Per-level RoPE tables (buffers so they follow the module to any device).
+        for l in range(L):
+            cos, sin = build_grid_rope(self.grids[l], self.dims[l] // nh)
+            self.register_buffer(f'rope_cos_{l}', cos)
+            self.register_buffer(f'rope_sin_{l}', sin)
 
-        self.decoder = QuadtreeDecoder(
-            d, cfg.in_channels, cfg.img_size, cfg.qt_base_grid,
-            cfg.qt_out_px, cfg.skip_ch, self.mask_aware
-        )
+        # One self-attn block per level (weights shared across that level's passes).
+        self.blocks = nn.ModuleList([
+            LevelBlock(self.dims[l], nh, cfg.d_ctx, self.grids[l], self.radii[l],
+                       cfg.mlp_ratio, cfg.dropout)
+            for l in range(L)
+        ])
+
+        # Bidirectional cross-attn between each adjacent (coarse, fine) pair.
+        # cross[l] couples level l (parent) with level l-1 (child).
+        self.cross = nn.ModuleList([
+            AdjacentCrossAttn(self.dims[l], self.dims[l - 1], nh, cfg.dropout)
+            for l in range(1, L)
+        ])
+
+        self.schedule = self._build_schedule(list(cfg.ml_passes))
+
+        # Decode from the finest level, which fully tiles the image.  The mask rides
+        # into the decoder's post-conv through the skip features (built from x_aug).
+        self.skip_encoder = SkipEncoder(
+            cfg.in_channels + int(self.mask_aware), cfg.skip_ch)
+        self.decoder = OverlappingPatchDecoder(
+            self.dims[0], cfg.in_channels, cfg.img_size, cfg.ml_finest_px, cfg.skip_ch)
 
         self.last_tree: Dict[str, torch.Tensor] = {}
         self._init_weights()
+
+    # -- schedule -----------------------------------------------------------
+
+    def _build_schedule(self, budgets: List[int]
+                        ) -> List[Tuple[List[int], List[int]]]:
+        """
+        Build the red/black + pyramidal pass list.
+
+        Returns a list of ``(self_levels, cross_indices)`` where ``cross_indices`` are
+        indices into ``self.cross`` (pair (l-1, l) has index l-1).  Levels {0,2} run on
+        even-parity passes, {1,3} on odd; a level self-attends only while it has budget,
+        and a cross pair runs only while both endpoints still have budget.  Emission
+        stops once the finest level is exhausted.
+        """
+        L = self.n_levels
+        budgets = list(budgets)
+        schedule: List[Tuple[List[int], List[int]]] = []
+        g = 0
+        guard = 0
+        while budgets[0] > 0 and guard < 10_000:
+            guard += 1
+            alive = [l for l in range(L) if budgets[l] > 0]
+            grp = [l for l in range(L) if l % 2 == g]
+            self_levels = [l for l in grp if budgets[l] > 0]
+            for l in self_levels:
+                budgets[l] -= 1
+            cross = [l - 1 for l in range(1, L) if (l - 1) in alive and l in alive]
+            if self_levels or cross:
+                schedule.append((self_levels, cross))
+            g ^= 1
+        return schedule
 
     # -- init ---------------------------------------------------------------
 
@@ -447,9 +281,11 @@ class QuadtreeHFM(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        self.scale_enc.reset_film()
-        w = self.cell_embed.weight
-        nn.init.orthogonal_(w.reshape(w.shape[0], -1))
+        for emb in self.embeds:
+            w = emb.weight
+            nn.init.orthogonal_(w.reshape(w.shape[0], -1))
+        # Zero the decoder's final projections so the model starts at exact
+        # persistence (out = x_base + 0) with residual prediction on.
         for seq in [self.decoder.head, self.decoder.post_conv]:
             for child in reversed(list(seq.children())):
                 if isinstance(child, (nn.Linear, nn.Conv2d)):
@@ -460,108 +296,20 @@ class QuadtreeHFM(nn.Module):
 
     # -- pieces -------------------------------------------------------------
 
-    def _embed_cells(self, x_aug: torch.Tensor, level: torch.Tensor,
-                     row: torch.Tensor, col: torch.Tensor,
-                     max_depth: int) -> torch.Tensor:
-        """Sample each cell's region and encode it. → [B, N, d]"""
-        B, N = level.shape
-        crops = self.sampler(x_aug, level, row, col, max_depth)        # [B,N,C,p,p]
-        flat = crops.reshape(B * N, *crops.shape[2:])
-        return self.cell_embed(flat).reshape(B, N, self.cfg.d_patch)
+    def _rope(self, l: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return getattr(self, f'rope_cos_{l}'), getattr(self, f'rope_sin_{l}')
 
-    def _encode(self, tokens: torch.Tensor, level: torch.Tensor,
-                row: torch.Tensor, col: torch.Tensor,
-                context: torch.Tensor) -> torch.Tensor:
-        """Apply the (shared) layer stack with scale-relative encodings."""
-        B, N, d = tokens.shape
-        hd = d // self.cfg.n_heads
-
-        # Everything is measured against the coarsest live cell, so an
-        # all-over-refined tree is encoded identically to its parent tree.
-        lmin = level.min(dim=1, keepdim=True).values                   # [B, 1]
-        d_rel = (level - lmin).to(tokens.dtype)                        # [B, N]
-        cell = 2.0 ** (-d_rel)                                         # in coarse-cell units
-        u = (col.to(tokens.dtype) + 0.5) * cell
-        v = (row.to(tokens.dtype) + 0.5) * cell
-
-        tokens = self.scale_enc(tokens, d_rel)
-        cos, sin = build_rope(u, v, hd, self.cfg.n_global_tokens, self.cfg.qt_rope_octaves)
-
-        seq = torch.cat([tokens, self.global_tokens.expand(B, -1, -1)], dim=1)
-        for layer in self.layers:
-            if self.cfg.gradient_checkpointing and self.training:
-                seq = _checkpointed_layer(layer, seq, context, cos, sin)
-            else:
-                seq = layer(seq, context, cos, sin)
-        return seq[:, :N]
-
-    def choose_splits(self, tokens: torch.Tensor, level: torch.Tensor,
-                      k: int, max_level: int) -> torch.Tensor:
-        """
-        Pick which k leaves to refine.  Returns indices [B, k].
-
-        Stage 1 (here): uniformly at random among the leaves not yet at max
-        depth.  Choosing *where* to spend resolution is a discrete,
-        non-differentiable decision, so there is nothing to learn from it yet —
-        and random trees are in fact the better training signal for now, since
-        they force the scale-invariant machinery to cope with every possible
-        mix of depths rather than whichever one a learned policy would collapse
-        onto.  Override this method to plug in a real criterion later.
-        """
-        splittable = level < max_level
-        noise = torch.rand(level.shape, device=level.device)
-        noise = noise.masked_fill(~splittable, -1.0)
-        return noise.topk(k, dim=1).indices
-
-    def _split(
-        self,
-        tokens: torch.Tensor,
-        level: torch.Tensor,
-        row: torch.Tensor,
-        col: torch.Tensor,
-        x_aug: torch.Tensor,
-        max_level: int,
-    ) -> Tuple[torch.Tensor, ...]:
-        """
-        Replace k leaves by their four children.
-
-        Which leaves get refined is chosen by `choose_splits` — currently
-        uniformly at random.  The parent slot becomes child (0,0) and the other
-        three are appended, so the token count grows by exactly 3k every round
-        and shapes stay static.
-        """
-        N, d = tokens.shape[1], tokens.shape[2]
-        k = min(self.split_k, N)
-
-        top = self.choose_splits(tokens, level, k, max_level)           # [B, k]
-
-        p_tok = tokens.gather(1, top[:, :, None].expand(-1, -1, d))
-        p_lvl = level.gather(1, top)
-        p_row = row.gather(1, top)
-        p_col = col.gather(1, top)
-
-        c_lvl = (p_lvl + 1).repeat(1, 4)                               # [B, 4k]
-        offs_r = torch.tensor([0, 0, 1, 1], device=tokens.device)
-        offs_c = torch.tensor([0, 1, 0, 1], device=tokens.device)
-        c_row = (p_row * 2).repeat(1, 4) + offs_r.repeat_interleave(k)[None]
-        c_col = (p_col * 2).repeat(1, 4) + offs_c.repeat_interleave(k)[None]
-
-        fresh = self._embed_cells(x_aug, c_lvl, c_row, c_col, max_level)   # [B, 4k, d]
-        inherited = p_tok.repeat(1, 4, 1)
-        c_tok = inherited + self.child_mix(fresh)
-
-        # Overwrite parents with child 0, append children 1..3.
-        idx_d = top[:, :, None].expand(-1, -1, d)
-        tokens = tokens.scatter(1, idx_d, c_tok[:, :k])
-        level = level.scatter(1, top, c_lvl[:, :k])
-        row = row.scatter(1, top, c_row[:, :k])
-        col = col.scatter(1, top, c_col[:, :k])
-
-        tokens = torch.cat([tokens, c_tok[:, k:]], dim=1)
-        level = torch.cat([level, c_lvl[:, k:]], dim=1)
-        row = torch.cat([row, c_row[:, k:]], dim=1)
-        col = torch.cat([col, c_col[:, k:]], dim=1)
-        return tokens, level, row, col
+    def _run_pass(self, tokens: List[torch.Tensor], context: torch.Tensor,
+                  self_levels: List[int], cross: List[int]) -> List[torch.Tensor]:
+        # Self-attention on the active levels (the "0&2 / 1&3 in parallel" halves).
+        for l in self_levels:
+            cos, sin = self._rope(l)
+            tokens[l] = self.blocks[l](tokens[l], context, cos, sin)
+        # Bidirectional parent<->child coupling on live adjacent pairs.
+        for ci in cross:
+            parent, child = self.cross[ci](tokens[ci + 1], tokens[ci])
+            tokens[ci + 1], tokens[ci] = parent, child
+        return tokens
 
     # -- forward ------------------------------------------------------------
 
@@ -570,18 +318,11 @@ class QuadtreeHFM(nn.Module):
         x: torch.Tensor,
         context: torch.Tensor,
         pixel_mask: Optional[torch.Tensor] = None,
-        n_rounds: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        `n_rounds` overrides the configured refinement depth — the model is
-        scale-invariant by construction, so running more (or fewer) rounds at
-        inference than at training time is a supported operation.
-        """
         B = x.shape[0]
-        rounds = self.n_rounds if n_rounds is None else n_rounds
 
-        # Base for the residual: the CLEAN masked input.  Taken before the
-        # training noise so the noise does not land straight in the output.
+        # Residual base: the CLEAN masked input, taken before training noise so the
+        # noise does not land straight in the output.
         x_base = x * pixel_mask if pixel_mask is not None else x
 
         if self.training and self.cfg.noise_std > 0.0:
@@ -595,43 +336,38 @@ class QuadtreeHFM(nn.Module):
                                  device=x.device, dtype=x.dtype)
 
         x_aug = torch.cat([x, mask_ch], dim=1)
-        # Skip features are built from the mask-augmented input so the decoder's
-        # convs can see where the walls are instead of inferring them from a
-        # step to zero.
         skip_feats = self.skip_encoder(x_aug if self.mask_aware else x)
 
-        # Root: a uniform base_grid × base_grid tiling at depth 0.
-        G = self.base_grid
-        ar = torch.arange(G, device=x.device)
-        row = ar.repeat_interleave(G)[None].expand(B, -1).contiguous()
-        col = ar.repeat(G)[None].expand(B, -1).contiguous()
-        level = torch.zeros_like(row)
+        # Embed every level from the frame at its own scale.
+        tokens: List[torch.Tensor] = []
+        for l in range(self.n_levels):
+            emb = self.embeds[l](x_aug)                     # [B, d_l, G, G]
+            tokens.append(emb.permute(0, 2, 3, 1).contiguous())   # [B, G, G, d_l]
 
-        tokens = self._embed_cells(x_aug, level, row, col, 0)
+        for self_levels, cross in self.schedule:
+            if self.cfg.gradient_checkpointing and self.training:
+                tokens = _checkpointed_pass(self._run_pass, tokens, context,
+                                            self_levels, cross)
+            else:
+                tokens = self._run_pass(tokens, context, self_levels, cross)
 
-        for r in range(rounds + 1):
-            tokens = self._encode(tokens, level, row, col, context)
-            if r < rounds:
-                tokens, level, row, col = self._split(
-                    tokens, level, row, col, x_aug, rounds
-                )
-
-        self.last_tree = {
-            'level': level.detach(),
-            'row': row.detach(),
-            'col': col.detach(),
-        }
-
-        out = self.decoder(tokens, level, row, col, rounds,
-                           skip_feats, pixel_mask=pixel_mask)
+        out = self.decoder(tokens[0], skip_feats, pixel_mask=pixel_mask)
 
         if self.residual_prediction:
-            # Predict the change, not the whole field.  Consecutive frames
-            # differ by only ~2% of signal, so an absolute model has to
-            # reconstruct everything to better than that just to tie with
-            # copying its input — a bar it does not clear.  With the decoder
-            # zero-initialised this starts training at exact persistence.
             out = x_base + out
             if pixel_mask is not None:
                 out = out * pixel_mask
         return out
+
+
+def _checkpointed_pass(fn, tokens: List[torch.Tensor], context: torch.Tensor,
+                       self_levels: List[int], cross: List[int]) -> List[torch.Tensor]:
+    """Gradient-checkpoint one schedule pass.  ``self_levels``/``cross`` are captured
+    in a closure so only tensors cross the checkpoint boundary."""
+    from torch.utils.checkpoint import checkpoint
+
+    def run(*toks):
+        return tuple(fn(list(toks), context, self_levels, cross))
+
+    out = checkpoint(run, *tokens, use_reentrant=False)
+    return list(out)

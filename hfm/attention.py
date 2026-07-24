@@ -33,6 +33,19 @@ def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return torch.matmul(attn, v)
 
 
+# 2-D RoPE helpers (kept local to avoid a circular import with model.py, which
+# imports CrossAttention from this module).
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Swap halves with sign flip: [..., a, b] → [..., -b, a]."""
+    d = x.shape[-1] // 2
+    return torch.cat([-x[..., d:], x[..., :d]], dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x: [B, n_heads, N, hd];  cos/sin: [1, 1, N, hd]."""
+    return x * cos + _rotate_half(x) * sin
+
+
 # ---------------------------------------------------------------------------
 # Local self-attention on a spatial grid
 # ---------------------------------------------------------------------------
@@ -94,6 +107,80 @@ class LocalSelfAttention(nn.Module):
         out = _scaled_dot(q, k, v)                            # [BHW, nh, 1, hd]
         out = out.transpose(1, 2).reshape(B * H * W, 1, C)
         out = out.reshape(B, H, W, C)
+        return self.drop(self.proj(out))
+
+
+# ---------------------------------------------------------------------------
+# Local self-attention with 2-D RoPE
+# ---------------------------------------------------------------------------
+
+class LocalSelfAttentionRoPE(nn.Module):
+    """
+    Self-attention where each grid position attends within a (2·radius+1)² window
+    of its neighbours, with 2-D rotary position embedding.
+
+    RoPE is applied to q and k on the *full* grid (a per-token rotation) before the
+    neighbourhood is gathered, so a centre query rotated by its absolute position
+    dotted with a neighbour key rotated by its absolute position yields the usual
+    relative encoding — with no bias term stored anywhere.
+
+    Input:  x [B, H, W, C];  cos/sin [1, 1, H·W, head_dim]  (row-major grid order)
+    Output: [B, H, W, C]
+    """
+
+    def __init__(self, dim: int, n_heads: int, radius: int, dropout: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = dim // n_heads
+        self.radius   = radius
+        self.qkv  = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+        nh, hd = self.n_heads, self.head_dim
+        r      = self.radius
+        win    = 2 * r + 1
+        N      = H * W
+        M      = win * win
+
+        q, k, v = self.qkv(x).reshape(B, N, 3 * C).chunk(3, dim=-1)   # each [B, N, C]
+
+        def heads(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(B, N, nh, hd).transpose(1, 2)            # [B, nh, N, hd]
+
+        q, k, v = heads(q), heads(k), heads(v)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+
+        def to_grid(t: torch.Tensor) -> torch.Tensor:
+            # [B, nh, N, hd] → [B, nh·hd, H, W] (channels-first for padding/unfold)
+            return t.reshape(B, nh, H, W, hd).permute(0, 1, 4, 2, 3).reshape(B, nh * hd, H, W)
+
+        kg = F.pad(to_grid(k), (r, r, r, r), mode='reflect')
+        vg = F.pad(to_grid(v), (r, r, r, r), mode='reflect')
+
+        kcols, vcols = [], []
+        for di in range(win):
+            for dj in range(win):
+                kcols.append(kg[:, :, di:di + H, dj:dj + W])
+                vcols.append(vg[:, :, di:di + H, dj:dj + W])
+        kk = torch.stack(kcols, dim=2)   # [B, nh·hd, M, H, W]
+        vv = torch.stack(vcols, dim=2)
+
+        def nbr(t: torch.Tensor) -> torch.Tensor:
+            # [B, nh·hd, M, H, W] → [B, nh, N, M, hd]
+            return t.reshape(B, nh, hd, M, N).permute(0, 1, 4, 3, 2)
+
+        kk, vv = nbr(kk), nbr(vv)
+        qc = q.unsqueeze(3)                                          # [B, nh, N, 1, hd]
+
+        attn = (qc * kk).sum(-1) / math.sqrt(hd)                     # [B, nh, N, M]
+        attn = F.softmax(attn, dim=-1)
+        out  = (attn.unsqueeze(-1) * vv).sum(3)                      # [B, nh, N, hd]
+        out  = out.transpose(1, 2).reshape(B, H, W, C)
         return self.drop(self.proj(out))
 
 
