@@ -51,4 +51,8 @@ checkpoints*
 out
 out*
 
+# Model checkpoints (never commit — large binaries)
+*.pt
+*.ckpt
+
 .claude
