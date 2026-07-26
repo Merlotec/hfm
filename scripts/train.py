@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -52,11 +53,38 @@ SELF_INPUT_PROB       = 0.5     # scheduled sampling: P(input = own prediction)
 # Config helpers
 # ---------------------------------------------------------------------------
 
+def apply_distributed_env_defaults() -> None:
+    """Seed the comms/DDP env vars from hyperparams.json so they are version-controlled
+    defaults, not shell-only flags.  Only setdefault — anything already exported (by
+    scripts/dawn_task.sh or `sbatch --export`) wins.  MUST run before init_distributed(),
+    which is where the collective backend is chosen.
+
+    Precedence: real env  >  hyperparams.json 'training'  >  code default.
+    """
+    try:
+        with open(HYPERPARAMS) as f:
+            t = json.load(f).get('training', {})
+    except Exception:
+        return
+    if t.get('try_xccl'):
+        # Native xccl device collectives instead of the host-staged gloo path.
+        os.environ.setdefault('HFM_DDP_BACKEND', 'xccl')
+    if t.get('grad_allreduce_bf16'):
+        os.environ.setdefault('HFM_GRAD_ALLREDUCE_BF16', '1')
+
+
 def load_config() -> tuple[HFMConfig, dict]:
     with open(HYPERPARAMS) as f:
         hp = json.load(f)
     m = hp['model']
     t = hp['training']
+    # Fixed-quadtree (QuadtreeHFM) knobs: pass through only the keys actually present
+    # so anything omitted keeps its HFMConfig default (no duplicated defaults here).
+    # JSON arrays arrive as lists; HFMConfig tuple fields tolerate them (the model
+    # does list(...) on each).  '_'-prefixed keys are comments and are skipped.
+    ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
+               'ml_blocks_per_level', 'ml_untie_passes')
+    ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],
         in_channels            = m['in_channels'],
@@ -80,6 +108,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         disc_adv_weight        = m['disc_adv_weight'],
         disc_lr                = m['disc_lr'],
         gradient_checkpointing = True,
+        **ml_kwargs,
     )
     return cfg, t
 
@@ -142,6 +171,10 @@ def main():
                              'These are what `--resume latest` looks for.')
     args = parser.parse_args()
 
+    # Seed comms env from hyperparams.json BEFORE the process group is built (the
+    # backend is chosen inside init_distributed).  Real env still overrides.
+    apply_distributed_env_defaults()
+
     # Raw torch DDP (NOMAD's launcher).  Lightning is not usable on Dawn: its
     # accelerator registry has no XPU entry, so accelerator='auto' picks CPU on a
     # PVC node.  init_distributed() imports IPEX/oneCCL, selects xpu:<local_rank>
@@ -154,6 +187,11 @@ def main():
     n_epochs = args.epochs or train_hp['n_epochs']
     # context frames + input frame + one target per rollout step
     seq_len  = cfg.n_context_frames + 1 + getattr(cfg, 'rollout_horizon', 1)
+
+    # Gradient accumulation: N micro-batches per optimizer step.  Env var overrides the
+    # hyperparams.json value so it can be toggled per-job on the cluster without an edit.
+    # Cuts the host-staged allreduce count N× at the cost of N× the effective batch.
+    accum_steps = int(os.environ.get('HFM_ACCUM_STEPS') or train_hp.get('accum_steps', 1))
 
     # ---- training data ----
     num_workers = train_hp.get('num_workers', 8)
@@ -230,6 +268,7 @@ def main():
         pixel_mask            = pixel_mask,
         self_input_prob       = SELF_INPUT_PROB,
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
+        accum_steps           = accum_steps,
     )
     trainer.to(device)
 
@@ -258,7 +297,9 @@ def main():
     # Under DDP the sampler shards the dataset, so each rank takes len/(B*world)
     # optimizer steps per epoch — forgetting `world` here made resume land on the
     # wrong epoch.
-    steps_per_epoch = math.ceil(len(dm._dataset) / (train_hp['batch_size'] * max(1, world)))
+    # global_step counts OPTIMIZER steps, so divide the micro-batches/epoch by accum_steps.
+    steps_per_epoch = math.ceil(
+        len(dm._dataset) / (train_hp['batch_size'] * max(1, world) * accum_steps))
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len})')
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}')

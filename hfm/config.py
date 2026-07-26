@@ -63,6 +63,15 @@ class HFMConfig:
     # the "number of layers" = how many times level `ml_levels-1` iterates.  Coarse
     # budgets exhaust first, so late passes touch only fine levels (pyramidal tail).
     ml_passes: tuple = (8, 6, 5, 4)
+    # Weight tying across a level's repeated passes.  By default each level reuses ONE
+    # block for all its passes (parameter-efficient iterative refinement).  Set an entry
+    # >1 to give that level that many DISTINCT blocks, cycled round-robin across its
+    # passes (e.g. 2 blocks over 6 passes → block order 0,1,0,1,0,1).  Each entry is
+    # clamped to [1, ml_passes[l]].
+    ml_blocks_per_level: tuple = (1, 1, 1, 1)
+    # Convenience flag: fully untie — one distinct block per pass.  Overrides
+    # ml_blocks_per_level (sets it to ml_passes).  Multiplies self-attn parameters.
+    ml_untie_passes: bool = False
 
     # --- legacy dynamic-quadtree fields (kept for config/checkpoint compat) ---
     qt_base_grid: int = 4

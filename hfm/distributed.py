@@ -186,6 +186,11 @@ def allreduce_grads(modules) -> None:
     distributed.  All ranks must call this with the same modules and the same
     set of grad-bearing params (keep any conditional backward globally
     consistent — see allreduce_stats).  ~4B/param of host traffic per call.
+
+    Set HFM_GRAD_ALLREDUCE_BF16=1 to stage and allreduce in bfloat16 instead of
+    fp32 — halves the D2H + host-collective + H2D traffic per step for a small
+    numerical cost (the /world division is still done in fp32).  Only worthwhile
+    while stuck on the host-staged gloo path; harmless otherwise.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
@@ -193,8 +198,11 @@ def allreduce_grads(modules) -> None:
     grads = [p.grad for m in modules for p in m.parameters() if p.grad is not None]
     if not grads:
         return
-    flat = torch.cat([g.detach().reshape(-1).to('cpu', torch.float32) for g in grads])
+    wire = (torch.bfloat16 if os.environ.get('HFM_GRAD_ALLREDUCE_BF16') == '1'
+            else torch.float32)
+    flat = torch.cat([g.detach().reshape(-1).to('cpu', wire) for g in grads])
     torch.distributed.all_reduce(flat)
+    flat = flat.to(torch.float32)                  # divide in fp32, not bf16
     flat.div_(world)
     off = 0
     for g in grads:

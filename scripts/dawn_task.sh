@@ -61,25 +61,34 @@ export CCL_ATL_TRANSPORT=ofi                   # oneCCL over libfabric (srun lau
 #   0,2,4,6,8,10,12,14,16,18,20,22          (even cores only — HT siblings)
 # so arithmetic like localid*cpus+cpus-1 lands on an odd core that is NOT in the set.
 # oneCCL's default ('auto') is just as wrong — it picks high cores like 95.
-# Ask the kernel instead: pin the worker to the LAST core actually allowed here.
+# Ask the kernel instead, and give EACH local rank a DISTINCT worker core.
 export CCL_WORKER_COUNT=1
 _NCORES=$(python -c 'import os; print(len(os.sched_getaffinity(0)))')
-_LASTCORE=$(python -c 'import os; print(sorted(os.sched_getaffinity(0))[-1])')
+_LOCALN="${SLURM_NTASKS_PER_NODE:-${SLURM_NTASKS:-1}}"
 # oneCCL parses CCL_WORKER_AFFINITY as a NODE-WIDE list of length
 # local_proc_count * CCL_WORKER_COUNT and gives local process i slot i.  A bare
 # integer parses only when local_proc_count == 1; with 8 ranks/node it dies with
 #   env.cpp:1363 env_2_worker_affinity: failed to parse worker affinity
-# Each rank gets its own copy of this env (per-task shell) and only ever reads
-# its own slot, so filling EVERY slot with our own last core keeps the list the
-# right length while guaranteeing the slot we read is inside our cpuset.
-_LOCALN="${SLURM_NTASKS_PER_NODE:-${SLURM_NTASKS:-1}}"
-export CCL_WORKER_AFFINITY=$(python -c "print(','.join(['$_LASTCORE'] * $_LOCALN))")
-# Compute runs on the XPU; the host cores mostly feed the DataLoader (num_workers=8
-# renderer processes per rank share this same 12-core cpuset).  A big OMP pool in
-# the main process would just fight them — cap it, and keep the last core free for
-# the CCL worker pinned above.
-_OMP=$(( _NCORES > 1 ? _NCORES - 1 : 1 ))
-export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
+# We build the full list from THIS rank's own cpuset: slot j -> the (j+1)-th core
+# counting DOWN from the top.  Every slot is inside our cpuset (so the slot we read
+# never triggers EINVAL(22)); and when ranks SHARE a cpuset — the case that made the
+# old "fill every slot with our one last core" collapse all 8 workers onto core 22 —
+# the per-rank slots now land on different cores.  Workers take the HIGH cores; the
+# DataLoader / OMP get the low ones.
+export CCL_WORKER_AFFINITY=$(python - "$_LOCALN" <<'PY'
+import os, sys
+cores = sorted(os.sched_getaffinity(0)); n = len(cores)
+N = int(sys.argv[1])
+print(','.join(str(cores[-(1 + (j % n))]) for j in range(N)))
+PY
+)
+# Compute runs on the XPU; host cores mostly feed the DataLoader (num_workers in
+# hyperparams.json — renderer processes share this cpuset) and drive the host-staged
+# allreduce (a threaded cat/div/copy that does benefit from a few cores).  Give the
+# main process a modest OMP pool without swamping the loaders or the CCL worker.
+# Tunable: dial back if `nproc` per rank is small, or raise with more cpus-per-task.
+_OMP=$(( _NCORES > 2 ? _NCORES - 2 : 1 ))
+export OMP_NUM_THREADS=$(( _OMP > 6 ? 6 : _OMP ))
 
 # --- oneCCL topology checks: LEAVE ON with 8 ranks/node -----------------------
 # History, because every one of these lines was paid for in failed jobs:
@@ -107,18 +116,28 @@ export OMP_NUM_THREADS=$(( _OMP > 4 ? 4 : _OMP ))
 # Still worth a Dawn support ticket: "torch 2.8+xpu native XCCL on pvc9,
 # 8 ranks/node: GPU NotPresent(PDE) fault on first allreduce; SIGSEGV in comm
 # init under ZE_AFFINITY_MASK — is there a supported oneCCL config?"
-export HFM_DDP_BACKEND=gloo
-export HFM_HOST_GRAD_SYNC=1
+#
+# RE-TEST HOOK: torch>=2.7 +xpu ships a NATIVE 'xccl' backend (separate from
+# oneccl_bindings).  The probe reports `backend xccl: True`, meaning it is BUILT —
+# not that it runs here.  The one combination never cleanly tried is native xccl
+# with ZE *enabled*: the documented failures were oneCCL's ZE path (PDE fault) and
+# xccl with ZE *disabled* (CCL_ZE_ENABLE=0 -> "ze_data was not initialized").  Set
+# HFM_TRY_XCCL=1 (e.g. `sbatch --export=ALL,HFM_TRY_XCCL=1 ...`) to try it: that
+# switches to device collectives via DDP and drops the host staging entirely.  Keep
+# ZE ENABLED for the attempt — do NOT set CCL_ZE_ENABLE=0 or ZE_AFFINITY_MASK.
+if [ "${HFM_TRY_XCCL:-0}" = "1" ]; then
+  export HFM_DDP_BACKEND=xccl
+  unset  HFM_HOST_GRAD_SYNC              # DDP device collectives, not host staging
+  echo "[collective] HFM_TRY_XCCL=1 -> native xccl device collectives (ZE enabled)"
+else
+  export HFM_DDP_BACKEND=gloo
+  export HFM_HOST_GRAD_SYNC=1
+fi
 
 # oneCCL bring-up diagnostics.  `failed to start worker # 0` is a generic message;
 # this prints the actual reason.  Set CCL_LOG_LEVEL=warn once it works — info is
 # hundreds of lines per rank.
 export CCL_LOG_LEVEL="${CCL_LOG_LEVEL:-info}"
-
-# Backend override: torch>=2.7 with an XPU build ships a NATIVE 'xccl' backend that
-# does not go through oneccl_bindings_for_pytorch at all.  Set HFM_DDP_BACKEND=xccl
-# to force it (hfm/distributed.py auto-detects, but only if is_xccl_available()).
-# export HFM_DDP_BACKEND=xccl
 
 # ---- fail fast, with the reason, instead of silently training on CPU --------
 # rank 0 prints what torch can actually see; init_distributed() hard-errors if a
@@ -127,7 +146,8 @@ if [ "${SLURM_PROCID:-0}" = "0" ]; then
   echo "=== rank0 env ==="
   echo "  nodes=${SLURM_NNODES:-?} ntasks=${SLURM_NTASKS:-?} localid=${SLURM_LOCALID:-?} cpus/task=${SLURM_CPUS_PER_TASK:-?}"
   echo "  OMP_NUM_THREADS=$OMP_NUM_THREADS CCL_WORKER_COUNT=$CCL_WORKER_COUNT CCL_WORKER_AFFINITY=$CCL_WORKER_AFFINITY"
-  echo "  CCL_ATL_TRANSPORT=$CCL_ATL_TRANSPORT HFM_DDP_BACKEND=${HFM_DDP_BACKEND:-<auto>}"
+  echo "  CCL_ATL_TRANSPORT=$CCL_ATL_TRANSPORT HFM_DDP_BACKEND=${HFM_DDP_BACKEND:-<auto>} HFM_HOST_GRAD_SYNC=${HFM_HOST_GRAD_SYNC:-0}"
+  echo "  tuning: HFM_TRY_XCCL=${HFM_TRY_XCCL:-0} HFM_ACCUM_STEPS=${HFM_ACCUM_STEPS:-<hp>} HFM_GRAD_ALLREDUCE_BF16=${HFM_GRAD_ALLREDUCE_BF16:-0}"
   echo "  cpus visible to this rank: $(nproc) | affinity: $(taskset -pc $$ 2>/dev/null || echo n/a)"
   python - <<'PY' || true
 import torch, torch.distributed as d

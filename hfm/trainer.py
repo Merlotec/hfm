@@ -10,6 +10,7 @@ The context encoder and main model are optimised jointly — gradients from the
 prediction loss flow freely through both.  No warmup BPTT or sys/resid logic.
 """
 
+import contextlib
 import math
 import torch
 import torch.nn as nn
@@ -73,6 +74,9 @@ def train_step_gan(
     disc_update_threshold: float = 0.3,
     self_input_prob: float = 0.0,
     rollout_horizon: int = 1,
+    accum_steps: int = 1,
+    micro_first: bool = True,
+    micro_last: bool = True,
 ) -> Tuple[float, float]:
     """
     One training step.
@@ -96,10 +100,23 @@ def train_step_gan(
     prediction of it (from frames[n_context-1]).  Largely subsumed by horizon>1,
     but kept for horizon=1.
 
+    accum_steps / micro_first / micro_last: gradient accumulation.  Over a window
+    of `accum_steps` micro-batches the grads are accumulated (losses scaled by
+    1/accum_steps) and the optimizers step ONLY on the last micro-batch — so the
+    expensive host-staged allreduce_grads runs once per window instead of once per
+    micro-batch, cutting the sync count `accum_steps`×.  Defaults (1/True/True)
+    reproduce the original single-step behaviour exactly.
+
+    NOTE: this saves comms only on the host-grad-sync path (no DDP wrapper).  Under
+    a real DDP wrapper the reducer still fires every backward; accumulation stays
+    numerically correct there but does not reduce traffic without model.no_sync().
+
     Returns (recon_loss, disc_loss).  disc_loss is 0.0 when adv_weight == 0.
     """
-    gen_optimizer.zero_grad()
-    disc_optimizer.zero_grad()
+    scale = 1.0 / max(1, accum_steps)
+    if micro_first:
+        gen_optimizer.zero_grad()
+        disc_optimizer.zero_grad()
 
     device_type = frames[0].device.type
     # bf16 autocast on CUDA *and* XPU — PVC's matrix engines run bf16; leaving this
@@ -157,14 +174,15 @@ def train_step_gan(
         if bad > 0.0:
             _zero_and_restore()
             return float('nan'), 0.0
-        recon_loss.backward()
-        if host_grad_sync_enabled():
-            allreduce_grads([model, context_encoder])   # average, THEN clip (DDP semantics)
-        if clip_grad > 0:
-            nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(context_encoder.parameters()), clip_grad
-            )
-        gen_optimizer.step()
+        (recon_loss * scale).backward()
+        if micro_last:
+            if host_grad_sync_enabled():
+                allreduce_grads([model, context_encoder])   # average, THEN clip (DDP semantics)
+            if clip_grad > 0:
+                nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(context_encoder.parameters()), clip_grad
+                )
+            gen_optimizer.step()
         return recon_loss.item(), 0.0
 
     # ---- discriminator update ----
@@ -205,14 +223,18 @@ def train_step_gan(
         return float('nan'), float('nan')
     d_gate = d_sum / n                       # global mean disc loss
 
+    # Accumulate the disc grad on healthy micro-batches; step once per window.
     if disc_update_threshold < d_gate < 2.0:
-        d_loss.backward()
+        (d_loss * scale).backward()
+    if micro_last:
+        # allreduce_grads / clip / step are no-ops when no micro in this window was
+        # healthy (grads absent) — and the health gate is GLOBAL, so grad presence is
+        # identical across ranks, keeping the collective consistent.
         if host_grad_sync_enabled():
             allreduce_grads([discriminator])
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(discriminator.parameters(), clip_grad)
         disc_optimizer.step()
-    disc_optimizer.zero_grad()
 
     # ---- generator update ----
     for p in discriminator.parameters():
@@ -235,14 +257,15 @@ def train_step_gan(
         _zero_and_restore()
         return float('nan'), d_loss_val
 
-    total_loss.backward()
-    if host_grad_sync_enabled():
-        allreduce_grads([model, context_encoder])
-    if clip_grad > 0:
-        nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(context_encoder.parameters()), clip_grad
-        )
-    gen_optimizer.step()
+    (total_loss * scale).backward()
+    if micro_last:
+        if host_grad_sync_enabled():
+            allreduce_grads([model, context_encoder])
+        if clip_grad > 0:
+            nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(context_encoder.parameters()), clip_grad
+            )
+        gen_optimizer.step()
 
     for p in discriminator.parameters():
         p.requires_grad_(True)
@@ -287,9 +310,12 @@ class GANTrainer:
         pixel_mask: Optional[torch.Tensor] = None,
         self_input_prob: float = 0.5,
         cosine_t_max: int = 10_000,
+        accum_steps: int = 1,
     ):
         self.self_input_prob  = self_input_prob
         self.cosine_t_max     = cosine_t_max
+        self.accum_steps      = max(1, int(accum_steps))
+        self._micro           = 0     # position within the current accumulation window
         self.cfg              = cfg
         self.model            = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
         self.context_encoder  = ContextEncoder(cfg)
@@ -312,6 +338,19 @@ class GANTrainer:
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
+
+    def _no_sync_if(self, active: bool):
+        """Context manager that enters ``.no_sync()`` on any DDP-wrapped module when
+        ``active`` — used to skip the reducer's allreduce on non-final accumulation
+        micro-batches.  A no-op when modules are not DDP-wrapped (host-grad-sync or
+        single-process), so it is safe on every path."""
+        from torch.nn.parallel import DistributedDataParallel as _DDP
+        stack = contextlib.ExitStack()
+        if active:
+            for m in (self.model, self.context_encoder, self.discriminator):
+                if isinstance(m, _DDP):
+                    stack.enter_context(m.no_sync())
+        return stack
 
     def _current_adv_weight(self) -> float:
         if self.global_step < self.gan_start_step:
@@ -394,24 +433,46 @@ class GANTrainer:
         self.context_encoder.train()
         self.discriminator.train()
 
-        recon_loss, disc_loss = train_step_gan(
-            self.model,
-            self.context_encoder,
-            self.discriminator,
-            frames,
-            self.gen_optimizer,
-            self.disc_optimizer,
-            self.criterion,
-            n_context=self.cfg.n_context_frames,
-            adv_weight=self._current_adv_weight(),
-            pixel_mask=pixel_mask,
-            disc_update_threshold=self.disc_update_threshold,
-            self_input_prob=self.self_input_prob,
-            rollout_horizon=getattr(self.cfg, 'rollout_horizon', 1),
-        )
+        micro_first = (self._micro == 0)
+        micro_last  = (self._micro == self.accum_steps - 1)
 
-        self.scheduler.step()
-        self.global_step += 1
+        # On the DDP path, suppress the per-backward allreduce on non-final micro-batches
+        # so accumulation actually saves comms (and doesn't double-mark the reducer).
+        # No-op on the host-grad-sync path — those modules aren't DDP-wrapped.
+        with self._no_sync_if(not micro_last):
+            recon_loss, disc_loss = train_step_gan(
+                self.model,
+                self.context_encoder,
+                self.discriminator,
+                frames,
+                self.gen_optimizer,
+                self.disc_optimizer,
+                self.criterion,
+                n_context=self.cfg.n_context_frames,
+                adv_weight=self._current_adv_weight(),
+                pixel_mask=pixel_mask,
+                disc_update_threshold=self.disc_update_threshold,
+                self_input_prob=self.self_input_prob,
+                rollout_horizon=getattr(self.cfg, 'rollout_horizon', 1),
+                accum_steps=self.accum_steps,
+                micro_first=micro_first,
+                micro_last=micro_last,
+            )
+
+        # A NaN bail zeroed the grads inside train_step_gan — abort the window and do
+        # not advance the optimizer step / LR schedule on a failed micro-batch.
+        if not (recon_loss == recon_loss):   # NaN check without importing math here
+            self._micro = 0
+            return recon_loss, disc_loss
+
+        # `global_step` counts OPTIMIZER steps (one per accumulation window), so the LR
+        # schedule, adv-weight ramp and checkpoint cadence are all in optimizer-step
+        # units regardless of accum_steps.
+        self._micro += 1
+        if self._micro >= self.accum_steps:
+            self._micro = 0
+            self.scheduler.step()
+            self.global_step += 1
         return recon_loss, disc_loss
 
     def training_info(self) -> dict:

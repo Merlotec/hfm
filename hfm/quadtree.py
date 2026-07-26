@@ -213,10 +213,25 @@ class QuadtreeHFM(nn.Module):
             self.register_buffer(f'rope_cos_{l}', cos)
             self.register_buffer(f'rope_sin_{l}', sin)
 
-        # One self-attn block per level (weights shared across that level's passes).
+        # Self-attn blocks per level.  Each level owns n_blocks[l] distinct blocks,
+        # cycled round-robin across its passes: 1 ties all passes (default, parameter-
+        # efficient iterative refinement), ml_passes[l] fully unties.  ml_untie_passes
+        # forces the fully-untied case; otherwise ml_blocks_per_level sets it.
+        passes = list(cfg.ml_passes)
+        if getattr(cfg, 'ml_untie_passes', False):
+            nb = list(passes)
+        else:
+            nb = list(getattr(cfg, 'ml_blocks_per_level', (1,) * L))
+        assert len(nb) == L, "ml_blocks_per_level must have ml_levels entries"
+        # Never more blocks than passes (extras would be dead weight), never fewer than 1.
+        self.n_blocks = [max(1, min(int(nb[l]), passes[l])) for l in range(L)]
+
         self.blocks = nn.ModuleList([
-            LevelBlock(self.dims[l], nh, cfg.d_ctx, self.grids[l], self.radii[l],
-                       cfg.mlp_ratio, cfg.dropout)
+            nn.ModuleList([
+                LevelBlock(self.dims[l], nh, cfg.d_ctx, self.grids[l], self.radii[l],
+                           cfg.mlp_ratio, cfg.dropout)
+                for _ in range(self.n_blocks[l])
+            ])
             for l in range(L)
         ])
 
@@ -227,7 +242,7 @@ class QuadtreeHFM(nn.Module):
             for l in range(1, L)
         ])
 
-        self.schedule = self._build_schedule(list(cfg.ml_passes))
+        self.schedule = self._build_schedule(passes)
 
         # Decode from the finest level, which fully tiles the image.  The mask rides
         # into the decoder's post-conv through the skip features (built from x_aug).
@@ -242,31 +257,37 @@ class QuadtreeHFM(nn.Module):
     # -- schedule -----------------------------------------------------------
 
     def _build_schedule(self, budgets: List[int]
-                        ) -> List[Tuple[List[int], List[int]]]:
+                        ) -> List[Tuple[List[Tuple[int, int]], List[int]]]:
         """
         Build the red/black + pyramidal pass list.
 
-        Returns a list of ``(self_levels, cross_indices)`` where ``cross_indices`` are
-        indices into ``self.cross`` (pair (l-1, l) has index l-1).  Levels {0,2} run on
-        even-parity passes, {1,3} on odd; a level self-attends only while it has budget,
-        and a cross pair runs only while both endpoints still have budget.  Emission
-        stops once the finest level is exhausted.
+        Returns a list of ``(self_items, cross_indices)`` where ``self_items`` are
+        ``(level, block_idx)`` pairs — ``block_idx`` cycles round-robin over that level's
+        ``n_blocks`` as its passes progress (always 0 when the level is fully tied) — and
+        ``cross_indices`` index ``self.cross`` (pair (l-1, l) has index l-1).  Levels
+        {0,2} run on even-parity passes, {1,3} on odd; a level self-attends only while it
+        has budget, and a cross pair runs only while both endpoints still have budget.
+        Emission stops once the finest level is exhausted.
         """
         L = self.n_levels
         budgets = list(budgets)
-        schedule: List[Tuple[List[int], List[int]]] = []
+        counts = [0] * L        # times each level has self-attended so far
+        schedule: List[Tuple[List[Tuple[int, int]], List[int]]] = []
         g = 0
         guard = 0
         while budgets[0] > 0 and guard < 10_000:
             guard += 1
             alive = [l for l in range(L) if budgets[l] > 0]
             grp = [l for l in range(L) if l % 2 == g]
-            self_levels = [l for l in grp if budgets[l] > 0]
-            for l in self_levels:
-                budgets[l] -= 1
+            self_items: List[Tuple[int, int]] = []
+            for l in grp:
+                if budgets[l] > 0:
+                    self_items.append((l, counts[l] % self.n_blocks[l]))
+                    counts[l] += 1
+                    budgets[l] -= 1
             cross = [l - 1 for l in range(1, L) if (l - 1) in alive and l in alive]
-            if self_levels or cross:
-                schedule.append((self_levels, cross))
+            if self_items or cross:
+                schedule.append((self_items, cross))
             g ^= 1
         return schedule
 
@@ -300,11 +321,11 @@ class QuadtreeHFM(nn.Module):
         return getattr(self, f'rope_cos_{l}'), getattr(self, f'rope_sin_{l}')
 
     def _run_pass(self, tokens: List[torch.Tensor], context: torch.Tensor,
-                  self_levels: List[int], cross: List[int]) -> List[torch.Tensor]:
+                  self_items: List[Tuple[int, int]], cross: List[int]) -> List[torch.Tensor]:
         # Self-attention on the active levels (the "0&2 / 1&3 in parallel" halves).
-        for l in self_levels:
+        for l, b in self_items:
             cos, sin = self._rope(l)
-            tokens[l] = self.blocks[l](tokens[l], context, cos, sin)
+            tokens[l] = self.blocks[l][b](tokens[l], context, cos, sin)
         # Bidirectional parent<->child coupling on live adjacent pairs.
         for ci in cross:
             parent, child = self.cross[ci](tokens[ci + 1], tokens[ci])
@@ -344,12 +365,12 @@ class QuadtreeHFM(nn.Module):
             emb = self.embeds[l](x_aug)                     # [B, d_l, G, G]
             tokens.append(emb.permute(0, 2, 3, 1).contiguous())   # [B, G, G, d_l]
 
-        for self_levels, cross in self.schedule:
+        for self_items, cross in self.schedule:
             if self.cfg.gradient_checkpointing and self.training:
                 tokens = _checkpointed_pass(self._run_pass, tokens, context,
-                                            self_levels, cross)
+                                            self_items, cross)
             else:
-                tokens = self._run_pass(tokens, context, self_levels, cross)
+                tokens = self._run_pass(tokens, context, self_items, cross)
 
         out = self.decoder(tokens[0], skip_feats, pixel_mask=pixel_mask)
 
@@ -361,13 +382,13 @@ class QuadtreeHFM(nn.Module):
 
 
 def _checkpointed_pass(fn, tokens: List[torch.Tensor], context: torch.Tensor,
-                       self_levels: List[int], cross: List[int]) -> List[torch.Tensor]:
-    """Gradient-checkpoint one schedule pass.  ``self_levels``/``cross`` are captured
+                       self_items: List[Tuple[int, int]], cross: List[int]) -> List[torch.Tensor]:
+    """Gradient-checkpoint one schedule pass.  ``self_items``/``cross`` are captured
     in a closure so only tensors cross the checkpoint boundary."""
     from torch.utils.checkpoint import checkpoint
 
     def run(*toks):
-        return tuple(fn(list(toks), context, self_levels, cross))
+        return tuple(fn(list(toks), context, self_items, cross))
 
     out = checkpoint(run, *tokens, use_reentrant=False)
     return list(out)
