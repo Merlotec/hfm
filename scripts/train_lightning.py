@@ -104,6 +104,8 @@ def main() -> None:
     parser.add_argument('--batch-size',  type=int,  default=None,
                         help='Override batch_size from hyperparams.json')
     parser.add_argument('--log-every',   type=int,  default=50)
+    parser.add_argument('--ckpt-every-steps', type=int, default=500,
+                        help='Write a step checkpoint (ckpt-step*.ckpt) every N steps (0 disables)')
     parser.add_argument('--workers',     type=int,  default=4)
     args = parser.parse_args()
 
@@ -176,16 +178,28 @@ def main() -> None:
     # ---- callbacks ----
     CKPT_DIR.mkdir(exist_ok=True)
     callbacks = [
+        # Epoch checkpoints: coarse safety net.
         ModelCheckpoint(
             dirpath          = str(CKPT_DIR),
             filename         = 'ckpt-epoch{epoch:03d}',
             every_n_epochs   = 2,
             save_top_k       = -1,
-            save_last        = True,
+            save_last        = False,
             auto_insert_metric_name = False,
         ),
         LearningRateMonitor(logging_interval='step'),
     ]
+    # Step checkpoints: ckpt-step*.ckpt is also what `--resume latest` globs, so this
+    # is what makes mid-epoch resume work.  save_last writes last.ckpt on this cadence.
+    if args.ckpt_every_steps > 0:
+        callbacks.insert(1, ModelCheckpoint(
+            dirpath             = str(CKPT_DIR),
+            filename            = 'ckpt-step{step:06d}',
+            every_n_train_steps = args.ckpt_every_steps,
+            save_top_k          = -1,
+            save_last           = True,
+            auto_insert_metric_name = False,
+        ))
 
     # ---- trainer ----
     multi_gpu = args.devices > 1 or args.nodes > 1
