@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 DATA_DIR="$(pwd)/../data/test"
 OUT_DIR="$(pwd)/out/infer"
-CKPT="$(pwd)/checkpoints/train_step005000.pt"
+CKPT="$(pwd)/checkpoints/train_step002000.pt"
 
 echo "Checkpoint : $CKPT"
 echo "Data       : $DATA_DIR"

@@ -43,6 +43,6 @@
     "cosine_t_max": 50000,
 
     "l1_weight": 0.01,
-    "precision": "bf16-true"
+    "precision": "bf16-mixed"
   }
 }
