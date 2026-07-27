@@ -185,6 +185,51 @@ class LocalSelfAttentionRoPE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Full self-attention with 2-D RoPE and an optional additive mask (fused SDPA)
+# ---------------------------------------------------------------------------
+
+class MaskedSelfAttentionRoPE(nn.Module):
+    """
+    Full self-attention with 2-D RoPE, run through the fused
+    ``F.scaled_dot_product_attention`` kernel, with an optional additive attention
+    mask.  ``attn_mask=None`` is plain global attention; a ``[1, 1, N, N]`` additive
+    float mask (0 where attention is allowed, -inf elsewhere) restricts each token to a
+    local window — identical result to the gather-based local attention, but expressed
+    as one fused kernel, which is far faster once the token count is modest (the whole
+    point for level 1's 9×9 window over a 32×32 grid).
+
+    Input:  x [B, H, W, C];  cos/sin [1, 1, H·W, head_dim]
+    Output: [B, H, W, C]
+    """
+
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = dim // n_heads
+        self.qkv  = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, H, W, C = x.shape
+        nh, hd = self.n_heads, self.head_dim
+        N = H * W
+
+        q, k, v = self.qkv(x.reshape(B, N, C)).chunk(3, dim=-1)
+        q = q.reshape(B, N, nh, hd).transpose(1, 2)          # [B, nh, N, hd]
+        k = k.reshape(B, N, nh, hd).transpose(1, 2)
+        v = v.reshape(B, N, nh, hd).transpose(1, 2)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, H, W, C)
+        return self.drop(self.proj(out))
+
+
+# ---------------------------------------------------------------------------
 # Window self-attention (non-overlapping tiles)
 # ---------------------------------------------------------------------------
 

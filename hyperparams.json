@@ -42,7 +42,7 @@
   "training": {
     "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic — training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",
     "batch_size": 32,
-    "n_epochs": 20,
+    "n_epochs": 200,
     "num_workers": 8,
 
     "_distributed": "Comms/DDP tuning. Each has an env override that WINS: HFM_ACCUM_STEPS, HFM_TRY_XCCL=1, HFM_GRAD_ALLREDUCE_BF16=1. On Dawn, scripts/dawn_task.sh sets the backend explicitly (shell env wins over these).",

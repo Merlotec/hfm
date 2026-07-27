@@ -46,10 +46,8 @@ import torch
 import torch.nn as nn
 
 from .config import HFMConfig
-from .model import (
-    FeedForward, GlobalSelfAttn, OverlappingPatchDecoder, SkipEncoder,
-)
-from .attention import CrossAttention, LocalSelfAttentionRoPE
+from .model import FeedForward, OverlappingPatchDecoder
+from .attention import CrossAttention, LocalSelfAttentionRoPE, MaskedSelfAttentionRoPE
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +75,30 @@ def build_grid_rope(grid: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tenso
     return cos, sin
 
 
+def build_window_mask(grid: int, radius: int) -> torch.Tensor:
+    """
+    Additive attention mask (``[1, 1, grid², grid²]``) restricting every token to the
+    ``(2·radius+1)²`` Chebyshev window around it: 0 where attention is allowed, -inf
+    outside.  Fed to :class:`MaskedSelfAttentionRoPE` so a fused full-attention kernel
+    reproduces a local window exactly.  Every token attends to itself, so no row is
+    fully masked.
+    """
+    idx = torch.arange(grid * grid)
+    ri, ci = idx // grid, idx % grid
+    dr = (ri[:, None] - ri[None, :]).abs()
+    dc = (ci[:, None] - ci[None, :]).abs()
+    keep = (dr <= radius) & (dc <= radius)                      # [N, N] bool
+    mask = torch.zeros(grid * grid, grid * grid)
+    mask.masked_fill_(~keep, float('-inf'))
+    return mask[None, None]
+
+
+# Local grids with at most this many cells per side use full masked SDPA (one fused
+# kernel) instead of the gather-based local attention; larger grids (level 0's 64×64)
+# keep the gather, since a full N² attention there is far more work than the window.
+_MASKED_SDPA_MAX_GRID = 32
+
+
 # ---------------------------------------------------------------------------
 # Per-level transformer block
 # ---------------------------------------------------------------------------
@@ -85,21 +107,37 @@ class LevelBlock(nn.Module):
     """
     One level's update: RoPE self-attention → context cross-attention → FFN.
 
-    Self-attention is local (:class:`LocalSelfAttentionRoPE`) when the ``(k+1)`` block
-    window is smaller than the grid, and global (:class:`GlobalSelfAttn`) once the
-    window covers the whole grid.  Tokens are kept in grid form ``[B, G, G, d]``.
+    The self-attention backend is chosen per level (tokens stay in grid form
+    ``[B, G, G, d]``):
+
+    * ``global`` — the ``(k+1)`` window already covers the grid: fused SDPA, no mask.
+    * ``masked`` — a local window on a small grid (e.g. level 1's 9×9 over 32×32):
+      fused SDPA restricted by a precomputed window mask — same result as a gather but
+      ~20× faster at this token count.
+    * ``local``  — a small window on a large grid (level 0's 5×5 over 64×64): the
+      gather-based :class:`LocalSelfAttentionRoPE`, since a full N² attention would be
+      wasteful there.
     """
 
     def __init__(self, d: int, n_heads: int, d_ctx: int, grid: int, radius: int,
                  mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
         self.grid = grid
-        self.is_global = (2 * radius + 1) >= grid
+        if (2 * radius + 1) >= grid:
+            self.mode = 'global'
+        elif grid <= _MASKED_SDPA_MAX_GRID:
+            self.mode = 'masked'
+        else:
+            self.mode = 'local'
+
         self.norm1 = nn.LayerNorm(d)
-        self.self_attn = (
-            GlobalSelfAttn(d, n_heads, dropout=dropout) if self.is_global
-            else LocalSelfAttentionRoPE(d, n_heads, radius, dropout=dropout)
-        )
+        if self.mode == 'local':
+            self.self_attn = LocalSelfAttentionRoPE(d, n_heads, radius, dropout=dropout)
+        else:
+            self.self_attn = MaskedSelfAttentionRoPE(d, n_heads, dropout=dropout)
+            if self.mode == 'masked':
+                self.register_buffer('attn_mask', build_window_mask(grid, radius))
+
         self.norm2 = nn.LayerNorm(d)
         self.cross_ctx = CrossAttention(d, d_ctx, n_heads, dropout=dropout)
         self.norm3 = nn.LayerNorm(d)
@@ -107,12 +145,13 @@ class LevelBlock(nn.Module):
 
     def forward(self, tok: torch.Tensor, context: torch.Tensor,
                 cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        B, G, _, d = tok.shape
         n = self.norm1(tok)
-        if self.is_global:
-            a = self.self_attn(n.reshape(B, G * G, d), cos, sin).reshape(B, G, G, d)
-        else:
+        if self.mode == 'local':
             a = self.self_attn(n, cos, sin)
+        elif self.mode == 'masked':
+            a = self.self_attn(n, cos, sin, attn_mask=self.attn_mask)
+        else:  # global
+            a = self.self_attn(n, cos, sin, attn_mask=None)
         tok = tok + a
         tok = tok + self.cross_ctx(self.norm2(tok), context)   # CrossAttention handles [B,G,G,d]
         tok = tok + self.ffn(self.norm3(tok))
@@ -197,7 +236,6 @@ class QuadtreeHFM(nn.Module):
             assert d % nh == 0 and (d // nh) % 4 == 0, \
                 f"each ml_dim must be divisible by n_heads and dim//n_heads%4==0 (got {d})"
 
-        self.mask_aware = getattr(cfg, 'mask_aware_decoder', True)
         self.residual_prediction = getattr(cfg, 'residual_prediction', True)
 
         # Per-level lossless-capable patch embeds from the mask-augmented frame.
@@ -244,12 +282,13 @@ class QuadtreeHFM(nn.Module):
 
         self.schedule = self._build_schedule(passes)
 
-        # Decode from the finest level, which fully tiles the image.  The mask rides
-        # into the decoder's post-conv through the skip features (built from x_aug).
-        self.skip_encoder = SkipEncoder(
-            cfg.in_channels + int(self.mask_aware), cfg.skip_ch)
+        # Decode from the finest level, which fully tiles the image.  No post-fold conv
+        # and no skip encoder: there is no spatial compression to recover from, and the
+        # mask reaches the model through the per-level embeds (fed x_aug).  The folded
+        # head output is the prediction directly.
         self.decoder = OverlappingPatchDecoder(
-            self.dims[0], cfg.in_channels, cfg.img_size, cfg.ml_finest_px, cfg.skip_ch)
+            self.dims[0], cfg.in_channels, cfg.img_size, cfg.ml_finest_px,
+            skip_ch=0, use_post_conv=False)
 
         self.last_tree: Dict[str, torch.Tensor] = {}
         self._init_weights()
@@ -305,9 +344,13 @@ class QuadtreeHFM(nn.Module):
         for emb in self.embeds:
             w = emb.weight
             nn.init.orthogonal_(w.reshape(w.shape[0], -1))
-        # Zero the decoder's final projections so the model starts at exact
-        # persistence (out = x_base + 0) with residual prediction on.
-        for seq in [self.decoder.head, self.decoder.post_conv]:
+        # Zero the decoder's final projection(s) so the model starts at exact
+        # persistence (out = x_base + 0) with residual prediction on.  With no
+        # post_conv the head alone carries this.
+        seqs = [self.decoder.head]
+        if getattr(self.decoder, 'post_conv', None) is not None:
+            seqs.append(self.decoder.post_conv)
+        for seq in seqs:
             for child in reversed(list(seq.children())):
                 if isinstance(child, (nn.Linear, nn.Conv2d)):
                     nn.init.zeros_(child.weight)
@@ -357,7 +400,6 @@ class QuadtreeHFM(nn.Module):
                                  device=x.device, dtype=x.dtype)
 
         x_aug = torch.cat([x, mask_ch], dim=1)
-        skip_feats = self.skip_encoder(x_aug if self.mask_aware else x)
 
         # Embed every level from the frame at its own scale.
         tokens: List[torch.Tensor] = []
@@ -372,7 +414,7 @@ class QuadtreeHFM(nn.Module):
             else:
                 tokens = self._run_pass(tokens, context, self_items, cross)
 
-        out = self.decoder(tokens[0], skip_feats, pixel_mask=pixel_mask)
+        out = self.decoder(tokens[0], pixel_mask=pixel_mask)
 
         if self.residual_prediction:
             out = x_base + out

@@ -88,13 +88,14 @@ class OverlappingPatchDecoder(nn.Module):
     """
 
     def __init__(self, d: int, out_channels: int, img_size: int, patch_size: int,
-                 skip_ch: int = 0):
+                 skip_ch: int = 0, use_post_conv: bool = True):
         super().__init__()
         assert patch_size % 4 == 0, "patch_size must be divisible by 4 for 25% overlap"
         self.img_size     = img_size
         self.patch_size   = patch_size
         self.out_channels = out_channels
         self.skip_ch      = skip_ch
+        self.use_post_conv = use_post_conv
         kernel            = patch_size + patch_size // 2   # 3p/2 = 24 for p=16
         self.kernel       = kernel
         n                 = img_size // patch_size
@@ -106,12 +107,18 @@ class OverlappingPatchDecoder(nn.Module):
             nn.Linear(d, out_channels * kernel * kernel),
         )
 
-        mid = max(out_channels * 8, 64)
-        self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
-            nn.GELU(),
-            nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
-        )
+        # Optional post-fold refinement CNN.  Omitted (use_post_conv=False) when the
+        # folded head output is the final prediction — there is no spatial compression
+        # to recover from, so it is a small refinement rather than a necessity.
+        if use_post_conv:
+            mid = max(out_channels * 8, 64)
+            self.post_conv = nn.Sequential(
+                nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
+            )
+        else:
+            self.post_conv = None
 
         coords = torch.arange(kernel).float() + 0.5
         centre = kernel / 2.0
@@ -163,6 +170,9 @@ class OverlappingPatchDecoder(nn.Module):
         # adjacent fluid pixels through the 3×3 replicate-padded kernel.
         if pixel_mask is not None:
             output = output * pixel_mask
+
+        if self.post_conv is None:          # refinement CNN disabled
+            return output
 
         post_in = (
             torch.cat([output, skip_feats[0]], dim=1)
