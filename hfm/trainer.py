@@ -62,10 +62,10 @@ class FluidLoss(nn.Module):
 def train_step_gan(
     model: HFM,
     context_encoder: ContextEncoder,
-    discriminator: HFMDiscriminator,
+    discriminator: Optional[HFMDiscriminator],
     frames: List[torch.Tensor],
     gen_optimizer: optim.Optimizer,
-    disc_optimizer: optim.Optimizer,
+    disc_optimizer: Optional[optim.Optimizer],
     criterion: nn.Module,
     n_context: int,
     adv_weight: float = 0.0,
@@ -116,7 +116,8 @@ def train_step_gan(
     scale = 1.0 / max(1, accum_steps)
     if micro_first:
         gen_optimizer.zero_grad()
-        disc_optimizer.zero_grad()
+        if disc_optimizer is not None:          # None when the GAN is disabled
+            disc_optimizer.zero_grad()
 
     device_type = frames[0].device.type
     # bf16 autocast on CUDA *and* XPU — PVC's matrix engines run bf16; leaving this
@@ -161,9 +162,11 @@ def train_step_gan(
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
-        disc_optimizer.zero_grad()
-        for p in discriminator.parameters():
-            p.requires_grad_(True)
+        if disc_optimizer is not None:
+            disc_optimizer.zero_grad()
+        if discriminator is not None:
+            for p in discriminator.parameters():
+                p.requires_grad_(True)
 
     # ---- reconstruction only ----
     if adv_weight == 0.0:
@@ -311,15 +314,19 @@ class GANTrainer:
         self_input_prob: float = 0.5,
         cosine_t_max: int = 10_000,
         accum_steps: int = 1,
+        use_gan: bool = True,
     ):
         self.self_input_prob  = self_input_prob
         self.cosine_t_max     = cosine_t_max
         self.accum_steps      = max(1, int(accum_steps))
         self._micro           = 0     # position within the current accumulation window
+        self.use_gan          = use_gan
         self.cfg              = cfg
         self.model            = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
         self.context_encoder  = ContextEncoder(cfg)
-        self.discriminator    = HFMDiscriminator(cfg)
+        # Complete GAN toggle: with use_gan=False the discriminator is never built,
+        # trained, saved, or applied — training is pure reconstruction.
+        self.discriminator    = HFMDiscriminator(cfg) if use_gan else None
         self.criterion        = FluidLoss(
             l1_weight, pixel_mask=pixel_mask,
             hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
@@ -327,8 +334,9 @@ class GANTrainer:
 
         gen_params = list(self.model.parameters()) + list(self.context_encoder.parameters())
         self.gen_optimizer = optim.AdamW(gen_params, lr=lr, weight_decay=weight_decay)
-        self.disc_optimizer = optim.Adam(
-            self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999)
+        self.disc_optimizer = (
+            optim.Adam(self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999))
+            if self.discriminator is not None else None
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.gen_optimizer, T_max=cosine_t_max
@@ -353,7 +361,7 @@ class GANTrainer:
         return stack
 
     def _current_adv_weight(self) -> float:
-        if self.global_step < self.gan_start_step:
+        if not self.use_gan or self.global_step < self.gan_start_step:
             return 0.0
         steps_in = self.global_step - self.gan_start_step
         ramp = min(1.0, steps_in / max(1, self.gan_ramp_steps))
@@ -396,7 +404,8 @@ class GANTrainer:
     def to(self, device: torch.device) -> "GANTrainer":
         self.model           = self.model.to(device)
         self.context_encoder = self.context_encoder.to(device)
-        self.discriminator   = self.discriminator.to(device)
+        if self.discriminator is not None:
+            self.discriminator = self.discriminator.to(device)
         self.criterion       = self.criterion.to(device)
         return self
 
@@ -420,7 +429,8 @@ class GANTrainer:
             return self
         self.model           = _wrap(self.model, device, find_unused_parameters=True)
         self.context_encoder = _wrap(self.context_encoder, device, find_unused_parameters=True)
-        self.discriminator   = _wrap(self.discriminator, device, find_unused_parameters=True)
+        if self.discriminator is not None:
+            self.discriminator = _wrap(self.discriminator, device, find_unused_parameters=True)
         return self
 
     def step(
@@ -431,7 +441,8 @@ class GANTrainer:
         """frames: list of (n_context_frames + 1 + rollout_horizon) tensors [B, C, H, W]."""
         self.model.train()
         self.context_encoder.train()
-        self.discriminator.train()
+        if self.discriminator is not None:
+            self.discriminator.train()
 
         micro_first = (self._micro == 0)
         micro_last  = (self._micro == self.accum_steps - 1)
@@ -506,17 +517,20 @@ class GANTrainer:
         # code (infer.py) and by a resumed non-DDP run.
         _m = getattr(self.model, 'module', self.model)
         _c = getattr(self.context_encoder, 'module', self.context_encoder)
-        _d = getattr(self.discriminator, 'module', self.discriminator)
-        torch.save({
+        ckpt = {
             'model':           _m.state_dict(),
             'context_encoder': _c.state_dict(),
-            'discriminator':   _d.state_dict(),
             'gen_optimizer':   self.gen_optimizer.state_dict(),
-            'disc_optimizer':  self.disc_optimizer.state_dict(),
             'scheduler':       self.scheduler.state_dict(),
             'cfg':             self.cfg,
             'global_step':     self.global_step,
-        }, path)
+        }
+        # Only persist discriminator state when the GAN is enabled.
+        if self.discriminator is not None and self.disc_optimizer is not None:
+            _d = getattr(self.discriminator, 'module', self.discriminator)
+            ckpt['discriminator']  = _d.state_dict()
+            ckpt['disc_optimizer'] = self.disc_optimizer.state_dict()
+        torch.save(ckpt, path)
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -525,7 +539,8 @@ class GANTrainer:
         # Normally load() runs before wrap_ddp(), but stay correct either way.
         self.model           = getattr(self.model, 'module', self.model)
         self.context_encoder = getattr(self.context_encoder, 'module', self.context_encoder)
-        self.discriminator   = getattr(self.discriminator, 'module', self.discriminator)
+        if self.discriminator is not None:
+            self.discriminator = getattr(self.discriminator, 'module', self.discriminator)
         missing, unexpected = self.model.load_state_dict(ckpt['model'], strict=False)
         if unexpected:
             print(f'  [warn] model unexpected keys: {unexpected}')
@@ -537,29 +552,35 @@ class GANTrainer:
         else:
             print('  [warn] no context_encoder in checkpoint; starting fresh')
 
-        disc_state = ckpt.get('discriminator', {})
-        new_keys = set(self.discriminator.state_dict().keys())
-        remapped = {}
-        for k, v in disc_state.items():
-            if k.endswith('.weight'):
-                new_key = k[:-7] + '.weight_orig'
-                remapped[new_key if new_key in new_keys else k] = v
-            else:
-                remapped[k] = v
-        disc_ok = True
-        try:
-            missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
-            non_uv = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
-            if non_uv:
-                print(f'  [warn] discriminator missing keys: {non_uv}')
-            if unexpected:
-                print(f'  [warn] discriminator unexpected keys: {unexpected}')
-        except RuntimeError as e:
-            print(f'  [warn] discriminator incompatible ({e}); reinitialising')
-            disc_ok = False
+        # Discriminator load is skipped entirely when the GAN is disabled (or when the
+        # checkpoint carries no discriminator, e.g. saved with use_gan=False).
+        disc_ok = False
+        if self.discriminator is not None and 'discriminator' in ckpt:
+            disc_state = ckpt['discriminator']
+            new_keys = set(self.discriminator.state_dict().keys())
+            remapped = {}
+            for k, v in disc_state.items():
+                if k.endswith('.weight'):
+                    new_key = k[:-7] + '.weight_orig'
+                    remapped[new_key if new_key in new_keys else k] = v
+                else:
+                    remapped[k] = v
+            disc_ok = True
+            try:
+                missing, unexpected = self.discriminator.load_state_dict(remapped, strict=False)
+                non_uv = [k for k in missing if not k.endswith(('.weight_u', '.weight_v'))]
+                if non_uv:
+                    print(f'  [warn] discriminator missing keys: {non_uv}')
+                if unexpected:
+                    print(f'  [warn] discriminator unexpected keys: {unexpected}')
+            except RuntimeError as e:
+                print(f'  [warn] discriminator incompatible ({e}); reinitialising')
+                disc_ok = False
+        elif self.discriminator is None:
+            print('  [info] GAN disabled (use_gan=False); discriminator not loaded')
 
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
-        if disc_ok and 'disc_optimizer' in ckpt:
+        if disc_ok and self.disc_optimizer is not None and 'disc_optimizer' in ckpt:
             try:
                 self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
             except Exception:

@@ -193,6 +193,12 @@ def main():
     # Cuts the host-staged allreduce count N× at the cost of N× the effective batch.
     accum_steps = int(os.environ.get('HFM_ACCUM_STEPS') or train_hp.get('accum_steps', 1))
 
+    # Complete GAN toggle: use_gan=false → no discriminator is built or applied
+    # (pure reconstruction training).  Env HFM_USE_GAN=0/1 overrides hyperparams.json.
+    _use_gan_env = os.environ.get('HFM_USE_GAN')
+    use_gan = (_use_gan_env not in ('0', 'false', 'False')) if _use_gan_env is not None \
+        else bool(train_hp.get('use_gan', True))
+
     # ---- training data ----
     num_workers = train_hp.get('num_workers', 8)
     dm = FVMDataModule(
@@ -269,6 +275,7 @@ def main():
         self_input_prob       = SELF_INPUT_PROB,
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         accum_steps           = accum_steps,
+        use_gan               = use_gan,
     )
     trainer.to(device)
 
@@ -289,10 +296,12 @@ def main():
 
     n_gen  = sum(p.numel() for p in trainer.model.parameters())           / 1e6
     n_ctx  = sum(p.numel() for p in trainer.context_encoder.parameters()) / 1e6
-    n_disc = sum(p.numel() for p in trainer.discriminator.parameters())   / 1e6
+    n_disc = (sum(p.numel() for p in trainer.discriminator.parameters()) / 1e6
+              if trainer.discriminator is not None else 0.0)
     print(f'Generator:       {n_gen:.1f}M params')
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
-    print(f'Discriminator:   {n_disc:.1f}M params')
+    print(f'Discriminator:   {n_disc:.1f}M params'
+          + ('' if use_gan else '  [DISABLED: use_gan=false — reconstruction only]'))
     assert dm._dataset is not None
     # Under DDP the sampler shards the dataset, so each rank takes len/(B*world)
     # optimizer steps per epoch — forgetting `world` here made resume land on the

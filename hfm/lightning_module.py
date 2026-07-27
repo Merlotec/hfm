@@ -58,6 +58,7 @@ class HFMLightningModule(L.LightningModule):
         cosine_t_max: int = 10_000,
         pixel_mask: Optional[torch.Tensor] = None,
         self_input_prob: float = 0.5,
+        use_gan: bool = True,
     ):
         super().__init__()
         self.automatic_optimization = False
@@ -67,10 +68,12 @@ class HFMLightningModule(L.LightningModule):
         self.gan_start_step        = gan_start_step
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
+        self.use_gan               = use_gan
 
         self.model           = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
         self.context_encoder = ContextEncoder(cfg)
-        self.discriminator   = HFMDiscriminator(cfg)
+        # Complete GAN toggle: no discriminator is built or applied when use_gan=False.
+        self.discriminator   = HFMDiscriminator(cfg) if use_gan else None
         self.criterion       = FluidLoss(l1_weight, pixel_mask=pixel_mask)
 
         if pixel_mask is not None:
@@ -100,7 +103,7 @@ class HFMLightningModule(L.LightningModule):
             self.context_encoder.load_state_dict(ckpt['context_encoder'])
         else:
             print('  [warn] no context_encoder in checkpoint; keeping random weights')
-        if 'discriminator' in ckpt:
+        if self.discriminator is not None and 'discriminator' in ckpt:
             try:
                 self.discriminator.load_state_dict(ckpt['discriminator'], strict=False)
             except RuntimeError as e:
@@ -111,13 +114,19 @@ class HFMLightningModule(L.LightningModule):
 
     def _adv_weight(self) -> float:
         s = self.global_step + self._step_offset
-        if s < self.gan_start_step:
+        if not self.use_gan or s < self.gan_start_step:
             return 0.0
         ramp = min(1.0, (s - self.gan_start_step) / max(1, self.gan_ramp_steps))
         return self.cfg.disc_adv_weight * ramp
 
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> None:
-        gen_opt, disc_opt = self.optimizers()  # type: ignore[misc]
+        # With the GAN disabled, configure_optimizers returns a single optimizer, so
+        # self.optimizers() is that optimizer rather than a [gen, disc] list.  adv_w is
+        # then always 0, so the reconstruction-only branch runs and disc_opt is unused.
+        if self.use_gan:
+            gen_opt, disc_opt = self.optimizers()  # type: ignore[misc]
+        else:
+            gen_opt = self.optimizers()            # type: ignore[assignment]
         scheduler = self.lr_schedulers()
 
         frames = [batch[:, t] for t in range(batch.shape[1])]
@@ -217,21 +226,22 @@ class HFMLightningModule(L.LightningModule):
         gen_opt  = optim.AdamW(gen_params,
                                lr=self.hparams['lr'],
                                weight_decay=self.hparams['weight_decay'])
-        disc_opt = optim.Adam(self.discriminator.parameters(),
-                              lr=self.cfg.disc_lr, betas=(0.5, 0.999))
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             gen_opt, T_max=self.hparams['cosine_t_max']
         )
-        return (
-            [gen_opt, disc_opt],
-            [{'scheduler': scheduler, 'interval': 'step', 'frequency': 1}],
-        )
+        sched_cfg = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
+        if self.discriminator is None:        # GAN disabled → generator optimizer only
+            return {'optimizer': gen_opt, 'lr_scheduler': sched_cfg}
+        disc_opt = optim.Adam(self.discriminator.parameters(),
+                              lr=self.cfg.disc_lr, betas=(0.5, 0.999))
+        return ([gen_opt, disc_opt], [sched_cfg])
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         # Inject HFM-native keys so infer.py can read this .ckpt file directly
         checkpoint['model']           = self.model.state_dict()
         checkpoint['context_encoder'] = self.context_encoder.state_dict()
-        checkpoint['discriminator']   = self.discriminator.state_dict()
+        if self.discriminator is not None:
+            checkpoint['discriminator'] = self.discriminator.state_dict()
         checkpoint['cfg']             = self.cfg
         checkpoint['global_step']     = self.global_step
 

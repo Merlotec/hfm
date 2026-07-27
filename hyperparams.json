@@ -50,6 +50,9 @@
     "try_xccl": true,
     "grad_allreduce_bf16": true,
 
+    "_gan": "use_gan=false disables the discriminator completely (not built, trained, saved, or applied) — pure reconstruction training. Env HFM_USE_GAN=0/1 overrides.",
+    "use_gan": false,
+
     "lr": 4e-4,
     "weight_decay": 1e-5,
     "clip_grad": 1.0,

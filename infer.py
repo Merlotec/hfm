@@ -237,6 +237,11 @@ def main():
                         help='Force residual_prediction=False (for checkpoints trained '
                              'as absolute predictors, where adding the residual at '
                              'inference double-counts the input and blows up the rollout)')
+    parser.add_argument('--teacher-forcing', action='store_true',
+                        help='Feed the GROUND-TRUTH frame as input at every step instead '
+                             'of the model\'s own previous prediction. Turns the rollout '
+                             'into independent single-step predictions (no compounding '
+                             'error), isolating per-step accuracy.')
     args = parser.parse_args()
 
     device   = get_device()
@@ -335,7 +340,9 @@ def main():
         with torch.no_grad():
             context = context_encoder(frames_gt[:n_context], pixel_mask=pixel_mask)
 
-        # ---- autoregressive prediction ----
+        # ---- prediction (autoregressive rollout, or teacher-forced single steps) ----
+        mode = 'teacher-forced (GT input each step)' if args.teacher_forcing else 'autoregressive rollout'
+        print(f'  prediction mode: {mode}')
         preds          = []
         gt             = []
         saliency_fakes = []
@@ -358,7 +365,8 @@ def main():
                     saliency_fakes.append(disc_saliency(discriminator, pred,   x_in_t, context))
                     saliency_reals.append(disc_saliency(discriminator, x_in_t, x_in_t, context))
 
-                x = pred
+                # Next input: the true frame under teacher forcing, else the prediction.
+                x = frames_gt[n_context + t + 1] if args.teacher_forcing else pred
 
         # ---- save outputs ----
         gt_arr   = torch.cat(gt,    dim=0).numpy()

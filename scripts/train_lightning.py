@@ -19,6 +19,7 @@ from typing import Optional, Union
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -151,6 +152,9 @@ def main() -> None:
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         pixel_mask            = pixel_mask,
+        use_gan               = (os.environ.get('HFM_USE_GAN') not in ('0', 'false', 'False'))
+                                 if os.environ.get('HFM_USE_GAN') is not None
+                                 else bool(train_hp.get('use_gan', True)),
     )
 
     if args.resume_pt:
@@ -160,10 +164,12 @@ def main() -> None:
 
     n_gen  = sum(p.numel() for p in module.model.parameters())           / 1e6
     n_ctx  = sum(p.numel() for p in module.context_encoder.parameters()) / 1e6
-    n_disc = sum(p.numel() for p in module.discriminator.parameters())   / 1e6
+    n_disc = (sum(p.numel() for p in module.discriminator.parameters()) / 1e6
+              if module.discriminator is not None else 0.0)
     print(f'Generator:      {n_gen:.1f}M params')
     print(f'ContextEncoder: {n_ctx:.1f}M params')
-    print(f'Discriminator:  {n_disc:.1f}M params')
+    print(f'Discriminator:  {n_disc:.1f}M params'
+          + ('' if module.discriminator is not None else '  [DISABLED: use_gan=false]'))
     print(f'Devices:        {args.devices}  |  seq_len: {seq_len}  |  batch: {batch_size}\n')
 
     # ---- data module ----

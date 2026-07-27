@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 DATA_DIR="$(pwd)/../data/test"
 OUT_DIR="$(pwd)/out/infer"
-CKPT="$(pwd)/checkpoints/ckpt-epoch019-v1.ckpt"
+CKPT="$(pwd)/checkpoints/ckpt-step010000.ckpt"
 
 echo "Checkpoint : $CKPT"
 echo "Data       : $DATA_DIR"
@@ -18,4 +18,5 @@ python infer.py \
     --checkpoint "$CKPT" \
     --data-dir   "$DATA_DIR" \
     --out-dir    "$OUT_DIR" \
-    --n-predict  30 
+    --n-predict  30 \
+    --teacher-forcing
