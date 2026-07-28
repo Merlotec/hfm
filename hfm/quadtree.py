@@ -44,6 +44,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .config import HFMConfig
 from .model import FeedForward, OverlappingPatchDecoder
@@ -167,9 +168,17 @@ class AdjacentCrossAttn(nn.Module):
     Couple a coarse (parent) level and the next finer (child) level, both ways.
 
     The child grid is exactly ``2×`` the parent grid, so every parent block owns a
-    disjoint 2×2 group of children.  Each parent attends to its 4 children, and each
-    child attends to its (single) parent.  Both updates are residual, so the two levels
-    can update each other within one pass.
+    disjoint 2×2 group of children.
+
+    * **parent ← children**: each parent attends to its 4 children (real attention).
+    * **child ← parent**: the parent field is **bilinearly upsampled** to the child grid
+      and projected.  This replaces the old single-key "attention" (which, with one key,
+      degenerated into copying the parent identically onto all 4 children — a
+      block-uniform correction that stamps visible 8/16/32px square artifacts as soon as
+      the coarse tokens go off-distribution, e.g. on the model's own rollout output).
+      Interpolation makes the correction vary smoothly across block boundaries.
+
+    Both updates are residual, so the two levels update each other within one pass.
     """
 
     def __init__(self, dp: int, dc: int, n_heads: int, dropout: float = 0.0):
@@ -177,7 +186,8 @@ class AdjacentCrossAttn(nn.Module):
         self.norm_p = nn.LayerNorm(dp)
         self.norm_c = nn.LayerNorm(dc)
         self.parent_from_child = CrossAttention(dp, dc, n_heads, dropout=dropout)
-        self.child_from_parent = CrossAttention(dc, dp, n_heads, dropout=dropout)
+        # child ← parent: smooth interpolation + learned projection (not a broadcast).
+        self.child_from_parent = nn.Linear(dp, dc, bias=False)
 
     def forward(self, parent: torch.Tensor, child: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -187,20 +197,18 @@ class AdjacentCrossAttn(nn.Module):
         np_ = self.norm_p(parent)                                    # [B, Gp, Gp, dp]
         nc_ = self.norm_c(child)                                     # [B, 2Gp, 2Gp, dc]
 
-        # Group children under their parent: [B, Gp·Gp, 4, dc].
+        # parent ← its 4 children (real attention).
         ncg = (nc_.reshape(B, Gp, 2, Gp, 2, dc)
                   .permute(0, 1, 3, 2, 4, 5)
                   .reshape(B * Gp * Gp, 4, dc))
         pq = np_.reshape(B * Gp * Gp, 1, dp)
-
-        # parent ← its 4 children
         p_upd = self.parent_from_child(pq, ncg).reshape(B, Gp, Gp, dp)
 
-        # child ← its parent (broadcast to the 2×2 group)
-        c_upd = (self.child_from_parent(ncg, pq)
-                 .reshape(B, Gp, Gp, 2, 2, dc)
-                 .permute(0, 1, 3, 2, 4, 5)
-                 .reshape(B, 2 * Gp, 2 * Gp, dc))
+        # child ← parent: bilinear upsample Gp→2Gp so the correction is smooth across
+        # block boundaries (no block-uniform stamping), then project dp→dc.
+        p_up = F.interpolate(np_.permute(0, 3, 1, 2), scale_factor=2,
+                             mode='bilinear', align_corners=False)   # [B, dp, 2Gp, 2Gp]
+        c_upd = self.child_from_parent(p_up.permute(0, 2, 3, 1))     # [B, 2Gp, 2Gp, dc]
 
         return parent + p_upd, child + c_upd
 

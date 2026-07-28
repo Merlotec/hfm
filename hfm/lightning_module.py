@@ -169,6 +169,13 @@ class HFMLightningModule(L.LightningModule):
             x_cur = pred_k_m       # feed prediction forward, keeps grad
         recon = torch.stack(recon_terms).mean()
 
+        # Persistence baseline: the loss of predicting "no change" for the first step.
+        # A residual model starts here and must go BELOW it — recon/persist > 1 means the
+        # model is worse than copying the input, i.e. it hasn't learned the dynamics.
+        with torch.no_grad():
+            persist = self.criterion(x_in, x_target)
+            ratio   = recon.detach() / persist.clamp(min=1e-8)
+
         # ---- reconstruction only (GAN off / pre-GAN) ----
         if adv_w == 0.0:
             gen_opt.zero_grad()
@@ -176,7 +183,8 @@ class HFMLightningModule(L.LightningModule):
             self.clip_gradients(gen_opt, gradient_clip_val=1.0, gradient_clip_algorithm='norm')  # type: ignore[arg-type]
             gen_opt.step()
             scheduler.step()  # type: ignore[union-attr]
-            self.log('recon', recon, prog_bar=True, sync_dist=True)
+            self.log_dict({'recon': recon, 'persist': persist, 'ratio': ratio},
+                          prog_bar=True, sync_dist=True)
             return
 
         assert pred_disc is not None
@@ -234,7 +242,8 @@ class HFMLightningModule(L.LightningModule):
             p.requires_grad_(True)
 
         self.log_dict(
-            {'recon': recon, 'disc': d_loss, 'adv_w': adv_w},
+            {'recon': recon, 'persist': persist, 'ratio': ratio,
+             'disc': d_loss, 'adv_w': adv_w},
             prog_bar=True, sync_dist=True,
         )
 

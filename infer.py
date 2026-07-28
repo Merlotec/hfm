@@ -366,7 +366,7 @@ def main():
                     saliency_reals.append(disc_saliency(discriminator, x_in_t, x_in_t, context))
 
                 # Next input: the true frame under teacher forcing, else the prediction.
-                aw = 0.8
+                aw = 0.5
                 true_frame = frames_gt[n_context + t + 1]
                 x = true_frame * aw + pred * (1.0 - aw) if args.teacher_forcing else pred
 

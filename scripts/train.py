@@ -367,9 +367,16 @@ def main():
             epoch_recon_cnt += 1
 
             if is_main() and step % args.log_every == 0:
+                # Persistence baseline: loss of predicting "no change" for the first
+                # step.  A residual model must keep recon/persist < 1; > 1 means it is
+                # worse than copying the input (hasn't learned the dynamics).
+                nc = cfg.n_context_frames
+                with torch.no_grad():
+                    persist = trainer.criterion(frames[nc], frames[nc + 1]).item()
+                ratio = recon / persist if persist > 0 else float('inf')
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
-                    f'recon={recon:.4f}  '
+                    f'recon={recon:.4f}  persist={persist:.4f}  ratio={ratio:.2f}  '
                     f'disc={disc:.4f}  '
                     f'adv_w={info["adv_weight"]:.3f}'
                 )

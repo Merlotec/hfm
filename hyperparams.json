@@ -12,7 +12,7 @@
     "n_global_tokens": 16,
     "n_heads": 8,
 
-    "noise_std": 0.05,
+    "noise_std": 0.0,
 
     "n_layers": 12,
     "mlp_ratio": 4.0,
