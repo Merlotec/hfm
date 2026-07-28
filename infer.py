@@ -366,7 +366,9 @@ def main():
                     saliency_reals.append(disc_saliency(discriminator, x_in_t, x_in_t, context))
 
                 # Next input: the true frame under teacher forcing, else the prediction.
-                x = frames_gt[n_context + t + 1] if args.teacher_forcing else pred
+                aw = 0.8
+                true_frame = frames_gt[n_context + t + 1]
+                x = true_frame * aw + pred * (1.0 - aw) if args.teacher_forcing else pred
 
         # ---- save outputs ----
         gt_arr   = torch.cat(gt,    dim=0).numpy()

@@ -59,6 +59,12 @@ def load_config() -> tuple[HFMConfig, dict]:
         hp = json.load(f)
     m = hp['model']
     t = hp['training']
+    # Pass through the fixed-quadtree knobs that are present (same as scripts/train.py),
+    # so the Lightning path honours ml_dims/ml_passes/ml_untie_passes/etc. instead of
+    # silently using the HFMConfig defaults.
+    ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
+               'ml_blocks_per_level', 'ml_untie_passes')
+    ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],
         in_channels            = m['in_channels'],
@@ -71,6 +77,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         n_layers               = m['n_layers'],
         mlp_ratio              = m['mlp_ratio'],
         dropout                = m['dropout'],
+        rollout_horizon        = m.get('rollout_horizon', 4),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
         d_ctx                  = m['d_ctx'],
@@ -81,6 +88,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         disc_adv_weight        = m['disc_adv_weight'],
         disc_lr                = m['disc_lr'],
         gradient_checkpointing = True,
+        **ml_kwargs,
     )
     return cfg, t
 
@@ -113,7 +121,8 @@ def main() -> None:
     cfg, train_hp = load_config()
     n_epochs   = args.epochs    or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
-    seq_len    = cfg.n_context_frames + 2
+    # context frames + input frame + one target per rollout step (matches scripts/train.py)
+    seq_len    = cfg.n_context_frames + 1 + getattr(cfg, 'rollout_horizon', 1)
 
     # ---- pixel mask (loaded once in main process; moved to each GPU as a buffer) ----
     mesh_dirs = []

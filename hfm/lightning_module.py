@@ -141,17 +141,36 @@ class HFMLightningModule(L.LightningModule):
         # scheduled sampling (exposure-bias fix): with probability self_input_prob,
         # feed the model its own no-grad prediction of frame n instead of the GT —
         # the target stays GT frame n+1 (see trainer.train_step_gan for rationale).
+        # Largely subsumed by the horizon>1 rollout below, but kept for horizon=1.
         if float(torch.rand(())) < self.hparams['self_input_prob']:
             with torch.no_grad():
                 x_in = self.model(frames[n - 1], context, pixel_mask=mask).float()
             if mask is not None:
                 x_in = x_in * mask
 
-        pred    = self.model(x_in, context, pixel_mask=mask)
+        # ---- unrolled prediction (backprop-through-time over the horizon) ----
+        # Predict `horizon` frames, feeding each prediction back as the next input with
+        # gradient kept, so the model is trained to survive its OWN outputs — the fix
+        # for autoregressive rollout collapse.  The reconstruction loss averages all
+        # horizon targets; pred_0 (first step) is what the GAN/adv term operates on, so
+        # GAN behaviour matches single-step training.
+        horizon = max(1, min(getattr(self.cfg, 'rollout_horizon', 1), len(frames) - n - 1))
+        recon_terms = []
+        x_cur = x_in
+        pred_disc = None           # first-step prediction, holes zeroed, for the GAN
+        for k in range(horizon):
+            pred_k = self.model(x_cur, context, pixel_mask=mask)
+            # Unmasked for the criterion (gradient flows through holes via the hole
+            # loss); masked copy is fed forward and used by the discriminator.
+            recon_terms.append(self.criterion(pred_k, frames[n + 1 + k]))
+            pred_k_m = pred_k.float() * mask if mask is not None else pred_k.float()
+            if pred_disc is None:
+                pred_disc = pred_k_m
+            x_cur = pred_k_m       # feed prediction forward, keeps grad
+        recon = torch.stack(recon_terms).mean()
 
-        # ---- reconstruction only (pre-GAN) ----
+        # ---- reconstruction only (GAN off / pre-GAN) ----
         if adv_w == 0.0:
-            recon = self.criterion(pred, x_target)
             gen_opt.zero_grad()
             self.manual_backward(recon)
             self.clip_gradients(gen_opt, gradient_clip_val=1.0, gradient_clip_algorithm='norm')  # type: ignore[arg-type]
@@ -160,9 +179,7 @@ class HFMLightningModule(L.LightningModule):
             self.log('recon', recon, prog_bar=True, sync_dist=True)
             return
 
-        # pred_disc: holes zeroed for discriminator; pred stays unmasked for criterion
-        # so gradient flows back through hole regions via the hole-filling loss.
-        pred_disc = pred.float() * mask if mask is not None else pred.float()
+        assert pred_disc is not None
 
         # ---- discriminator update ----
         # Mask BOTH disc inputs: raw target frames carry the renderer's hole fill
@@ -198,7 +215,7 @@ class HFMLightningModule(L.LightningModule):
         for p in self.discriminator.parameters():
             p.requires_grad_(False)
 
-        recon = self.criterion(pred, x_target)
+        # recon is the rollout mean computed above; the adv term acts on pred_0.
         # Only apply adversarial loss when the discriminator is in the healthy range
         if disc_healthy:
             adv_logit = self.discriminator(pred_disc, x_in_d, context)
