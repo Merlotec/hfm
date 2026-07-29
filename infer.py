@@ -67,24 +67,34 @@ def denorm(frames: np.ndarray, mean: torch.Tensor, std: torch.Tensor) -> np.ndar
 
 
 def save_viewer_frames(
-    gt_phys: np.ndarray,
+    seed_phys: np.ndarray,
     pred_phys: np.ndarray,
     timestamps: list[float],
-    n_context: int,
+    n_seed: int,
     run_name: str,
     viewer_dir: Path,
 ):
-    """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c."""
+    """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c.
+
+    ``seed_phys`` are the ``n_seed`` given frames (context frames PLUS the input frame),
+    marked is_seed=True; ``pred_phys`` are the predictions.  Including the input frame as
+    the last seed is what makes the viewer's first predicted delta be pred[0]-input (the
+    model's actual one-step change) rather than a GT delta smeared across the gap.
+    """
     run_dir = viewer_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Clear stale frames from previous runs — otherwise leftover t_*.npz at other
+    # timestamps get interleaved into this run's sequence by the viewer.
+    for old in run_dir.glob('t_*.npz'):
+        old.unlink()
 
     T = len(timestamps)
     for i, ts in enumerate(timestamps):
-        if i < n_context:
-            grid    = gt_phys[i].astype(np.float32)
+        if i < n_seed:
+            grid    = seed_phys[i].astype(np.float32)
             is_seed = True
         else:
-            grid    = pred_phys[i - n_context].astype(np.float32)
+            grid    = pred_phys[i - n_seed].astype(np.float32)
             is_seed = False
         np.savez(run_dir / f't_{ts:.4g}.npz',
                  grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed))
@@ -381,16 +391,22 @@ def main():
         np.save(run_out / 'frames_gt_phys.npy',  gt_phys)
         np.save(run_out / 'frames_pred_phys.npy', pred_phys)
 
-        context_phys = denorm(
-            torch.cat([frames_gt[t].cpu() for t in range(n_context)], dim=0).numpy(),
+        # Seed frames = context frames PLUS the input frame gt[n_context].  Including
+        # the input frame means the viewer's first predicted delta is pred[0]-input
+        # (the model's real one-step change).  Predictions are placed at the timestamps
+        # of the frames they ACTUALLY predict (n_context+1 ..), fixing the off-by-one
+        # that otherwise showed pred[t] one frame too early.
+        seed_phys = denorm(
+            torch.cat([frames_gt[t].cpu() for t in range(n_context + 1)], dim=0).numpy(),
             mean, std,
         ) * pixel_mask.cpu().numpy()
-        all_ts = timestamps[:n_context] + timestamps[n_context:n_context + args.n_predict]
+        all_ts = (timestamps[:n_context + 1]
+                  + timestamps[n_context + 1: n_context + 1 + args.n_predict])
         save_viewer_frames(
-            gt_phys    = context_phys,
+            seed_phys  = seed_phys,
             pred_phys  = pred_phys,
             timestamps = all_ts,
-            n_context  = n_context,
+            n_seed     = n_context + 1,
             run_name   = sim_dir.name,
             viewer_dir = out_dir / 'viewer',
         )
