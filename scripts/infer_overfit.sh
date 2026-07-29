@@ -5,9 +5,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-DATA_DIR="$(pwd)/../data/fvm_validation"
+DATA_DIR="$(pwd)/../data/fvm_subset"
 OUT_DIR="$(pwd)/out/infer"
-CKPT="$(pwd)/checkpoints/ckpt-step003000.ckpt"
+CKPT="$(pwd)/checkpoints/ckpt-epoch001.ckpt"
 
 echo "Checkpoint : $CKPT"
 echo "Data       : $DATA_DIR"

@@ -57,12 +57,13 @@ class HFMLightningModule(L.LightningModule):
         disc_update_threshold: float = 0.3,
         cosine_t_max: int = 10_000,
         pixel_mask: Optional[torch.Tensor] = None,
+        mesh_masks: Optional[torch.Tensor] = None,
         self_input_prob: float = 0.5,
         use_gan: bool = True,
     ):
         super().__init__()
         self.automatic_optimization = False
-        self.save_hyperparameters(ignore=['cfg', 'pixel_mask'])
+        self.save_hyperparameters(ignore=['cfg', 'pixel_mask', 'mesh_masks'])
 
         self.cfg                   = cfg
         self.gan_start_step        = gan_start_step
@@ -80,6 +81,14 @@ class HFMLightningModule(L.LightningModule):
             self.register_buffer('pixel_mask', pixel_mask)
         else:
             self.pixel_mask: Optional[torch.Tensor] = None
+        # Per-geometry masks, gathered per sample in training_step.  A batch mixes
+        # geometries (ConcatDataset + shuffle), so the single shared pixel_mask above
+        # is wrong for every mesh but the first -- masks differ by ~13% of the frame.
+        # persistent=False: moves with .to(device) but stays out of the checkpoint.
+        if mesh_masks is not None:
+            self.register_buffer('mesh_masks', mesh_masks, persistent=False)
+        else:
+            self.mesh_masks: Optional[torch.Tensor] = None
 
         self._step_offset = 0   # set by load_from_pt to preserve GAN curriculum
 
@@ -129,11 +138,19 @@ class HFMLightningModule(L.LightningModule):
             gen_opt = self.optimizers()            # type: ignore[assignment]
         scheduler = self.lr_schedulers()
 
+        # (frames, mesh_id) when the datamodule tags geometries, else bare frames
+        if isinstance(batch, (tuple, list)):
+            batch, mesh_ids = batch[0], batch[1]
+        else:
+            mesh_ids = None
         frames = [batch[:, t] for t in range(batch.shape[1])]
         n        = self.cfg.n_context_frames
         x_in     = frames[n]
         x_target = frames[n + 1]
-        mask     = self.pixel_mask
+        # per-sample geometry: index the mesh table, else fall back to the shared mask
+        mask     = (self.mesh_masks[mesh_ids.to(self.mesh_masks.device).long()]
+                    if (mesh_ids is not None and self.mesh_masks is not None)
+                    else self.pixel_mask)
         adv_w    = self._adv_weight()
 
         context = self.context_encoder(frames[:n], pixel_mask=mask)
@@ -162,7 +179,8 @@ class HFMLightningModule(L.LightningModule):
             pred_k = self.model(x_cur, context, pixel_mask=mask)
             # Unmasked for the criterion (gradient flows through holes via the hole
             # loss); masked copy is fed forward and used by the discriminator.
-            recon_terms.append(self.criterion(pred_k, frames[n + 1 + k]))
+            recon_terms.append(self.criterion(pred_k, frames[n + 1 + k],
+                                              pixel_mask=mask))
             pred_k_m = pred_k.float() * mask if mask is not None else pred_k.float()
             if pred_disc is None:
                 pred_disc = pred_k_m
@@ -173,7 +191,7 @@ class HFMLightningModule(L.LightningModule):
         # A residual model starts here and must go BELOW it — recon/persist > 1 means the
         # model is worse than copying the input, i.e. it hasn't learned the dynamics.
         with torch.no_grad():
-            persist = self.criterion(x_in, x_target)
+            persist = self.criterion(x_in, x_target, pixel_mask=mask)
             ratio   = recon.detach() / persist.clamp(min=1e-8)
 
         # ---- reconstruction only (GAN off / pre-GAN) ----
@@ -305,8 +323,10 @@ class FVMLightningDataModule(L.LightningDataModule):
         batch_size:  int = 4,
         num_workers: int = 4,
         first_frame: int = 20,
+        return_mesh_id: bool = True,
     ):
         super().__init__()
+        self._return_mesh_id = return_mesh_id
         self._data_dir    = data_dir
         self._seq_len     = seq_len
         self._resolution  = resolution
@@ -323,6 +343,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             batch_size  = self._batch_size,
             num_workers = self._num_workers,
             first_frame = self._first_frame,
+            return_mesh_id = self._return_mesh_id,
         )
 
     def prepare_data(self) -> None:

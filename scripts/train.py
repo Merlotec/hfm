@@ -206,6 +206,7 @@ def main():
         seq_len     = seq_len,
         batch_size  = train_hp['batch_size'],
         num_workers = num_workers,
+        return_mesh_id = True,
     )
     dm.setup()
 
@@ -238,6 +239,7 @@ def main():
             num_workers = num_workers,
             mean        = dm.mean,
             std         = dm.std,
+            return_mesh_id = True,
         )
         val_dm.setup()
         val_mesh_dirs = []
@@ -277,6 +279,15 @@ def main():
         accum_steps           = accum_steps,
         use_gan               = use_gan,
     )
+
+    # Per-sample masks: a batch mixes geometries, so ONE shared mask would be wrong
+    # for every mesh but the first (masks differ by ~13% of the frame between meshes).
+    if dm.mesh_masks is not None:
+        trainer.set_mesh_tables(dm.mesh_masks.to(device))
+        print(f'Per-sample masks: {dm.mesh_masks.shape[0]} train geometries')
+    if val_dl is not None and getattr(val_dm, 'mesh_masks', None) is not None:
+        trainer.set_val_mesh_tables(val_dm.mesh_masks.to(device))
+        print(f'                  {val_dm.mesh_masks.shape[0]} val geometries')
     trainer.to(device)
 
     if args.resume == 'latest':
@@ -341,10 +352,12 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
-        for batch in train_dl:                       # [B, T, C, H, W]
+        for batch in train_dl:                       # ([B, T, C, H, W], [B]) mesh ids
+            batch, mesh_b = batch if isinstance(batch, (tuple, list)) else (batch, None)
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
-            recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
+            recon, disc = trainer.step(frames, pixel_mask=pixel_mask,
+                                       mesh_ids=mesh_b)
             info = trainer.training_info()
             step = info['global_step']
 

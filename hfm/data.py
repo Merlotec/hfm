@@ -80,6 +80,29 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
 # Pixel mask (fluid vs. hole)
 # ---------------------------------------------------------------------------
 
+def mesh_dirs_for(data_dir) -> "list[Path]":
+    """Geometry dirs in a DETERMINISTIC (sorted) order.
+
+    mesh_id indexes THIS list, so any consumer that builds a parallel mask table
+    must use the same order.  The scripts used bare iterdir() (filesystem order)
+    while the datamodule enumerated its own list -- two independent unsorted scans,
+    so a mismatch would silently pair samples with another geometry's mask.
+    """
+    data_dir = Path(data_dir)
+    if (data_dir / 'shared_mesh.pkl').exists():
+        return [data_dir]
+    return sorted(p for p in data_dir.iterdir()
+                  if p.is_dir() and (p / 'shared_mesh.pkl').exists())
+
+
+def load_mesh_masks(data_dir, resolution) -> torch.Tensor:
+    """[n_mesh, 1, H, W] fluid masks stacked in mesh_id order."""
+    dirs = mesh_dirs_for(data_dir)
+    return torch.stack([
+        load_pixel_mask(d, build_renderer(d, resolution), resolution)[0] for d in dirs
+    ])
+
+
 def build_pixel_mask(renderer: MeshRenderer, resolution: tuple[int, int]) -> torch.Tensor:
     """Boolean (1, 1, H, W) mask — True for pixels inside the fluid mesh."""
     H, W = resolution
@@ -170,6 +193,7 @@ class FVMSequenceDataset(Dataset):
         std:         torch.Tensor,
         first_frame: int = 20,
         frame_cache: Optional[list[torch.Tensor]] = None,
+        mesh_id:     Optional[int] = None,
     ):
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -178,6 +202,12 @@ class FVMSequenceDataset(Dataset):
         self.paths      = files
         self.renderer   = renderer
         self.seq_len    = seq_len
+        # Index into FVMDataModule.mesh_masks.  A batch mixes geometries freely
+        # (ConcatDataset + shuffle), so the mask must be gathered PER SAMPLE.
+        # Training used to apply ONE mask from mesh_dirs[0] to every sample, which
+        # is wrong for every other geometry -- masks differ by ~13% of the frame
+        # between meshes, corrupting the loss mask AND the model's mask channel.
+        self.mesh_id    = mesh_id
         self.mean       = mean.view(-1, 1, 1)   # [C, 1, 1] for broadcasting
         self.std        = std.view(-1, 1, 1)
         self._cache     = frame_cache            # optional pre-rendered cache
@@ -185,8 +215,10 @@ class FVMSequenceDataset(Dataset):
     def __len__(self) -> int:
         return max(0, len(self.paths) - self.seq_len + 1)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         frames = torch.stack([self._get_frame(idx + i) for i in range(self.seq_len)])
+        if self.mesh_id is not None:
+            return frames, self.mesh_id      # + which geometry this sample is
         return frames   # [T, C, H, W]
 
     def _get_frame(self, i: int) -> torch.Tensor:
@@ -200,7 +232,8 @@ class FVMSequenceDataset(Dataset):
     @classmethod
     def with_cache(cls, sim_dir: Path, renderer: MeshRenderer, seq_len: int,
                    mean: torch.Tensor, std: torch.Tensor,
-                   first_frame: int = 20) -> "FVMSequenceDataset":
+                   first_frame: int = 20,
+                   mesh_id: Optional[int] = None) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -247,6 +280,7 @@ class FVMDataModule:
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
+        return_mesh_id: bool = False,
     ):
         self.data_dir     = Path(data_dir)
         self.seq_len      = seq_len
@@ -258,26 +292,26 @@ class FVMDataModule:
         self._dataset: Optional[ConcatDataset] = None
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
+        self.return_mesh_id = return_mesh_id
+        self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
 
     def setup(self, recompute_stats: bool = False):
-        mesh_dirs = []
-        if (self.data_dir / 'shared_mesh.pkl').exists():
-            mesh_dirs.append(self.data_dir)
-        else:
-            for p in self.data_dir.iterdir():
-                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
-                    mesh_dirs.append(p)
-                    
+        mesh_dirs = mesh_dirs_for(self.data_dir)
         if not mesh_dirs:
             raise RuntimeError(f'No shared_mesh.pkl found in {self.data_dir} or its subdirectories')
 
-        runs: list[tuple[Path, MeshRenderer]] = []
-        for mdir in mesh_dirs:
+        runs: list[tuple[Path, MeshRenderer, int]] = []
+        mesh_masks = []
+        for mi, mdir in enumerate(mesh_dirs):
             renderer = build_renderer(mdir, self.resolution)
+            if self.return_mesh_id:
+                mesh_masks.append(load_pixel_mask(mdir, renderer, self.resolution)[0])
             sim_dirs = sorted([p for p in mdir.iterdir()
                                if p.is_dir() and p.name.startswith('run')])
             for sdir in sim_dirs:
-                runs.append((sdir, renderer))
+                runs.append((sdir, renderer, mi))
+        if self.return_mesh_id:
+            self.mesh_masks = torch.stack(mesh_masks)     # [n_mesh, 1, H, W]
 
         if not runs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
@@ -293,7 +327,7 @@ class FVMDataModule:
             else:
                 print('Computing normalisation stats...')
                 self.mean, self.std = compute_normalisation_stats(
-                    runs, first_frame=self.first_frame)
+                    [(d, r) for d, r, _mi in runs], first_frame=self.first_frame)
                 with open(stats_path, 'w') as f:
                     json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
                 print(f'Stats saved to {stats_path}')
@@ -302,14 +336,22 @@ class FVMDataModule:
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
         )
         datasets = [
-            builder(d, renderer, self.seq_len, self.mean, self.std, self.first_frame)
-            for d, renderer in runs
+            builder(d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
+                    mesh_id=(mi if self.return_mesh_id else None))
+            for d, renderer, mi in runs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
             raise RuntimeError('No usable sequences found — try reducing seq_len or first_frame')
         self._dataset = ConcatDataset(datasets)
-        print(f'Dataset ready: {len(self._dataset)} sequences across {len(runs)} runs')
+        # print the MESH count too: without it a multi-mesh run looks identical to a
+        # single-mesh one, which is how the shared-mask bug stayed invisible.
+        print(f'Dataset ready: {len(self._dataset)} sequences across {len(runs)} runs '
+              f'/ {len(mesh_dirs)} mesh(es)')
+        if len(mesh_dirs) > 1 and not self.return_mesh_id:
+            print(f'  [WARN] {len(mesh_dirs)} geometries but return_mesh_id=False -- the '
+                  f'caller will apply ONE mask to all of them, which is wrong for '
+                  f'{len(mesh_dirs)-1} of them.')
 
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'

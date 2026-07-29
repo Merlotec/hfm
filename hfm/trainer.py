@@ -46,13 +46,23 @@ class FluidLoss(nn.Module):
         else:
             self.pixel_mask: Optional[torch.Tensor] = None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if self.pixel_mask is None:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`pixel_mask` overrides the constructor buffer -- pass the PER-SAMPLE mask
+        [B, 1, H, W] when a batch mixes geometries, otherwise every sample is scored
+        against the wrong collider."""
+        m = pixel_mask if pixel_mask is not None else self.pixel_mask
+        if m is None:
             d = pred - target
-        else:
-            mask = self.pixel_mask.expand_as(pred).bool()
-            d = pred[mask] - target[mask]
-        return d.pow(2).mean() + self.l1_weight * d.abs().mean()
+            return d.pow(2).mean() + self.l1_weight * d.abs().mean()
+        # Boolean indexing flattens across samples; weight instead so a per-sample
+        # mask broadcasts and the normaliser counts only that sample's fluid pixels.
+        w = m[:, :1].to(pred.dtype)
+        if w.shape[0] != pred.shape[0]:
+            w = w.expand(pred.shape[0], -1, -1, -1)
+        d = pred - target
+        n = w.expand_as(d).sum().clamp_min(1.0)
+        return ((d.pow(2) * w).sum() / n) + self.l1_weight * ((d.abs() * w).sum() / n)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +163,8 @@ def train_step_gan(
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             pred_k = model(x_cur, context, pixel_mask=pixel_mask)
         pred_k = pred_k.float() * pixel_mask if pixel_mask is not None else pred_k.float()
-        recon_terms.append(criterion(pred_k, frames[n_context + 1 + k]))
+        recon_terms.append(criterion(pred_k, frames[n_context + 1 + k],
+                                     pixel_mask=pixel_mask))
         if pred_masked is None:
             pred_masked = pred_k          # first step feeds the GAN, as before
         x_cur = pred_k                    # feed prediction forward (keeps grad)
@@ -382,6 +393,12 @@ class GANTrainer:
         nc      = self.cfg.n_context_frames
         total, count = 0.0, 0
         for batch in dataloader:
+            # (frames, mesh_id) when the datamodule tags geometries, else just frames
+            if isinstance(batch, (tuple, list)):
+                batch, mesh_b = batch[0], batch[1]
+            else:
+                mesh_b = None
+            pixel_mask = self._mask_ctx(pixel_mask, mesh_b, val=True)
             frames   = [batch[:, t].to(device) for t in range(batch.shape[1])]
             horizon  = max(1, min(getattr(self.cfg, 'rollout_horizon', 1),
                                   len(frames) - nc - 1))
@@ -393,7 +410,8 @@ class GANTrainer:
                 for k in range(horizon):
                     pred = self.model(x_cur, context, pixel_mask=pixel_mask)
                     pred_m = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
-                    terms.append(self.criterion(pred_m, frames[nc + 1 + k]).item())
+                    terms.append(self.criterion(pred_m, frames[nc + 1 + k],
+                                                pixel_mask=pixel_mask).item())
                     x_cur = pred_m
             loss = sum(terms) / len(terms)
             if loss == loss:   # finite check (NaN != NaN)
@@ -433,12 +451,30 @@ class GANTrainer:
             self.discriminator = _wrap(self.discriminator, device, find_unused_parameters=True)
         return self
 
+    def set_mesh_tables(self, masks) -> None:
+        """Install FVMDataModule.mesh_masks so the mask can be gathered per sample."""
+        self.mesh_masks = masks
+
+    def set_val_mesh_tables(self, masks) -> None:
+        """Validation geometries are a separate 0-based set -- indexing val ids into
+        the train table would silently pick unrelated geometries."""
+        self.val_mesh_masks = masks
+
+    def _mask_ctx(self, pixel_mask, mesh_ids, val: bool = False):
+        """Per-sample mask for this batch, or the shared one when there are no ids."""
+        masks = getattr(self, 'val_mesh_masks' if val else 'mesh_masks', None)
+        if mesh_ids is None or masks is None:
+            return pixel_mask
+        return masks[mesh_ids.to(masks.device).long()]      # [B, 1, H, W]
+
     def step(
         self,
         frames: List[torch.Tensor],
         pixel_mask: Optional[torch.Tensor] = None,
+        mesh_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
         """frames: list of (n_context_frames + 1 + rollout_horizon) tensors [B, C, H, W]."""
+        pixel_mask = self._mask_ctx(pixel_mask, mesh_ids)
         self.model.train()
         self.context_encoder.train()
         if self.discriminator is not None:

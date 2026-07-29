@@ -30,7 +30,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hfm.config import HFMConfig
-from hfm.data import build_renderer, load_pixel_mask
+from hfm.data import build_renderer, load_pixel_mask, load_mesh_masks
 from hfm.lightning_module import HFMLightningModule, FVMLightningDataModule
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,10 @@ def main() -> None:
     first_mdir = mesh_dirs[0]
     renderer   = build_renderer(first_mdir, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(first_mdir, renderer, (cfg.img_size, cfg.img_size))
+    # Per-sample masks: built via the SAME canonical (sorted) ordering the datamodule
+    # assigns mesh_ids from, so row i really is geometry i.
+    mesh_masks = load_mesh_masks(args.data, (cfg.img_size, cfg.img_size))
+    print(f'Per-sample masks: {mesh_masks.shape[0]} geometries')
 
     # ---- resolve checkpoint ----
     resume: Optional[str] = args.resume
@@ -161,6 +165,7 @@ def main() -> None:
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         pixel_mask            = pixel_mask,
+        mesh_masks            = mesh_masks,
         use_gan               = (os.environ.get('HFM_USE_GAN') not in ('0', 'false', 'False'))
                                  if os.environ.get('HFM_USE_GAN') is not None
                                  else bool(train_hp.get('use_gan', True)),
