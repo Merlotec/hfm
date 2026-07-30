@@ -357,6 +357,10 @@ class GANTrainer:
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
+        # Normalisation stats this run trains with — saved into the checkpoint so
+        # inference cannot silently use a different normalisation (see infer.load_stats).
+        self.norm_mean: Optional[torch.Tensor] = None
+        self.norm_std:  Optional[torch.Tensor] = None
 
     def _no_sync_if(self, active: bool):
         """Context manager that enters ``.no_sync()`` on any DDP-wrapped module when
@@ -560,6 +564,9 @@ class GANTrainer:
             'scheduler':       self.scheduler.state_dict(),
             'cfg':             self.cfg,
             'global_step':     self.global_step,
+            # Pin the normalisation so inference reproduces training exactly.
+            'norm_mean':       None if self.norm_mean is None else self.norm_mean.tolist(),
+            'norm_std':        None if self.norm_std  is None else self.norm_std.tolist(),
         }
         # Only persist discriminator state when the GAN is enabled.
         if self.discriminator is not None and self.disc_optimizer is not None:

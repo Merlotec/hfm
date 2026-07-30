@@ -91,6 +91,10 @@ class HFMLightningModule(L.LightningModule):
             self.mesh_masks: Optional[torch.Tensor] = None
 
         self._step_offset = 0   # set by load_from_pt to preserve GAN curriculum
+        # Normalisation stats this run trains with — written into the checkpoint so
+        # inference cannot silently use different stats (see infer.load_stats).
+        self.norm_mean: Optional[torch.Tensor] = None
+        self.norm_std:  Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
 
@@ -280,6 +284,17 @@ class HFMLightningModule(L.LightningModule):
                               lr=self.cfg.disc_lr, betas=(0.5, 0.999))
         return ([gen_opt, disc_opt], [sched_cfg])
 
+    def on_fit_start(self) -> None:
+        """Capture the datamodule's normalisation stats once its setup() has run, so
+        on_save_checkpoint can pin them into every checkpoint."""
+        dm = getattr(self.trainer, 'datamodule', None)
+        inner = getattr(dm, '_inner', None) if dm is not None else None
+        if inner is not None and getattr(inner, 'mean', None) is not None \
+                             and getattr(inner, 'std', None) is not None:
+            self.norm_mean = [float(v) for v in inner.mean]
+            self.norm_std  = [float(v) for v in inner.std]
+            print(f'  Normalisation pinned into checkpoints: mean={self.norm_mean}')
+
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         # Inject HFM-native keys so infer.py can read this .ckpt file directly
         checkpoint['model']           = self.model.state_dict()
@@ -288,6 +303,10 @@ class HFMLightningModule(L.LightningModule):
             checkpoint['discriminator'] = self.discriminator.state_dict()
         checkpoint['cfg']             = self.cfg
         checkpoint['global_step']     = self.global_step
+        # Pin the normalisation so inference reproduces training exactly.
+        _lst = lambda v: None if v is None else [float(x) for x in v]
+        checkpoint['norm_mean'] = _lst(self.norm_mean)
+        checkpoint['norm_std']  = _lst(self.norm_std)
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         # Fill keys present in the current model but absent from the checkpoint

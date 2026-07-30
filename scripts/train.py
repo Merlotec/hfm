@@ -288,6 +288,9 @@ def main():
     if val_dl is not None and getattr(val_dm, 'mesh_masks', None) is not None:
         trainer.set_val_mesh_tables(val_dm.mesh_masks.to(device))
         print(f'                  {val_dm.mesh_masks.shape[0]} val geometries')
+    # Pin the training normalisation into every checkpoint this run writes, so
+    # inference can't silently normalise with different stats (see infer.load_stats).
+    trainer.norm_mean, trainer.norm_std = dm.mean, dm.std
     trainer.to(device)
 
     if args.resume == 'latest':

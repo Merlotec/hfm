@@ -50,12 +50,43 @@ def get_device() -> torch.device:
     return torch.device('cpu')
 
 
-def load_stats(data_dir: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    for p in [data_dir / 'hfm_input_stats.json', FOUNDATION_STATS]:
-        if p.exists():
-            with open(p) as f:
-                s = json.load(f)
-            return torch.tensor(s['mean']), torch.tensor(s['std'])
+def load_stats(data_dir: Path,
+               ckpt: Optional[dict] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalisation stats, preferring the ones the CHECKPOINT was trained with.
+
+    Training and inference MUST use identical stats: the model consumes
+    (raw - mean)/std, so a mismatch feeds it off-distribution inputs (the field is
+    rescaled, i.e. squashed toward or stretched away from the mean) AND de-normalises
+    its predicted delta by the wrong scale — which looks like "pulled toward the mean
+    plus grainy".  Deriving stats from whatever data dir you happen to infer on is
+    exactly how that breaks silently, so checkpoint stats win whenever present.
+    """
+    if ckpt is not None and ckpt.get('norm_mean') is not None \
+                        and ckpt.get('norm_std') is not None:
+        m = torch.as_tensor(ckpt['norm_mean'], dtype=torch.float32)
+        s = torch.as_tensor(ckpt['norm_std'],  dtype=torch.float32)
+        print('  Normalisation: from CHECKPOINT (matches training)')
+        return m, s
+
+    ds_stats = data_dir / 'hfm_input_stats.json'
+    if ds_stats.exists():
+        with open(ds_stats) as f:
+            s = json.load(f)
+        print(f'  [warn] checkpoint has no stats; using {ds_stats}')
+        print('         These MUST match the training stats or predictions are distorted.')
+        return torch.tensor(s['mean']), torch.tensor(s['std'])
+
+    if FOUNDATION_STATS.exists():
+        with open(FOUNDATION_STATS) as f:
+            s = json.load(f)
+        print(f'  [WARNING] No stats in the checkpoint AND none in {data_dir}!')
+        print(f'            Falling back to {FOUNDATION_STATS},')
+        print('            which is almost certainly NOT what this model was trained')
+        print('            with.  Expect fields pulled toward the mean and grainy output.')
+        print('            Fix: copy the TRAINING dir\'s hfm_input_stats.json here, or')
+        print('            retrain/re-save so the checkpoint carries norm_mean/norm_std.')
+        return torch.tensor(s['mean']), torch.tensor(s['std'])
+
     raise FileNotFoundError('No normalisation stats found.')
 
 
@@ -301,7 +332,7 @@ def main():
 
     # ---- load data ----
     print(f'\nLoading data from {data_dir}')
-    mean, std = load_stats(data_dir)
+    mean, std = load_stats(data_dir, ckpt)
     renderer_cache = {}
     
     mesh_dirs = []
