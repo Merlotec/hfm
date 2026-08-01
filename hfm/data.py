@@ -215,11 +215,36 @@ class FVMSequenceDataset(Dataset):
     def __len__(self) -> int:
         return max(0, len(self.paths) - self.seq_len + 1)
 
+    # Warn at most once per worker process about unreadable frames, so a handful of
+    # bad files don't flood the log.
+    _warned_corrupt = False
+
     def __getitem__(self, idx: int):
-        frames = torch.stack([self._get_frame(idx + i) for i in range(self.seq_len)])
-        if self.mesh_id is not None:
-            return frames, self.mesh_id      # + which geometry this sample is
-        return frames   # [T, C, H, W]
+        # A truncated / zero-byte .npz (left behind by a simulation that crashed
+        # mid-write) makes np.load raise EOFError.  Letting that propagate kills the
+        # DataLoader worker, which kills the rank, which strands every OTHER rank in
+        # its next collective ("Connection closed by peer") — i.e. one bad file takes
+        # down the whole job hours in.  Skip to a different window instead, and return
+        # a wholly valid sequence rather than splicing around the bad frame.
+        n = max(1, len(self))
+        for _ in range(4):
+            try:
+                frames = torch.stack(
+                    [self._get_frame(idx + i) for i in range(self.seq_len)])
+                if self.mesh_id is not None:
+                    return frames, self.mesh_id  # + which geometry this sample is
+                return frames   # [T, C, H, W]
+            except Exception as e:                       # unreadable/corrupt frame
+                if not FVMSequenceDataset._warned_corrupt:
+                    bad = self.paths[min(idx, len(self.paths) - 1)]
+                    print(f'  [warn] unreadable frame near {bad}: {type(e).__name__}: {e}')
+                    print('         Skipping this sample.  Find bad files with:')
+                    print('         python scripts/check_frames.py <data_dir>')
+                    FVMSequenceDataset._warned_corrupt = True
+                idx = (idx + self.seq_len) % n
+        raise RuntimeError(
+            f'{self.paths[0].parent}: could not read a valid sequence after 4 attempts '
+            '— this run is likely truncated; remove or repair it.')
 
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
