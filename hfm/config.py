@@ -58,7 +58,11 @@ class HFMConfig:
     ml_finest_px: int = 4                    # smallest unit side (encoded losslessly)
     # Per-level token dim — a bell curve peaking at level 1 (see model docstring).
     # Each dim must be divisible by n_heads, and dim//n_heads divisible by 4 (2-D RoPE).
-    ml_dims: tuple = (64, 384, 256, 96)
+    # Level 0 is the ONLY level the decoder reads, so it must be wide enough to carry
+    # both its own 4x4 patch encoding and everything routed down from the coarse
+    # levels.  At dim 64 (= the raw 4x4x4 patch size) it had zero headroom and was the
+    # model's output bottleneck; 192 gives the decoded level real capacity.
+    ml_dims: tuple = (192, 384, 256, 96)
     # Per-level self-attn pass budget, non-increasing (pyramid).  The last entry is
     # the "number of layers" = how many times level `ml_levels-1` iterates.  Coarse
     # budgets exhaust first, so late passes touch only fine levels (pyramidal tail).

@@ -383,12 +383,19 @@ def main():
             epoch_recon_cnt += 1
 
             if is_main() and step % args.log_every == 0:
-                # Persistence baseline: loss of predicting "no change" for the first
-                # step.  A residual model must keep recon/persist < 1; > 1 means it is
-                # worse than copying the input (hasn't learned the dynamics).
+                # Persistence baseline, matched to the SAME rollout `recon` averages:
+                # "predict no change" scored against every horizon target.  A one-step
+                # baseline would be wrong — the field drifts further from the input each
+                # step, so an EXACT persistence model (what a zero-init residual model
+                # is) scores ~4.9x the 1-step loss at horizon 4.  Matched, ratio == 1
+                # means "as good as persistence" and < 1 means it genuinely beats it.
                 nc = cfg.n_context_frames
+                horizon = max(1, min(getattr(cfg, 'rollout_horizon', 1),
+                                     len(frames) - nc - 1))
                 with torch.no_grad():
-                    persist = trainer.criterion(frames[nc], frames[nc + 1]).item()
+                    _p = [trainer.criterion(frames[nc], frames[nc + 1 + k]).item()
+                          for k in range(horizon)]
+                    persist = sum(_p) / len(_p)
                 ratio = recon / persist if persist > 0 else float('inf')
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '

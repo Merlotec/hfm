@@ -186,8 +186,19 @@ class AdjacentCrossAttn(nn.Module):
         self.norm_p = nn.LayerNorm(dp)
         self.norm_c = nn.LayerNorm(dc)
         self.parent_from_child = CrossAttention(dp, dc, n_heads, dropout=dropout)
-        # child ← parent: smooth interpolation + learned projection (not a broadcast).
-        self.child_from_parent = nn.Linear(dp, dc, bias=False)
+        # child ← parent: bilinear upsample (smooth across block boundaries — no
+        # block-stamping) followed by an MLP that ALSO sees the child's own state, so a
+        # child can modulate how it uses the parent context rather than just receiving a
+        # projection of it.  Capacity matters here more than anywhere else in the model:
+        # this is the ONLY route from the wide coarse levels down to level 0, and level 0
+        # is the only level the decoder reads.  A bare Linear made it the narrowest path
+        # in the network while the upward (parent←child) path had ~14x the parameters.
+        hidden = 2 * dc
+        self.child_from_parent = nn.Sequential(
+            nn.Linear(dp + dc, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dc),
+        )
 
     def forward(self, parent: torch.Tensor, child: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -204,11 +215,13 @@ class AdjacentCrossAttn(nn.Module):
         pq = np_.reshape(B * Gp * Gp, 1, dp)
         p_upd = self.parent_from_child(pq, ncg).reshape(B, Gp, Gp, dp)
 
-        # child ← parent: bilinear upsample Gp→2Gp so the correction is smooth across
-        # block boundaries (no block-uniform stamping), then project dp→dc.
+        # child ← parent: bilinear upsample Gp→2Gp so the correction varies smoothly
+        # across block boundaries (no block-uniform stamping), then an MLP over
+        # [parent_context, child_state] so the child gates what it takes from above.
         p_up = F.interpolate(np_.permute(0, 3, 1, 2), scale_factor=2,
                              mode='bilinear', align_corners=False)   # [B, dp, 2Gp, 2Gp]
-        c_upd = self.child_from_parent(p_up.permute(0, 2, 3, 1))     # [B, 2Gp, 2Gp, dc]
+        p_up = p_up.permute(0, 2, 3, 1)                              # [B, 2Gp, 2Gp, dp]
+        c_upd = self.child_from_parent(torch.cat([p_up, nc_], dim=-1))
 
         return parent + p_upd, child + c_upd
 

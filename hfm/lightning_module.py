@@ -93,8 +93,8 @@ class HFMLightningModule(L.LightningModule):
         self._step_offset = 0   # set by load_from_pt to preserve GAN curriculum
         # Normalisation stats this run trains with — written into the checkpoint so
         # inference cannot silently use different stats (see infer.load_stats).
-        self.norm_mean: Optional[torch.Tensor] = None
-        self.norm_std:  Optional[torch.Tensor] = None
+        self.norm_mean: Optional[list] = None
+        self.norm_std:  Optional[list] = None
 
     # ------------------------------------------------------------------
 
@@ -191,11 +191,17 @@ class HFMLightningModule(L.LightningModule):
             x_cur = pred_k_m       # feed prediction forward, keeps grad
         recon = torch.stack(recon_terms).mean()
 
-        # Persistence baseline: the loss of predicting "no change" for the first step.
-        # A residual model starts here and must go BELOW it — recon/persist > 1 means the
-        # model is worse than copying the input, i.e. it hasn't learned the dynamics.
+        # Persistence baseline, matched to the SAME rollout: "predict no change" scored
+        # against every horizon target, exactly as recon is.  A single-step baseline is
+        # wrong here — the field drifts further from x_in at each step, so an EXACT
+        # persistence model (which is what a zero-init residual model is) scores ~4.9x
+        # the 1-step loss at horizon 4, and `ratio` would start ~4.9 rather than 1.
+        # Matched this way, ratio == 1 means "as good as persistence" and < 1 means the
+        # model genuinely beats it — at any horizon.
         with torch.no_grad():
-            persist = self.criterion(x_in, x_target, pixel_mask=mask)
+            persist = torch.stack(
+                [self.criterion(x_in, frames[n + 1 + k], pixel_mask=mask)
+                 for k in range(horizon)]).mean()
             ratio   = recon.detach() / persist.clamp(min=1e-8)
 
         # ---- reconstruction only (GAN off / pre-GAN) ----

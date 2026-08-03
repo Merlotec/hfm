@@ -155,17 +155,28 @@ def compute_normalisation_stats(
     s1 = torch.zeros(C)
     s2 = torch.zeros(C)
     cnt = torch.zeros(C)
+    n_bad = 0
     for i in idx:
         fpath, renderer = all_files[i]
-        d = np.load(fpath)
-        vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-        frame = renderer.render_cell_smooth(vals)   # [C, H, W]
+        # Skip truncated/zero-byte frames rather than aborting the whole run at setup:
+        # these are statistics over a random sample, so a few dropped frames are
+        # statistically irrelevant.
+        try:
+            d = np.load(fpath)
+            vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+            frame = renderer.render_cell_smooth(vals)   # [C, H, W]
+        except Exception:
+            n_bad += 1
+            continue
         for c in range(C):
             px = frame[c]
             fin = px[torch.isfinite(px)]
             s1[c]  += fin.sum()
             s2[c]  += (fin ** 2).sum()
             cnt[c] += fin.numel()
+    if n_bad:
+        print(f'  [warn] stats: skipped {n_bad}/{n} unreadable frame(s) '
+              '(run scripts/check_frames.py to find them)')
 
     mean = s1 / cnt
     std  = ((s2 / cnt) - mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
