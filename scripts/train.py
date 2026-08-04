@@ -171,6 +171,10 @@ def main():
                              'These are what `--resume latest` looks for.')
     args = parser.parse_args()
 
+    # Let fp32 matmuls use TF32 tensor cores (Ampere+/CUDA, and the XPU equivalent).
+    # bf16 autocast already covers most matmuls; this picks up the ones that stay fp32.
+    torch.set_float32_matmul_precision('high')
+
     # Seed comms env from hyperparams.json BEFORE the process group is built (the
     # backend is chosen inside init_distributed).  Real env still overrides.
     apply_distributed_env_defaults()

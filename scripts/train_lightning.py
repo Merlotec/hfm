@@ -118,6 +118,12 @@ def main() -> None:
     parser.add_argument('--workers',     type=int,  default=4)
     args = parser.parse_args()
 
+    # Let fp32 matmuls use TF32 tensor cores (Ampere+/CUDA, and the XPU equivalent).
+    # bf16 autocast already covers most matmuls; this picks up the ones that stay fp32
+    # and silences Lightning's "you have Tensor Cores" warning.  Precision loss is
+    # confined to matmul accumulation and is irrelevant next to bf16 activations.
+    torch.set_float32_matmul_precision('high')
+
     cfg, train_hp = load_config()
     n_epochs   = args.epochs    or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
