@@ -66,6 +66,35 @@ class FluidLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Stride probe: does the context actually encode the timestep?
+# ---------------------------------------------------------------------------
+
+class StrideProbe(nn.Module):
+    """
+    Classify the sampled temporal stride from the context tokens alone.
+
+    The stride is never given to the model explicitly — it exists only in how
+    far the flow moves between context frames — so this probe's accuracy is a
+    direct measurement that the context encodes the timestep.  Trained jointly
+    (small weight), it also applies gradient pressure against the context
+    collapsing to a constant: a constant context cannot be classified.
+    """
+
+    def __init__(self, d_ctx: int, n_classes: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_ctx),
+            nn.Linear(d_ctx, d_ctx // 2),
+            nn.GELU(),
+            nn.Linear(d_ctx // 2, n_classes),
+        )
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        """context: [B, K, d_ctx] → logits [B, n_classes]."""
+        return self.net(context.mean(dim=1))
+
+
+# ---------------------------------------------------------------------------
 # GAN training step
 # ---------------------------------------------------------------------------
 
@@ -87,6 +116,10 @@ def train_step_gan(
     accum_steps: int = 1,
     micro_first: bool = True,
     micro_last: bool = True,
+    stride_probe: Optional[nn.Module] = None,
+    stride_label: Optional[int] = None,
+    stride_cls_weight: float = 0.0,
+    metrics: Optional[dict] = None,
 ) -> Tuple[float, float]:
     """
     One training step.
@@ -141,6 +174,22 @@ def train_step_gan(
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         context = context_encoder(frames[:n_context], pixel_mask=pixel_mask)
 
+    # ---- stride probe: recover the timestep from the context alone ----
+    # frames[] is already stride-subsampled by the caller; the stride reaches
+    # the encoder only through the inter-frame motion, so this CE term both
+    # measures and enforces that the context encodes the timestep.
+    probe_term = None
+    if stride_probe is not None and stride_label is not None and stride_cls_weight > 0.0:
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
+            logits = stride_probe(context)
+        labels = torch.full((logits.shape[0],), stride_label,
+                            dtype=torch.long, device=logits.device)
+        probe_term = F.cross_entropy(logits.float(), labels)
+        if metrics is not None:
+            metrics['stride_loss'] = float(probe_term.item())
+            metrics['stride_acc']  = float((logits.argmax(-1) == labels)
+                                           .float().mean().item())
+
     # ---- scheduled sampling: sometimes feed the model its own prediction ----
     # frames[n_context-1] always exists (n_context >= 1); the supervision target
     # stays the TRUE frame n_context+1, exactly the pushforward setup.
@@ -179,23 +228,28 @@ def train_step_gan(
             for p in discriminator.parameters():
                 p.requires_grad_(True)
 
+    # Modules the generator backward writes grads into (probe included so its
+    # grads are averaged and clipped alongside the rest on every path).
+    gen_modules = [model, context_encoder] + ([stride_probe] if stride_probe is not None else [])
+    gen_params  = [p for mod in gen_modules for p in mod.parameters()]
+
     # ---- reconstruction only ----
     if adv_weight == 0.0:
         recon_loss = recon_rollout
+        gen_loss = recon_loss if probe_term is None \
+            else recon_loss + stride_cls_weight * probe_term
         # NaN bail must be GLOBAL: if one rank bailed while others proceeded to a
         # collective (DDP reducer or host allreduce), the job would hang/diverge.
-        (bad,) = allreduce_stats(0.0 if torch.isfinite(recon_loss) else 1.0)
+        (bad,) = allreduce_stats(0.0 if torch.isfinite(gen_loss) else 1.0)
         if bad > 0.0:
             _zero_and_restore()
             return float('nan'), 0.0
-        (recon_loss * scale).backward()
+        (gen_loss * scale).backward()
         if micro_last:
             if host_grad_sync_enabled():
-                allreduce_grads([model, context_encoder])   # average, THEN clip (DDP semantics)
+                allreduce_grads(gen_modules)   # average, THEN clip (DDP semantics)
             if clip_grad > 0:
-                nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(context_encoder.parameters()), clip_grad
-                )
+                nn.utils.clip_grad_norm_(gen_params, clip_grad)
             gen_optimizer.step()
         return recon_loss.item(), 0.0
 
@@ -266,6 +320,8 @@ def train_step_gan(
         total_loss = recon_loss + adv_weight * adv_loss
     else:
         total_loss = recon_loss
+    if probe_term is not None:
+        total_loss = total_loss + stride_cls_weight * probe_term
     (bad,) = allreduce_stats(0.0 if torch.isfinite(total_loss) else 1.0)
     if bad > 0.0:
         _zero_and_restore()
@@ -274,11 +330,9 @@ def train_step_gan(
     (total_loss * scale).backward()
     if micro_last:
         if host_grad_sync_enabled():
-            allreduce_grads([model, context_encoder])
+            allreduce_grads(gen_modules)
         if clip_grad > 0:
-            nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(context_encoder.parameters()), clip_grad
-            )
+            nn.utils.clip_grad_norm_(gen_params, clip_grad)
         gen_optimizer.step()
 
     for p in discriminator.parameters():
@@ -343,7 +397,19 @@ class GANTrainer:
             hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
         )
 
+        # Stride probe: only meaningful when there is more than one stride to
+        # classify.  Joint-trained with a small weight (cfg.stride_cls_weight).
+        strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
+        self.time_strides = strides
+        self.stride_probe = (
+            StrideProbe(cfg.d_ctx, len(strides)) if len(strides) > 1 else None
+        )
+        self._stride_metrics: dict = {}
+        self._last_stride: int = strides[0]
+
         gen_params = list(self.model.parameters()) + list(self.context_encoder.parameters())
+        if self.stride_probe is not None:
+            gen_params += list(self.stride_probe.parameters())
         self.gen_optimizer = optim.AdamW(gen_params, lr=lr, weight_decay=weight_decay)
         self.disc_optimizer = (
             optim.Adam(self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999))
@@ -370,7 +436,8 @@ class GANTrainer:
         from torch.nn.parallel import DistributedDataParallel as _DDP
         stack = contextlib.ExitStack()
         if active:
-            for m in (self.model, self.context_encoder, self.discriminator):
+            for m in (self.model, self.context_encoder, self.discriminator,
+                      self.stride_probe):
                 if isinstance(m, _DDP):
                     stack.enter_context(m.no_sync())
         return stack
@@ -428,6 +495,8 @@ class GANTrainer:
         self.context_encoder = self.context_encoder.to(device)
         if self.discriminator is not None:
             self.discriminator = self.discriminator.to(device)
+        if self.stride_probe is not None:
+            self.stride_probe = self.stride_probe.to(device)
         self.criterion       = self.criterion.to(device)
         return self
 
@@ -453,6 +522,8 @@ class GANTrainer:
         self.context_encoder = _wrap(self.context_encoder, device, find_unused_parameters=True)
         if self.discriminator is not None:
             self.discriminator = _wrap(self.discriminator, device, find_unused_parameters=True)
+        if self.stride_probe is not None:
+            self.stride_probe = _wrap(self.stride_probe, device, find_unused_parameters=True)
         return self
 
     def set_mesh_tables(self, masks) -> None:
@@ -477,12 +548,39 @@ class GANTrainer:
         pixel_mask: Optional[torch.Tensor] = None,
         mesh_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
-        """frames: list of (n_context_frames + 1 + rollout_horizon) tensors [B, C, H, W]."""
+        """frames: list of (n_context_frames + rollout_horizon) * max(time_strides) + 1
+        tensors [B, C, H, W].  Each step samples one temporal stride s and trains on
+        every s-th frame — the timestep reaches the model only through the context."""
         pixel_mask = self._mask_ctx(pixel_mask, mesh_ids)
         self.model.train()
         self.context_encoder.train()
         if self.discriminator is not None:
             self.discriminator.train()
+        if self.stride_probe is not None:
+            self.stride_probe.train()
+
+        # ---- sample a temporal stride and subsample the frame sequence ----
+        # One stride per step (whole batch shares it — the subsample is on the
+        # time axis).  A random start offset uses the slack left by smaller
+        # strides as temporal augmentation.
+        nc, H = self.cfg.n_context_frames, getattr(self.cfg, 'rollout_horizon', 1)
+        s_idx = int(torch.randint(len(self.time_strides), (1,)).item())
+        s = self.time_strides[s_idx]
+        need = (nc + H) * s + 1
+        if need > len(frames):        # sequence too short for this stride
+            s_idx, s = 0, self.time_strides[0]
+            need = (nc + H) * s + 1
+        off = int(torch.randint(len(frames) - need + 1, (1,)).item())
+        frames = frames[off : off + need : s]
+        self._last_stride = s
+        self._stride_metrics = {}
+        # Persistence baseline AT THIS STRIDE — the honest "model vs copy-input"
+        # comparison for the log (stride-1 persistence would flatter larger strides).
+        with torch.no_grad():
+            _p = [self.criterion(frames[nc], frames[nc + 1 + k],
+                                 pixel_mask=pixel_mask).item()
+                  for k in range(min(H, len(frames) - nc - 1))]
+        self._stride_metrics['persist'] = sum(_p) / max(1, len(_p))
 
         micro_first = (self._micro == 0)
         micro_last  = (self._micro == self.accum_steps - 1)
@@ -508,6 +606,10 @@ class GANTrainer:
                 accum_steps=self.accum_steps,
                 micro_first=micro_first,
                 micro_last=micro_last,
+                stride_probe=self.stride_probe,
+                stride_label=s_idx,
+                stride_cls_weight=getattr(self.cfg, 'stride_cls_weight', 0.0),
+                metrics=self._stride_metrics,
             )
 
         # A NaN bail zeroed the grads inside train_step_gan — abort the window and do
@@ -527,11 +629,14 @@ class GANTrainer:
         return recon_loss, disc_loss
 
     def training_info(self) -> dict:
-        return {
+        info = {
             'global_step': self.global_step,
             'adv_weight':  self._current_adv_weight(),
             'gan_active':  self._current_adv_weight() > 0.0,
+            'stride':      self._last_stride,
         }
+        info.update(self._stride_metrics)      # stride_loss / stride_acc when present
+        return info
 
     @torch.no_grad()
     def predict(
@@ -573,6 +678,9 @@ class GANTrainer:
             _d = getattr(self.discriminator, 'module', self.discriminator)
             ckpt['discriminator']  = _d.state_dict()
             ckpt['disc_optimizer'] = self.disc_optimizer.state_dict()
+        if self.stride_probe is not None:
+            _s = getattr(self.stride_probe, 'module', self.stride_probe)
+            ckpt['stride_probe'] = _s.state_dict()
         torch.save(ckpt, path)
 
     def load(self, path: str):
@@ -594,6 +702,13 @@ class GANTrainer:
             self.context_encoder.load_state_dict(ckpt['context_encoder'])
         else:
             print('  [warn] no context_encoder in checkpoint; starting fresh')
+
+        if self.stride_probe is not None and 'stride_probe' in ckpt:
+            self.stride_probe = getattr(self.stride_probe, 'module', self.stride_probe)
+            try:
+                self.stride_probe.load_state_dict(ckpt['stride_probe'])
+            except RuntimeError as e:            # e.g. n_classes changed
+                print(f'  [warn] stride_probe not restored ({e}); starting fresh')
 
         # Discriminator load is skipped entirely when the GAN is disabled (or when the
         # checkpoint carries no discriminator, e.g. saved with use_gan=False).

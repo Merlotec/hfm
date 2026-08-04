@@ -98,6 +98,8 @@ def load_config() -> tuple[HFMConfig, dict]:
         mlp_ratio              = m['mlp_ratio'],
         dropout                = m['dropout'],
         rollout_horizon        = m.get('rollout_horizon', 4),
+        time_strides           = tuple(m.get('time_strides', (1, 2, 4))),
+        stride_cls_weight      = m.get('stride_cls_weight', 0.1),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
         d_ctx                  = m['d_ctx'],
@@ -189,8 +191,10 @@ def main():
 
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
-    # context frames + input frame + one target per rollout step
-    seq_len  = cfg.n_context_frames + 1 + getattr(cfg, 'rollout_horizon', 1)
+    # (context frames + rollout targets) at the LARGEST stride, + 1: each step
+    # subsamples every s-th frame from this window (see GANTrainer.step).
+    max_stride = max(getattr(cfg, 'time_strides', (1,)) or (1,))
+    seq_len  = (cfg.n_context_frames + getattr(cfg, 'rollout_horizon', 1)) * max_stride + 1
 
     # Gradient accumulation: N micro-batches per optimizer step.  Env var overrides the
     # hyperparams.json value so it can be toggled per-job on the cluster without an edit.
@@ -393,17 +397,17 @@ def main():
                 # step, so an EXACT persistence model (what a zero-init residual model
                 # is) scores ~4.9x the 1-step loss at horizon 4.  Matched, ratio == 1
                 # means "as good as persistence" and < 1 means it genuinely beats it.
-                nc = cfg.n_context_frames
-                horizon = max(1, min(getattr(cfg, 'rollout_horizon', 1),
-                                     len(frames) - nc - 1))
-                with torch.no_grad():
-                    _p = [trainer.criterion(frames[nc], frames[nc + 1 + k]).item()
-                          for k in range(horizon)]
-                    persist = sum(_p) / len(_p)
+                # Persistence is computed inside trainer.step at the SAMPLED stride,
+                # so the ratio stays honest when the timestep varies.
+                persist = info.get('persist', float('nan'))
                 ratio = recon / persist if persist > 0 else float('inf')
+                stride_bit = f"s={info.get('stride', 1)}"
+                if 'stride_acc' in info:
+                    stride_bit += f"  sacc={info['stride_acc']:.2f}"
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
                     f'recon={recon:.4f}  persist={persist:.4f}  ratio={ratio:.2f}  '
+                    f'{stride_bit}  '
                     f'disc={disc:.4f}  '
                     f'adv_w={info["adv_weight"]:.3f}'
                 )

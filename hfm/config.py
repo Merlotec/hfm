@@ -34,6 +34,19 @@ class HFMConfig:
     # to a constant.  Needs seq_len = n_context_frames + 1 + rollout_horizon.
     rollout_horizon: int = 4
 
+    # --- multi-timestep training ---
+    # Temporal strides sampled per training step.  With stride s the context is
+    # built from every s-th frame and the model predicts s frames ahead — the
+    # timestep is parameterised purely by the context (the encoder sees how far
+    # the flow moves between its input frames), never as an explicit input.
+    # Needs seq_len = (n_context_frames + rollout_horizon) * max(stride) + 1.
+    time_strides: tuple = (1, 2, 4)
+    # Weight of the auxiliary stride-classification loss on the context tokens.
+    # A small probe must recover the sampled stride from the context alone —
+    # direct evidence (and gradient pressure) that the context actually encodes
+    # the timestep rather than collapsing to a constant.
+    stride_cls_weight: float = 0.1
+
     # --- context encoder ---
     n_context_frames: int = 5
     ctx_patch_px: int = 16

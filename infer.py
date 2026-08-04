@@ -274,6 +274,10 @@ def main():
                         help='Skip PNG generation')
     parser.add_argument('--disc-saliency', action='store_true',
                         help='Compute and save discriminator saliency heatmaps')
+    parser.add_argument('--time-stride', type=int, default=1,
+                        help='Temporal stride: context/rollout use every s-th frame, '
+                             'so the model predicts s frame-deltas per step (must be '
+                             'a stride the model was trained on to work well)')
     parser.add_argument('--no-residual', action='store_true',
                         help='Force residual_prediction=False (for checkpoints trained '
                              'as absolute predictors, where adding the residual at '
@@ -358,7 +362,12 @@ def main():
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
     print(f'  Found {len(runs)} simulation runs across {len(mesh_dirs)} meshes\n')
 
+    # With --time-stride s the raw sequence is s× longer and every s-th frame is
+    # used: the context sees stride-s spacing, which is the ONLY way the model
+    # learns what timestep it is being asked to predict at.
+    stride  = max(1, args.time_stride)
     seq_len = n_context + args.n_predict + 1
+    raw_len = (seq_len - 1) * stride + 1
 
     for sim_idx, (sim_dir, renderer, pixel_mask) in enumerate(runs):
         print(f'[{sim_idx+1}/{len(runs)}] {sim_dir.name}')
@@ -366,7 +375,7 @@ def main():
         run_out.mkdir(parents=True, exist_ok=True)
 
         ds = FVMSequenceDataset.with_cache(
-            sim_dir, renderer, seq_len, mean, std, first_frame=args.first_frame
+            sim_dir, renderer, raw_len, mean, std, first_frame=args.first_frame
         )
         if len(ds) == 0:
             print(f'  [skip] no sequences available')
@@ -374,8 +383,10 @@ def main():
 
         start = args.seq_start if args.seq_start is not None else len(ds) // 2
         seq   = ds[start]
-        frames_gt = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
-        timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
+        frames_gt = [seq[t:t+1].to(device) * pixel_mask
+                     for t in range(0, raw_len, stride)]
+        timestamps = [float(ds.paths[start + t].stem[2:])
+                      for t in range(0, raw_len, stride)]
 
         # ---- encode context ----
         with torch.no_grad():
