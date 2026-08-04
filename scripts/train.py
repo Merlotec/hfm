@@ -83,7 +83,8 @@ def load_config() -> tuple[HFMConfig, dict]:
     # JSON arrays arrive as lists; HFMConfig tuple fields tolerate them (the model
     # does list(...) on each).  '_'-prefixed keys are comments and are skipped.
     ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
-               'ml_blocks_per_level', 'ml_untie_passes')
+               'ml_blocks_per_level', 'ml_untie_passes',
+               'residual_prediction', 'mask_aware_decoder')
     ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],
