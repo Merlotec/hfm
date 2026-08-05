@@ -56,7 +56,15 @@ class ContextEncoder(nn.Module):
         super().__init__()
         P = cfg.img_size // cfg.ctx_patch_px    # patches per side in context encoder
 
-        self.patch_embed  = PatchEmbed(cfg.in_channels + 1, cfg.ctx_patch_px, cfg.d_ctx)
+        # Instance-dict lookup, NOT getattr: dataclass defaults are CLASS
+        # attributes, so getattr on a cfg pickled before this field existed
+        # would silently return the new default (True) and build a 9-channel
+        # embed that old 5-channel checkpoints cannot load.  Only a cfg whose
+        # own __dict__ carries the field (i.e. constructed by current code)
+        # enables the diff channels.
+        self.use_diffs = bool(vars(cfg).get('ctx_temporal_diffs', False))
+        in_ch = (2 * cfg.in_channels if self.use_diffs else cfg.in_channels) + 1
+        self.patch_embed  = PatchEmbed(in_ch, cfg.ctx_patch_px, cfg.d_ctx)
         self.spatial_pos  = LearnedPos2D(P, P, cfg.d_ctx)
         self.temporal_pos = nn.Embedding(64, cfg.d_ctx)   # supports up to 64 input frames
 
@@ -103,10 +111,20 @@ class ContextEncoder(nn.Module):
                                  device=frames[0].device, dtype=frames[0].dtype)
 
         tokens: List[torch.Tensor] = []
+        prev: Optional[torch.Tensor] = None
         for t, frame in enumerate(frames):
             if pixel_mask is not None:
                 frame = frame * pixel_mask
-            frame_aug = torch.cat([frame, mask_ch], dim=1)
+            if self.use_diffs:
+                # Explicit inter-frame motion channel: [f_t, f_t - f_{t-1}].
+                # The diff's magnitude/structure scales with the temporal stride,
+                # making the timestep readable at the very first conv instead of
+                # having to be disentangled from appearance deep in the trunk.
+                diff = frame - prev if prev is not None else torch.zeros_like(frame)
+                prev = frame
+                frame_aug = torch.cat([frame, diff, mask_ch], dim=1)
+            else:
+                frame_aug = torch.cat([frame, mask_ch], dim=1)
             tok = self.spatial_pos(self.patch_embed(frame_aug))  # [B, P, P, d_ctx]
             tok = rearrange(tok, 'b h w d -> b (h w) d')         # [B, P², d_ctx]
             tok = tok + self.temporal_pos.weight[t]            # broadcast temporal bias

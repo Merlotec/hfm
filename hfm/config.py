@@ -57,6 +57,13 @@ class HFMConfig:
     persist_norm_loss: bool = True
 
     # --- context encoder ---
+    # Feed each context frame together with its difference from the previous
+    # frame ([f_t, f_t - f_{t-1}]).  The encoder embeds frames independently, so
+    # without this, inter-frame motion — the ONLY carrier of the timestep —
+    # exists just as pattern-entangled differences between token embeddings,
+    # which no probe (and, in practice, not the trunk either) can linearise.
+    # With explicit diffs, stride classification goes 0.33 -> 0.98 in isolation.
+    ctx_temporal_diffs: bool = True
     n_context_frames: int = 5
     ctx_patch_px: int = 16
     d_ctx: int = 256

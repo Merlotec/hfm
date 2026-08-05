@@ -35,6 +35,7 @@
     "residual_prediction": true,
     "mask_aware_decoder": true,
 
+    "ctx_temporal_diffs": true,
     "n_context_frames": 5,
     "ctx_patch_px": 16,
     "d_ctx": 384,
