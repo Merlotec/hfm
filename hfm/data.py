@@ -223,6 +223,28 @@ class FVMSequenceDataset(Dataset):
         self.std        = std.view(-1, 1, 1)
         self._cache     = frame_cache            # optional pre-rendered cache
 
+        # Per-run boundary-condition summary: per-channel mean+std of the first
+        # readable frame's bc_primatives -> [2C].  This is the forcing information
+        # that is NOT reliably visible in a single field frame; the context probe
+        # regresses it so the encoder is pushed to carry run-specific physics.
+        # NaN-safe (some runs carry NaN bc rows); an unreadable/all-NaN run yields
+        # NaN targets, which consumers mask out of the loss.
+        self.bc_raw: Optional[torch.Tensor] = None
+        for f in files[:3]:                      # tolerate a corrupt first file
+            try:
+                bc = np.load(f)['bc_primatives'].astype(np.float32)   # [N, C]
+                summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
+                self.bc_raw = torch.from_numpy(summ)                  # [2C]
+                break
+            except Exception:
+                continue
+        self.bc = self.bc_raw                    # normalised via set_bc_norm()
+
+    def set_bc_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """z-score the BC summary with dataset-level stats (regression target)."""
+        if self.bc_raw is not None:
+            self.bc = (self.bc_raw - mean) / std.clamp(min=1e-6)
+
     def __len__(self) -> int:
         return max(0, len(self.paths) - self.seq_len + 1)
 
@@ -243,7 +265,10 @@ class FVMSequenceDataset(Dataset):
                 frames = torch.stack(
                     [self._get_frame(idx + i) for i in range(self.seq_len)])
                 if self.mesh_id is not None:
-                    return frames, self.mesh_id  # + which geometry this sample is
+                    # + which geometry this sample is, + its BC/forcing summary
+                    bc = self.bc if self.bc is not None \
+                        else torch.full((8,), float('nan'))
+                    return frames, self.mesh_id, bc
                 return frames   # [T, C, H, W]
             except Exception as e:                       # unreadable/corrupt frame
                 if not FVMSequenceDataset._warned_corrupt:
@@ -283,7 +308,8 @@ class FVMSequenceDataset(Dataset):
             vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
             raw  = renderer.render_cell_smooth(vals)
             cache.append((raw - m) / s)
-        return cls(sim_dir, renderer, seq_len, mean, std, first_frame, frame_cache=cache)
+        return cls(sim_dir, renderer, seq_len, mean, std, first_frame,
+                   frame_cache=cache, mesh_id=mesh_id)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +405,22 @@ class FVMDataModule:
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
             raise RuntimeError('No usable sequences found — try reducing seq_len or first_frame')
+
+        # z-score the per-run BC summaries across runs so the probe regression
+        # target is unit-scale.  Runs with no readable BCs keep NaN targets, which
+        # the probe loss masks per sample.
+        bcs = [ds.bc_raw for ds in datasets if ds.bc_raw is not None
+               and bool(torch.isfinite(ds.bc_raw).all())]
+        if bcs:
+            B = torch.stack(bcs)
+            self.bc_mean, self.bc_std = B.mean(0), B.std(0)
+            for ds in datasets:
+                ds.set_bc_norm(self.bc_mean, self.bc_std)
+            self.bc_dim = B.shape[1]
+        else:
+            self.bc_mean = self.bc_std = None
+            self.bc_dim = 0
+
         self._dataset = ConcatDataset(datasets)
         # print the MESH count too: without it a multi-mesh run looks identical to a
         # single-mesh one, which is how the shared-mask bug stayed invisible.

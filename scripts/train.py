@@ -287,6 +287,9 @@ def main():
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         accum_steps           = accum_steps,
         use_gan               = use_gan,
+        # Context-probe label spaces: geometry classes and BC-summary dimension.
+        probe_n_meshes        = (dm.mesh_masks.shape[0] if dm.mesh_masks is not None else 0),
+        probe_bc_dim          = getattr(dm, 'bc_dim', 0),
     )
 
     # Per-sample masks: a batch mixes geometries, so ONE shared mask would be wrong
@@ -364,12 +367,16 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
-        for batch in train_dl:                       # ([B, T, C, H, W], [B]) mesh ids
-            batch, mesh_b = batch if isinstance(batch, (tuple, list)) else (batch, None)
+        for batch in train_dl:            # (frames, mesh_ids, bc) / (frames, mesh_ids) / frames
+            mesh_b = bc_b = None
+            if isinstance(batch, (tuple, list)):
+                mesh_b = batch[1] if len(batch) > 1 else None
+                bc_b   = batch[2] if len(batch) > 2 else None
+                batch  = batch[0]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
             recon, disc = trainer.step(frames, pixel_mask=pixel_mask,
-                                       mesh_ids=mesh_b)
+                                       mesh_ids=mesh_b, bc=bc_b)
             info = trainer.training_info()
             step = info['global_step']
 

@@ -69,29 +69,87 @@ class FluidLoss(nn.Module):
 # Stride probe: does the context actually encode the timestep?
 # ---------------------------------------------------------------------------
 
-class StrideProbe(nn.Module):
+class ContextProbe(nn.Module):
     """
-    Classify the sampled temporal stride from the context tokens alone.
+    Recover everything we have labels for from the context tokens alone:
 
-    The stride is never given to the model explicitly — it exists only in how
-    far the flow moves between context frames — so this probe's accuracy is a
-    direct measurement that the context encodes the timestep.  Trained jointly
-    (small weight), it also applies gradient pressure against the context
-    collapsing to a constant: a constant context cannot be classified.
+      stride : which temporal stride was sampled (classification) — exists only
+               in the inter-frame motion of the context frames
+      mesh   : which geometry this sample comes from (classification)
+      bc     : per-run boundary-condition summary (regression, z-scored) — the
+               run-specific forcing that a single field frame does not reliably
+               carry, i.e. exactly the information the context-swap test showed
+               the model was not using
+
+    Trained jointly (small weight), each head both MEASURES whether that
+    information is present in the context and applies gradient pressure on the
+    encoder to put it there: a collapsed/constant context satisfies none of them.
     """
 
-    def __init__(self, d_ctx: int, n_classes: int):
+    def __init__(self, d_ctx: int, n_strides: int,
+                 n_meshes: int = 0, bc_dim: int = 0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(d_ctx),
-            nn.Linear(d_ctx, d_ctx // 2),
-            nn.GELU(),
-            nn.Linear(d_ctx // 2, n_classes),
+        h = d_ctx // 2
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(d_ctx), nn.Linear(d_ctx, h), nn.GELU(),
         )
+        self.stride_head = nn.Linear(h, n_strides)
+        self.mesh_head = nn.Linear(h, n_meshes) if n_meshes > 1 else None
+        self.bc_head = nn.Linear(h, bc_dim) if bc_dim > 0 else None
 
-    def forward(self, context: torch.Tensor) -> torch.Tensor:
-        """context: [B, K, d_ctx] → logits [B, n_classes]."""
-        return self.net(context.mean(dim=1))
+    def forward(self, context: torch.Tensor) -> dict:
+        """context: [B, K, d_ctx] → {'stride': [B,S], 'mesh': [B,M]?, 'bc': [B,D]?}."""
+        z = self.trunk(context.mean(dim=1))
+        out = {'stride': self.stride_head(z)}
+        if self.mesh_head is not None:
+            out['mesh'] = self.mesh_head(z)
+        if self.bc_head is not None:
+            out['bc'] = self.bc_head(z)
+        return out
+
+
+def probe_losses(
+    probe: nn.Module,
+    context: torch.Tensor,
+    stride_label: int,
+    mesh_ids: Optional[torch.Tensor] = None,
+    bc: Optional[torch.Tensor] = None,
+    metrics: Optional[dict] = None,
+) -> torch.Tensor:
+    """
+    Combined probe loss (CE ~ ln(n) and z-scored MSE are comparable scales, so
+    the terms are summed unweighted; the caller applies one overall weight).
+    NaN bc rows (runs with unreadable BCs) are masked out per sample.
+    """
+    out = probe(context)
+    B = context.shape[0]
+    dev = context.device
+
+    labels = torch.full((B,), stride_label, dtype=torch.long, device=dev)
+    total = F.cross_entropy(out['stride'].float(), labels)
+    if metrics is not None:
+        metrics['stride_loss'] = float(total.item())
+        metrics['stride_acc'] = float((out['stride'].argmax(-1) == labels)
+                                      .float().mean().item())
+
+    if 'mesh' in out and mesh_ids is not None:
+        m_lab = mesh_ids.to(dev).long()
+        m_loss = F.cross_entropy(out['mesh'].float(), m_lab)
+        total = total + m_loss
+        if metrics is not None:
+            metrics['mesh_acc'] = float((out['mesh'].argmax(-1) == m_lab)
+                                        .float().mean().item())
+
+    if 'bc' in out and bc is not None:
+        tgt = bc.to(dev).float()
+        valid = torch.isfinite(tgt).all(dim=-1)                     # [B]
+        if bool(valid.any()):
+            err = (out['bc'].float()[valid] - tgt[valid]).pow(2).mean()
+            total = total + err
+            if metrics is not None:
+                metrics['bc_mse'] = float(err.item())
+
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +174,10 @@ def train_step_gan(
     accum_steps: int = 1,
     micro_first: bool = True,
     micro_last: bool = True,
-    stride_probe: Optional[nn.Module] = None,
+    probe: Optional[nn.Module] = None,
     stride_label: Optional[int] = None,
+    probe_mesh_ids: Optional[torch.Tensor] = None,
+    probe_bc: Optional[torch.Tensor] = None,
     stride_cls_weight: float = 0.0,
     metrics: Optional[dict] = None,
 ) -> Tuple[float, float]:
@@ -174,21 +234,16 @@ def train_step_gan(
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         context = context_encoder(frames[:n_context], pixel_mask=pixel_mask)
 
-    # ---- stride probe: recover the timestep from the context alone ----
+    # ---- context probe: recover stride / mesh / BCs from the context alone ----
     # frames[] is already stride-subsampled by the caller; the stride reaches
-    # the encoder only through the inter-frame motion, so this CE term both
-    # measures and enforces that the context encodes the timestep.
+    # the encoder only through the inter-frame motion.  The probe both measures
+    # and enforces that the context carries each labelled quantity.
     probe_term = None
-    if stride_probe is not None and stride_label is not None and stride_cls_weight > 0.0:
+    if probe is not None and stride_label is not None and stride_cls_weight > 0.0:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            logits = stride_probe(context)
-        labels = torch.full((logits.shape[0],), stride_label,
-                            dtype=torch.long, device=logits.device)
-        probe_term = F.cross_entropy(logits.float(), labels)
-        if metrics is not None:
-            metrics['stride_loss'] = float(probe_term.item())
-            metrics['stride_acc']  = float((logits.argmax(-1) == labels)
-                                           .float().mean().item())
+            probe_term = probe_losses(probe, context, stride_label,
+                                      mesh_ids=probe_mesh_ids, bc=probe_bc,
+                                      metrics=metrics)
 
     # ---- scheduled sampling: sometimes feed the model its own prediction ----
     # frames[n_context-1] always exists (n_context >= 1); the supervision target
@@ -230,7 +285,7 @@ def train_step_gan(
 
     # Modules the generator backward writes grads into (probe included so its
     # grads are averaged and clipped alongside the rest on every path).
-    gen_modules = [model, context_encoder] + ([stride_probe] if stride_probe is not None else [])
+    gen_modules = [model, context_encoder] + ([probe] if probe is not None else [])
     gen_params  = [p for mod in gen_modules for p in mod.parameters()]
 
     # ---- reconstruction only ----
@@ -380,6 +435,8 @@ class GANTrainer:
         cosine_t_max: int = 10_000,
         accum_steps: int = 1,
         use_gan: bool = True,
+        probe_n_meshes: int = 0,
+        probe_bc_dim: int = 0,
     ):
         self.self_input_prob  = self_input_prob
         self.cosine_t_max     = cosine_t_max
@@ -388,6 +445,12 @@ class GANTrainer:
         self.use_gan          = use_gan
         self.cfg              = cfg
         self.model            = QuadtreeHFM(cfg) if cfg.use_quadtree else HFM(cfg)
+        # Loud, once, at construction: the flat-HFM run that ignored
+        # residual_prediction silently cost a full training run.  This prints the
+        # flag the MODEL actually holds, not what the config claims.
+        print(f'[trainer] model={type(self.model).__name__}  '
+              f'residual_prediction={getattr(self.model, "residual_prediction", "MISSING")}  '
+              f'time_strides={getattr(cfg, "time_strides", (1,))}')
         self.context_encoder  = ContextEncoder(cfg)
         # Complete GAN toggle: with use_gan=False the discriminator is never built,
         # trained, saved, or applied — training is pure reconstruction.
@@ -402,7 +465,9 @@ class GANTrainer:
         strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
         self.time_strides = strides
         self.stride_probe = (
-            StrideProbe(cfg.d_ctx, len(strides)) if len(strides) > 1 else None
+            ContextProbe(cfg.d_ctx, len(strides),
+                         n_meshes=probe_n_meshes, bc_dim=probe_bc_dim)
+            if len(strides) > 1 else None
         )
         self._stride_metrics: dict = {}
         self._last_stride: int = strides[0]
@@ -547,6 +612,7 @@ class GANTrainer:
         frames: List[torch.Tensor],
         pixel_mask: Optional[torch.Tensor] = None,
         mesh_ids: Optional[torch.Tensor] = None,
+        bc: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
         """frames: list of (n_context_frames + rollout_horizon) * max(time_strides) + 1
         tensors [B, C, H, W].  Each step samples one temporal stride s and trains on
@@ -606,8 +672,10 @@ class GANTrainer:
                 accum_steps=self.accum_steps,
                 micro_first=micro_first,
                 micro_last=micro_last,
-                stride_probe=self.stride_probe,
+                probe=self.stride_probe,
                 stride_label=s_idx,
+                probe_mesh_ids=mesh_ids,
+                probe_bc=bc,
                 stride_cls_weight=getattr(self.cfg, 'stride_cls_weight', 0.0),
                 metrics=self._stride_metrics,
             )

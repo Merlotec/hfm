@@ -63,7 +63,8 @@ def load_config() -> tuple[HFMConfig, dict]:
     # so the Lightning path honours ml_dims/ml_passes/ml_untie_passes/etc. instead of
     # silently using the HFMConfig defaults.
     ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
-               'ml_blocks_per_level', 'ml_untie_passes')
+               'ml_blocks_per_level', 'ml_untie_passes',
+               'residual_prediction', 'mask_aware_decoder')
     ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],
@@ -78,6 +79,8 @@ def load_config() -> tuple[HFMConfig, dict]:
         mlp_ratio              = m['mlp_ratio'],
         dropout                = m['dropout'],
         rollout_horizon        = m.get('rollout_horizon', 4),
+        time_strides           = tuple(m.get('time_strides', (1, 2, 4))),
+        stride_cls_weight      = m.get('stride_cls_weight', 0.1),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
         d_ctx                  = m['d_ctx'],
@@ -128,7 +131,10 @@ def main() -> None:
     n_epochs   = args.epochs    or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
     # context frames + input frame + one target per rollout step (matches scripts/train.py)
-    seq_len    = cfg.n_context_frames + 1 + getattr(cfg, 'rollout_horizon', 1)
+    # (context + rollout targets) at the LARGEST stride, + 1 — each training step
+    # subsamples every s-th frame from this window (see HFMLightningModule).
+    max_stride = max(getattr(cfg, 'time_strides', (1,)) or (1,))
+    seq_len    = (cfg.n_context_frames + getattr(cfg, 'rollout_horizon', 1)) * max_stride + 1
 
     # ---- pixel mask (loaded once in main process; moved to each GPU as a buffer) ----
     mesh_dirs = []

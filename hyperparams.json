@@ -19,7 +19,7 @@
     "dropout": 0.0,
 
     "_multilevel": "Fixed-quadtree QuadtreeHFM knobs (use_quadtree=true). d_patch/n_layers/patch_px/n_global_tokens above are legacy flat-HFM fields the quadtree ignores. ml_dims is a bell curve peaking at level 1; ml_passes is the non-increasing per-level self-attn budget (last = 'number of layers'). Tie/untie: ml_blocks_per_level gives each level that many distinct blocks cycled across its passes (1 = tied); ml_untie_passes=true overrides to one block per pass (fully untied, ~22.8M gen vs ~6M tied).",
-    "use_quadtree": false,
+    "use_quadtree": true,
     "ml_levels": 4,
     "ml_finest_px": 4,
     "ml_dims": [192, 384, 256, 96],

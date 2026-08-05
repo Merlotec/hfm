@@ -299,6 +299,11 @@ class HFM(nn.Module):
     def __init__(self, cfg: HFMConfig):
         super().__init__()
         self.cfg = cfg
+        # Same residual semantics as QuadtreeHFM: predict the frame-to-frame
+        # delta, out = x + f(x).  Without this the model must reconstruct the
+        # absolute field, whose error floor exceeds the small-stride delta —
+        # ratio then plateaus above 1 at stride 1 no matter how long it trains.
+        self.residual_prediction = getattr(cfg, 'residual_prediction', True)
         P  = cfg.n_patch            # grid side (16 for 256px / 16px patches)
         hd = cfg.d_patch // cfg.n_heads
 
@@ -373,6 +378,10 @@ class HFM(nn.Module):
         P       = self.cfg.n_patch
         n_patch = P * P
 
+        # Residual base: the CLEAN masked input, taken before the training noise
+        # so the noise does not land straight in the output.
+        x_base = x * pixel_mask if pixel_mask is not None else x
+
         # Perturb input during training for stochastic generation
         if self.training and self.cfg.noise_std > 0.0:
             x = x + torch.randn_like(x) * self.cfg.noise_std
@@ -406,7 +415,14 @@ class HFM(nn.Module):
                 tokens = layer(tokens, context, self.rope_cos, self.rope_sin)
 
         patch_tokens = tokens[:, :n_patch].reshape(B, P, P, self.cfg.d_patch)
-        return self.decoder(patch_tokens, skip_feats, pixel_mask=pixel_mask)
+        out = self.decoder(patch_tokens, skip_feats, pixel_mask=pixel_mask)
+
+        if self.residual_prediction:
+            # Zero-init decoder head => the model starts at exact persistence.
+            out = x_base + out
+            if pixel_mask is not None:
+                out = out * pixel_mask
+        return out
 
 
 def _checkpointed_layer(

@@ -27,7 +27,7 @@ from .data import FVMDataModule
 from .discriminator import HFMDiscriminator
 from .model import HFM
 from .quadtree import QuadtreeHFM
-from .trainer import FluidLoss
+from .trainer import FluidLoss, ContextProbe, probe_losses
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +60,7 @@ class HFMLightningModule(L.LightningModule):
         mesh_masks: Optional[torch.Tensor] = None,
         self_input_prob: float = 0.5,
         use_gan: bool = True,
+        probe_bc_dim: int = 8,
     ):
         super().__init__()
         self.automatic_optimization = False
@@ -77,6 +78,19 @@ class HFMLightningModule(L.LightningModule):
         self.discriminator   = HFMDiscriminator(cfg) if use_gan else None
         self.criterion       = FluidLoss(l1_weight, pixel_mask=pixel_mask)
 
+        # Multi-timestep training: each step samples a stride s from time_strides and
+        # trains on every s-th frame, so the timestep reaches the model only through
+        # the context (spacing of its input frames).  The probe recovers stride,
+        # geometry, and BC summary from the context alone — evidence + gradient
+        # pressure that the context carries them (see trainer.ContextProbe).
+        self.time_strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
+        n_meshes = 0 if mesh_masks is None else int(mesh_masks.shape[0])
+        self.stride_probe = (
+            ContextProbe(cfg.d_ctx, len(self.time_strides),
+                         n_meshes=n_meshes, bc_dim=probe_bc_dim)
+            if len(self.time_strides) > 1 else None
+        )
+
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
         else:
@@ -90,6 +104,7 @@ class HFMLightningModule(L.LightningModule):
         else:
             self.mesh_masks: Optional[torch.Tensor] = None
 
+        self._probe_metrics: dict = {}
         self._step_offset = 0   # set by load_from_pt to preserve GAN curriculum
         # Normalisation stats this run trains with — written into the checkpoint so
         # inference cannot silently use different stats (see infer.load_stats).
@@ -121,6 +136,11 @@ class HFMLightningModule(L.LightningModule):
                 self.discriminator.load_state_dict(ckpt['discriminator'], strict=False)
             except RuntimeError as e:
                 print(f'  [warn] discriminator not restored: {e}')
+        if self.stride_probe is not None and 'stride_probe' in ckpt:
+            try:
+                self.stride_probe.load_state_dict(ckpt['stride_probe'])
+            except RuntimeError as e:          # e.g. number of strides changed
+                print(f'  [warn] stride_probe not restored ({e}); starting fresh')
         saved_step = ckpt.get('global_step', 0)
         print(f'  Loaded .pt checkpoint (global_step={saved_step})')
         return saved_step
@@ -142,13 +162,29 @@ class HFMLightningModule(L.LightningModule):
             gen_opt = self.optimizers()            # type: ignore[assignment]
         scheduler = self.lr_schedulers()
 
-        # (frames, mesh_id) when the datamodule tags geometries, else bare frames
+        # (frames, mesh_id, bc) when the datamodule tags labels, else bare frames
+        mesh_ids = bc = None
         if isinstance(batch, (tuple, list)):
-            batch, mesh_ids = batch[0], batch[1]
-        else:
-            mesh_ids = None
+            mesh_ids = batch[1] if len(batch) > 1 else None
+            bc       = batch[2] if len(batch) > 2 else None
+            batch    = batch[0]
         frames = [batch[:, t] for t in range(batch.shape[1])]
         n        = self.cfg.n_context_frames
+
+        # ---- sample a temporal stride and subsample the frame sequence ----
+        # One stride per step (batch shares it — the subsample is on the time axis);
+        # the random start offset uses the slack left by smaller strides as temporal
+        # augmentation.  Mirrors GANTrainer.step exactly.
+        H = max(1, getattr(self.cfg, 'rollout_horizon', 1))
+        s_idx = int(torch.randint(len(self.time_strides), (1,)).item())
+        s = self.time_strides[s_idx]
+        need = (n + H) * s + 1
+        if need > len(frames):            # sequence too short for this stride
+            s_idx, s = 0, self.time_strides[0]
+            need = (n + H) * s + 1
+        off = int(torch.randint(len(frames) - need + 1, (1,)).item())
+        frames = frames[off : off + need : s]
+
         x_in     = frames[n]
         x_target = frames[n + 1]
         # per-sample geometry: index the mesh table, else fall back to the shared mask
@@ -158,6 +194,17 @@ class HFMLightningModule(L.LightningModule):
         adv_w    = self._adv_weight()
 
         context = self.context_encoder(frames[:n], pixel_mask=mask)
+
+        # ---- stride probe: recover the timestep from the context alone ----
+        probe_term = None
+        sacc = None
+        w_probe = getattr(self.cfg, 'stride_cls_weight', 0.0)
+        if self.stride_probe is not None and w_probe > 0.0:
+            pm = {}
+            probe_term = probe_losses(self.stride_probe, context, s_idx,
+                                      mesh_ids=mesh_ids, bc=bc, metrics=pm)
+            sacc = torch.tensor(pm.get('stride_acc', 0.0))
+            self._probe_metrics = pm
 
         # scheduled sampling (exposure-bias fix): with probability self_input_prob,
         # feed the model its own no-grad prediction of frame n instead of the GT —
@@ -206,13 +253,20 @@ class HFMLightningModule(L.LightningModule):
 
         # ---- reconstruction only (GAN off / pre-GAN) ----
         if adv_w == 0.0:
+            gen_loss = recon if probe_term is None else recon + w_probe * probe_term
             gen_opt.zero_grad()
-            self.manual_backward(recon)
+            self.manual_backward(gen_loss)
             self.clip_gradients(gen_opt, gradient_clip_val=1.0, gradient_clip_algorithm='norm')  # type: ignore[arg-type]
             gen_opt.step()
             scheduler.step()  # type: ignore[union-attr]
-            self.log_dict({'recon': recon, 'persist': persist, 'ratio': ratio},
-                          prog_bar=True, sync_dist=True)
+            logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
+                    's': float(s)}
+            if sacc is not None:
+                logs['sacc'] = sacc
+                for k in ('mesh_acc', 'bc_mse'):
+                    if k in self._probe_metrics:
+                        logs[k] = self._probe_metrics[k]
+            self.log_dict(logs, prog_bar=True, sync_dist=True)
             return
 
         assert pred_disc is not None
@@ -259,6 +313,8 @@ class HFMLightningModule(L.LightningModule):
             g_loss    = recon + adv_w * adv_loss
         else:
             g_loss = recon
+        if probe_term is not None:
+            g_loss = g_loss + w_probe * probe_term
 
         gen_opt.zero_grad()
         self.manual_backward(g_loss)
@@ -269,14 +325,19 @@ class HFMLightningModule(L.LightningModule):
         for p in self.discriminator.parameters():
             p.requires_grad_(True)
 
-        self.log_dict(
-            {'recon': recon, 'persist': persist, 'ratio': ratio,
-             'disc': d_loss, 'adv_w': adv_w},
-            prog_bar=True, sync_dist=True,
-        )
+        logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
+                'disc': d_loss, 'adv_w': adv_w, 's': float(s)}
+        if sacc is not None:
+            logs['sacc'] = sacc
+            for k in ('mesh_acc', 'bc_mse'):
+                if k in self._probe_metrics:
+                    logs[k] = self._probe_metrics[k]
+        self.log_dict(logs, prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):  # type: ignore[override]
         gen_params = list(self.model.parameters()) + list(self.context_encoder.parameters())
+        if self.stride_probe is not None:
+            gen_params += list(self.stride_probe.parameters())
         gen_opt  = optim.AdamW(gen_params,
                                lr=self.hparams['lr'],
                                weight_decay=self.hparams['weight_decay'])
@@ -307,6 +368,8 @@ class HFMLightningModule(L.LightningModule):
         checkpoint['context_encoder'] = self.context_encoder.state_dict()
         if self.discriminator is not None:
             checkpoint['discriminator'] = self.discriminator.state_dict()
+        if self.stride_probe is not None:
+            checkpoint['stride_probe'] = self.stride_probe.state_dict()
         checkpoint['cfg']             = self.cfg
         checkpoint['global_step']     = self.global_step
         # Pin the normalisation so inference reproduces training exactly.
