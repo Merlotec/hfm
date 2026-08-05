@@ -44,8 +44,17 @@ class HFMConfig:
     # Weight of the auxiliary stride-classification loss on the context tokens.
     # A small probe must recover the sampled stride from the context alone —
     # direct evidence (and gradient pressure) that the context actually encodes
-    # the timestep rather than collapsing to a constant.
-    stride_cls_weight: float = 0.1
+    # the timestep rather than collapsing to a constant.  0.5: at 0.1 the probe
+    # never learned stride 4 (sacc(s=4) pinned at ~0) and the model hedged with
+    # an average-magnitude delta.
+    stride_cls_weight: float = 0.5
+
+    # Normalise each rollout loss term by the persistence baseline for the same
+    # target (no-grad).  The raw loss scales with the delta size, so stride-4
+    # batches out-gradient stride-1 batches ~4:1 and the fine small-stride task
+    # is starved; normalised, every stride contributes O(1) gradient and the
+    # objective literally becomes "beat persistence".
+    persist_norm_loss: bool = True
 
     # --- context encoder ---
     n_context_frames: int = 5

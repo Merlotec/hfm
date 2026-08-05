@@ -84,7 +84,7 @@ def load_config() -> tuple[HFMConfig, dict]:
     # does list(...) on each).  '_'-prefixed keys are comments and are skipped.
     ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
                'ml_blocks_per_level', 'ml_untie_passes',
-               'residual_prediction', 'mask_aware_decoder')
+               'residual_prediction', 'mask_aware_decoder', 'persist_norm_loss')
     ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],
@@ -100,7 +100,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         dropout                = m['dropout'],
         rollout_horizon        = m.get('rollout_horizon', 4),
         time_strides           = tuple(m.get('time_strides', (1, 2, 4))),
-        stride_cls_weight      = m.get('stride_cls_weight', 0.1),
+        stride_cls_weight      = m.get('stride_cls_weight', 0.5),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
         d_ctx                  = m['d_ctx'],

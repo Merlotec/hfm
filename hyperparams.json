@@ -27,6 +27,10 @@
     "ml_blocks_per_level": [1, 1, 1, 1],
     "ml_untie_passes": true,
 
+    "_strides": "Multi-timestep training. stride_cls_weight scales the whole context-probe loss (stride+mesh+bc heads); 0.5 because at 0.1 the probe never learned stride 4 and the model hedged with an average delta. persist_norm_loss=true trains on loss/persistence per rollout term so every stride contributes O(1) gradient (raw loss lets stride-4 out-gradient stride-1 ~4:1) — the training objective becomes the logged ratio.",
+    "stride_cls_weight": 0.5,
+    "persist_norm_loss": true,
+
     "_residual": "residual_prediction=true: model predicts the frame-to-frame DELTA (out = x + f(x)); a zero-init decoder then starts at exact persistence. MUST match how the checkpoint being loaded was trained — inference on an absolute-trained checkpoint with this on doubles the field each step and explodes (infer.py --no-residual works around). mask_aware_decoder feeds the geometry mask to the decoder convs.",
     "residual_prediction": true,
     "mask_aware_decoder": true,

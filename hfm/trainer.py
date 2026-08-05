@@ -171,6 +171,7 @@ def train_step_gan(
     disc_update_threshold: float = 0.3,
     self_input_prob: float = 0.0,
     rollout_horizon: int = 1,
+    persist_norm: bool = False,
     accum_steps: int = 1,
     micro_first: bool = True,
     micro_last: bool = True,
@@ -260,20 +261,33 @@ def train_step_gan(
     # first step) is also what the discriminator / adv term operate on below, so
     # the GAN behaviour is unchanged relative to single-step training.
     horizon = max(1, min(rollout_horizon, len(frames) - n_context - 1))
-    recon_terms = []
+    recon_terms = []                      # raw loss, logged
+    norm_terms = []                       # persistence-normalised, trained
     pred_masked = None
     x_cur = x_in
     for k in range(horizon):
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             pred_k = model(x_cur, context, pixel_mask=pixel_mask)
         pred_k = pred_k.float() * pixel_mask if pixel_mask is not None else pred_k.float()
-        recon_terms.append(criterion(pred_k, frames[n_context + 1 + k],
-                                     pixel_mask=pixel_mask))
+        target = frames[n_context + 1 + k]
+        term = criterion(pred_k, target, pixel_mask=pixel_mask)
+        recon_terms.append(term)
+        if persist_norm:
+            # Per-term persistence baseline from the CLEAN input frame (not the
+            # scheduled-sampling replacement), so the normaliser is a stable
+            # scale reference.  Floor guards near-static windows from blowing
+            # the division up; typical baselines run 0.01 (s=1) to 0.1+ (s=4).
+            with torch.no_grad():
+                base = criterion(frames[n_context], target, pixel_mask=pixel_mask)
+            norm_terms.append(term / base.clamp_min(5e-3))
         if pred_masked is None:
             pred_masked = pred_k          # first step feeds the GAN, as before
         x_cur = pred_k                    # feed prediction forward (keeps grad)
     assert pred_masked is not None
     recon_rollout = torch.stack(recon_terms).mean()
+    # What the generator actually optimises: relative-to-persistence error when
+    # normalisation is on (== the logged `ratio`), else the raw loss.
+    gen_recon = torch.stack(norm_terms).mean() if persist_norm else recon_rollout
 
     def _zero_and_restore() -> None:
         gen_optimizer.zero_grad()
@@ -290,9 +304,9 @@ def train_step_gan(
 
     # ---- reconstruction only ----
     if adv_weight == 0.0:
-        recon_loss = recon_rollout
-        gen_loss = recon_loss if probe_term is None \
-            else recon_loss + stride_cls_weight * probe_term
+        recon_loss = recon_rollout        # raw value, for the log
+        gen_loss = gen_recon if probe_term is None \
+            else gen_recon + stride_cls_weight * probe_term
         # NaN bail must be GLOBAL: if one rank bailed while others proceeded to a
         # collective (DDP reducer or host allreduce), the job would hang/diverge.
         (bad,) = allreduce_stats(0.0 if torch.isfinite(gen_loss) else 1.0)
@@ -363,7 +377,7 @@ def train_step_gan(
     for p in discriminator.parameters():
         p.requires_grad_(False)
 
-    recon_loss = recon_rollout
+    recon_loss = recon_rollout            # raw value, for the log
 
     disc_healthy = disc_update_threshold < d_gate < 2.0   # same GLOBAL gate as above
     if disc_healthy:
@@ -372,9 +386,9 @@ def train_step_gan(
         adv_loss = F.binary_cross_entropy_with_logits(
             adv_logit, torch.ones_like(adv_logit)
         )
-        total_loss = recon_loss + adv_weight * adv_loss
+        total_loss = gen_recon + adv_weight * adv_loss
     else:
-        total_loss = recon_loss
+        total_loss = gen_recon
     if probe_term is not None:
         total_loss = total_loss + stride_cls_weight * probe_term
     (bad,) = allreduce_stats(0.0 if torch.isfinite(total_loss) else 1.0)
@@ -669,6 +683,7 @@ class GANTrainer:
                 disc_update_threshold=self.disc_update_threshold,
                 self_input_prob=self.self_input_prob,
                 rollout_horizon=getattr(self.cfg, 'rollout_horizon', 1),
+                persist_norm=getattr(self.cfg, 'persist_norm_loss', False),
                 accum_steps=self.accum_steps,
                 micro_first=micro_first,
                 micro_last=micro_last,

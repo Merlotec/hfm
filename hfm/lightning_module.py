@@ -223,37 +223,46 @@ class HFMLightningModule(L.LightningModule):
         # horizon targets; pred_0 (first step) is what the GAN/adv term operates on, so
         # GAN behaviour matches single-step training.
         horizon = max(1, min(getattr(self.cfg, 'rollout_horizon', 1), len(frames) - n - 1))
-        recon_terms = []
+        persist_norm = getattr(self.cfg, 'persist_norm_loss', False)
+        recon_terms = []           # raw loss, logged
+        norm_terms = []            # persistence-normalised, trained
+        base_terms = []            # per-term persistence baseline (clean GT input)
         x_cur = x_in
         pred_disc = None           # first-step prediction, holes zeroed, for the GAN
         for k in range(horizon):
             pred_k = self.model(x_cur, context, pixel_mask=mask)
             # Unmasked for the criterion (gradient flows through holes via the hole
             # loss); masked copy is fed forward and used by the discriminator.
-            recon_terms.append(self.criterion(pred_k, frames[n + 1 + k],
-                                              pixel_mask=mask))
+            target = frames[n + 1 + k]
+            term = self.criterion(pred_k, target, pixel_mask=mask)
+            recon_terms.append(term)
+            # Baseline from the CLEAN GT input frame (not the scheduled-sampling
+            # replacement) so the normaliser — and the logged ratio — are stable
+            # scale references.  Floor guards near-static windows.
+            with torch.no_grad():
+                base_terms.append(self.criterion(frames[n], target, pixel_mask=mask))
+            norm_terms.append(term / base_terms[-1].clamp_min(5e-3))
             pred_k_m = pred_k.float() * mask if mask is not None else pred_k.float()
             if pred_disc is None:
                 pred_disc = pred_k_m
             x_cur = pred_k_m       # feed prediction forward, keeps grad
         recon = torch.stack(recon_terms).mean()
 
-        # Persistence baseline, matched to the SAME rollout: "predict no change" scored
-        # against every horizon target, exactly as recon is.  A single-step baseline is
-        # wrong here — the field drifts further from x_in at each step, so an EXACT
-        # persistence model (which is what a zero-init residual model is) scores ~4.9x
-        # the 1-step loss at horizon 4, and `ratio` would start ~4.9 rather than 1.
-        # Matched this way, ratio == 1 means "as good as persistence" and < 1 means the
-        # model genuinely beats it — at any horizon.
+        # Persistence baseline matched to the SAME rollout ("predict no change"
+        # scored against every horizon target): ratio == 1 means "as good as
+        # persistence", < 1 genuinely beats it — at any horizon or stride.
         with torch.no_grad():
-            persist = torch.stack(
-                [self.criterion(x_in, frames[n + 1 + k], pixel_mask=mask)
-                 for k in range(horizon)]).mean()
+            persist = torch.stack(base_terms).mean()
             ratio   = recon.detach() / persist.clamp(min=1e-8)
+
+        # What the generator optimises: relative-to-persistence error when
+        # normalisation is on (each stride then contributes O(1) gradient instead
+        # of the raw loss's ~4:1 skew toward large strides), else the raw loss.
+        gen_recon = torch.stack(norm_terms).mean() if persist_norm else recon
 
         # ---- reconstruction only (GAN off / pre-GAN) ----
         if adv_w == 0.0:
-            gen_loss = recon if probe_term is None else recon + w_probe * probe_term
+            gen_loss = gen_recon if probe_term is None else gen_recon + w_probe * probe_term
             gen_opt.zero_grad()
             self.manual_backward(gen_loss)
             self.clip_gradients(gen_opt, gradient_clip_val=1.0, gradient_clip_algorithm='norm')  # type: ignore[arg-type]
@@ -310,9 +319,9 @@ class HFMLightningModule(L.LightningModule):
         if disc_healthy:
             adv_logit = self.discriminator(pred_disc, x_in_d, context)
             adv_loss  = F.binary_cross_entropy_with_logits(adv_logit, torch.ones_like(adv_logit))
-            g_loss    = recon + adv_w * adv_loss
+            g_loss    = gen_recon + adv_w * adv_loss
         else:
-            g_loss = recon
+            g_loss = gen_recon
         if probe_term is not None:
             g_loss = g_loss + w_probe * probe_term
 
