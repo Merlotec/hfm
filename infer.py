@@ -282,6 +282,18 @@ def main():
                         help='Force residual_prediction=False (for checkpoints trained '
                              'as absolute predictors, where adding the residual at '
                              'inference double-counts the input and blows up the rollout)')
+    parser.add_argument('--refine', type=str, default=None,
+                        help='Path to a flow-matching refiner checkpoint '
+                             '(scripts/train_refiner.py). Samples high-frequency '
+                             'detail on top of each prediction.')
+    parser.add_argument('--refine-steps', type=int, default=6,
+                        help='Euler ODE steps for the refiner sampler')
+    parser.add_argument('--refine-feedback', action='store_true',
+                        help='Feed REFINED frames back into the autoregressive '
+                             'loop. Default off: refined frames are output-only '
+                             'and the un-refined prediction remains the AR state.')
+    parser.add_argument('--refine-seed', type=int, default=None,
+                        help='Seed for the refiner noise (reproducible samples)')
     parser.add_argument('--teacher-forcing', action='store_true',
                         help='Feed the GROUND-TRUTH frame as input at every step instead '
                              'of the model\'s own previous prediction. Turns the rollout '
@@ -331,6 +343,32 @@ def main():
             print('  Discriminator loaded for saliency.')
         else:
             print('  [warn] no discriminator in checkpoint — skipping saliency')
+
+    # ---- optional flow-matching refiner ----
+    refiner = None
+    refiner_sigma = None
+    refine_gen = None
+    if args.refine:
+        from hfm.refiner import RefinerUNet, sample_detail
+        print(f'\nLoading refiner: {args.refine}')
+        rck = torch.load(args.refine, map_location='cpu', weights_only=False)
+        refiner = RefinerUNet(rck['refiner_cfg']).to(device)
+        refiner.load_state_dict(rck.get('refiner_ema', rck['refiner']))
+        refiner.eval()
+        refiner_sigma = rck['sigma_d'].to(device)
+        # A refiner is only valid for the base it was trained against.
+        if str(rck.get('base_global_step')) != str(step):
+            print(f'  [WARN] refiner was trained against base step '
+                  f'{rck.get("base_global_step")}, but this base is step {step} '
+                  f'— refined output may be miscalibrated')
+        if rck.get('norm_mean') is not None and ckpt.get('norm_mean') is not None \
+                and rck['norm_mean'] != ckpt['norm_mean']:
+            print('  [WARN] refiner/base normalisation stats differ!')
+        if args.refine_seed is not None:
+            refine_gen = torch.Generator(device=device)
+            refine_gen.manual_seed(args.refine_seed)
+        print(f'  refiner loaded (EMA={"refiner_ema" in rck}, '
+              f'steps={args.refine_steps}, feedback={args.refine_feedback})')
 
     n_context = args.n_context if args.n_context is not None else cfg.n_context_frames
 
@@ -396,15 +434,29 @@ def main():
         mode = 'teacher-forced (GT input each step)' if args.teacher_forcing else 'autoregressive rollout'
         print(f'  prediction mode: {mode}')
         preds          = []
+        preds_refined  = []
         gt             = []
         saliency_fakes = []
         saliency_reals = []
         x = frames_gt[n_context]
+        ctx_vec = context.float().mean(dim=1) if refiner is not None else None
 
         with torch.no_grad():
             for t in range(args.n_predict):
                 pred = model(x, context, pixel_mask=pixel_mask)
                 pred = pred.float() * pixel_mask
+
+                refined = None
+                if refiner is not None:
+                    from hfm.refiner import sample_detail
+                    # x is the frame the base stepped FROM — the refiner's
+                    # conditioning matches its training pairs exactly.
+                    d_hat = sample_detail(refiner, pred, x, pixel_mask, ctx_vec,
+                                          refiner_sigma, n_steps=args.refine_steps,
+                                          generator=refine_gen)
+                    refined = (pred + d_hat) * pixel_mask
+                    preds_refined.append(refined.cpu())
+
                 preds.append(pred.cpu())
                 gt.append(frames_gt[n_context + t].cpu())
 
@@ -418,9 +470,13 @@ def main():
                     saliency_reals.append(disc_saliency(discriminator, x_in_t, x_in_t, context))
 
                 # Next input: the true frame under teacher forcing, else the prediction.
+                # With --refine-feedback the REFINED frame re-enters the loop;
+                # default keeps the un-refined pred as the AR state (the base
+                # never trained on refined inputs).
                 aw = 0.5
                 true_frame = frames_gt[n_context + t + 1]
-                x = true_frame * aw + pred * (1.0 - aw) if args.teacher_forcing else pred
+                ar_state = refined if (args.refine_feedback and refined is not None) else pred
+                x = true_frame * aw + ar_state * (1.0 - aw) if args.teacher_forcing else ar_state
 
         # ---- save outputs ----
         gt_arr   = torch.cat(gt,    dim=0).numpy()
@@ -432,6 +488,16 @@ def main():
         np.save(run_out / 'frames_pred.npy',      pred_arr)
         np.save(run_out / 'frames_gt_phys.npy',  gt_phys)
         np.save(run_out / 'frames_pred_phys.npy', pred_phys)
+
+        # Refined outputs saved ALONGSIDE the raw prediction (never replacing
+        # it) so the two can be compared; viewer/PNGs show the refined frames.
+        show_arr, show_phys = pred_arr, pred_phys
+        if preds_refined:
+            refined_arr  = torch.cat(preds_refined, dim=0).numpy()
+            refined_phys = denorm(refined_arr, mean, std) * pixel_mask.cpu().numpy()
+            np.save(run_out / 'frames_pred_refined.npy',      refined_arr)
+            np.save(run_out / 'frames_pred_refined_phys.npy', refined_phys)
+            show_arr, show_phys = refined_arr, refined_phys
 
         # Seed frames = context frames PLUS the input frame gt[n_context].  Including
         # the input frame means the viewer's first predicted delta is pred[0]-input
@@ -446,7 +512,7 @@ def main():
                   + timestamps[n_context + 1: n_context + 1 + args.n_predict])
         save_viewer_frames(
             seed_phys  = seed_phys,
-            pred_phys  = pred_phys,
+            pred_phys  = show_phys,
             timestamps = all_ts,
             n_seed     = n_context + 1,
             run_name   = sim_dir.name,
@@ -454,7 +520,7 @@ def main():
         )
 
         if not args.no_images:
-            save_images(gt_arr, pred_arr, run_out, mean, std)
+            save_images(gt_arr, show_arr, run_out, mean, std)
 
         if discriminator is not None and saliency_fakes:
             save_disc_saliency(saliency_fakes, saliency_reals, pred_phys, gt_phys, run_out)
