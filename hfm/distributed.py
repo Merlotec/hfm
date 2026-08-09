@@ -84,20 +84,33 @@ def pick_device(local_rank: int = 0) -> torch.device:
 
 
 def _ddp_backend(device: torch.device) -> str:
+    """Backend spec for init_process_group.
+
+    Device-only backends (nccl/xccl/ccl) are always paired with gloo for CPU
+    tensors, via the 'cpu:gloo,xpu:xccl' map syntax.  The helpers here
+    deliberately run some collectives on the HOST (allreduce_stats stages
+    float64 scalars on cpu so every rank makes identical control-flow
+    decisions), and an xccl-only group cannot carry them: the first NaN-gate of
+    the first step dies with "No backend type associated with device type cpu".
+    A device-only HFM_DDP_BACKEND override gets the same pairing; a map-style
+    override (containing ':') is passed through untouched.
+    """
     override = os.environ.get('HFM_DDP_BACKEND')
     if override:
-        return override
+        if ':' in override or override == 'gloo':
+            return override
+        return f'cpu:gloo,{device.type}:{override}'
     if device.type == 'cuda':
-        return 'nccl'
+        return 'cpu:gloo,cuda:nccl'
     if device.type == 'xpu':
-        # torch >= 2.7 ships a native XCCL backend for XPU — no oneccl_bindings
+        # torch >= 2.7 ships a native XCCL backend for XPU -- no oneccl_bindings
         # needed.  Fall back to the 'ccl' bindings on older stacks.
         try:
             if torch.distributed.is_xccl_available():   # type: ignore[attr-defined]
-                return 'xccl'
+                return 'cpu:gloo,xpu:xccl'
         except Exception:
             pass
-        return 'ccl'          # oneCCL via oneccl_bindings_for_pytorch (torch-ccl)
+        return 'cpu:gloo,xpu:ccl'   # oneCCL via oneccl_bindings_for_pytorch
     return 'gloo'
 
 
