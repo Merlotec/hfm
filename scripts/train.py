@@ -168,6 +168,11 @@ def main():
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
     parser.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR,
                         help='Dataset directory containing simulation subdirs')
+    parser.add_argument('--settle-time', type=float, default=0.0,
+                        help='Sim-time (s) to discard from the front of COLD-START '
+                             'runs only, where an impulsive start makes the field '
+                             'change ~140x faster than developed flow. 0.7 is the '
+                             'measured settling time; 0 keeps everything.')
     parser.add_argument('--val-fraction', type=float, default=0.05,
                         help='Fraction of RUNS held out of training for validation '
                              '(0 disables). Split is deterministic per run name.')
@@ -237,6 +242,7 @@ def main():
         return_mesh_id = True,
         val_fraction   = args.val_fraction,
         n_context      = ctx_n,
+        settle_time    = args.settle_time,
     )
     dm.setup()
 

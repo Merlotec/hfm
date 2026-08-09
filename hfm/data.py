@@ -373,6 +373,47 @@ CTX_PARAM_KEYS = (
 CTX_MODEL_CHOICES = ('Newtonian', 'PowerLaw', 'Carreau', 'HerschelBulkley')
 
 
+def _is_cold_start(sim_dir: Path) -> bool:
+    """True when this run begins from an initial condition rather than continuing
+    a developed field.
+
+    gen_alternating chains segments: segment 0 starts from the IC, and segments
+    1..n-1 hand off the previous segment's final state, so only segment 0 carries
+    a startup transient.  ic.json records segment_id; runs without it (run_gen's
+    independent trajectories) are always cold starts."""
+    try:
+        return int(json.loads((sim_dir / 'ic.json').read_text())['segment_id']) == 0
+    except Exception:
+        return True
+
+
+def _settle_skip(files: "list[Path]", settle_time: float, cold: bool) -> int:
+    """Frames to drop from the front of a cold-start run.
+
+    Measured decay of the one-step persistence loss after an impulsive start
+    (dt=0.01 data, per unit sim time):
+
+        0.00-0.05 s  1.635      0.40-0.70 s  0.077
+        0.05-0.10 s  1.221      0.70-1.00 s  0.012
+        0.10-0.20 s  0.829      1.00-1.50 s  0.003
+        0.20-0.40 s  0.301      2.50-4.00 s  0.0008
+
+    so the field settles by roughly 0.7 s, a 140x drop.  The cut is in SIM TIME,
+    not frames, because a segment spans steps_per_segment * save_t: at
+    save_t=0.01 all 30 frames sit inside the transient, while at save_t=0.2 only
+    the first four do.  A frame-count cut would be wrong at both ends.
+    """
+    if settle_time <= 0.0 or not cold:
+        return 0
+    for i, f in enumerate(files):
+        try:
+            if float(f.stem[2:]) >= settle_time:
+                return i
+        except ValueError:
+            return 0
+    return len(files)          # whole run is transient
+
+
 def _read_context_params(sim_dir: Path) -> "tuple[Optional[torch.Tensor], int]":
     """(continuous context vector, viscosity-model class) for one run.
 
@@ -441,9 +482,14 @@ class FVMSequenceDataset(Dataset):
         paths_override: "Optional[list[Path]]" = None,
         n_context:   Optional[int] = None,
         ctx_random:  bool = True,
+        settle_time: float = 0.0,
     ):
-        files = paths_override if paths_override is not None else \
-            _frame_files(sim_dir)[first_frame:]
+        if paths_override is not None:
+            files = paths_override
+        else:
+            files = _frame_files(sim_dir)[first_frame:]
+            files = files[_settle_skip(files, settle_time,
+                                       _is_cold_start(sim_dir)):]
         self.paths      = files
         self.renderer   = renderer
         self.seq_len    = seq_len
@@ -620,10 +666,11 @@ class FVMSequenceDataset(Dataset):
                    first_frame: int = 0,
                    mesh_id: Optional[int] = None,
                    n_context: Optional[int] = None,
-                   ctx_random: bool = True) -> "FVMSequenceDataset":
+                   ctx_random: bool = True,
+                   settle_time: float = 0.0) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
-        files = _frame_files(sim_dir)
-        files = files[first_frame:]
+        files = _frame_files(sim_dir)[first_frame:]
+        files = files[_settle_skip(files, settle_time, _is_cold_start(sim_dir)):]
         m = mean.view(-1, 1, 1)
         s = std.view(-1, 1, 1)
         cache = []
@@ -646,7 +693,8 @@ class FVMSequenceDataset(Dataset):
                 sim_dir, f'only {len(cache)} readable frames, need {seq_len}')
         return cls(sim_dir, renderer, seq_len, mean, std, first_frame,
                    frame_cache=cache, mesh_id=mesh_id, paths_override=files,
-                   n_context=n_context, ctx_random=ctx_random)
+                   n_context=n_context, ctx_random=ctx_random,
+                   settle_time=settle_time)
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +737,11 @@ class FVMDataModule:
         # random causal position in the run instead of always the frames directly
         # before the prediction (see FVMSequenceDataset._window).
         n_context: Optional[int] = None,
+        # Sim-time to discard from the front of COLD-START runs only (0 = keep
+        # everything).  Unlike first_frame this is a physical criterion applied
+        # only where there is actually a transient, so continuation segments keep
+        # all 30 of their frames.
+        settle_time: float = 0.0,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
@@ -707,6 +760,7 @@ class FVMDataModule:
         self.return_mesh_id = return_mesh_id
         self.val_fraction = val_fraction
         self.n_context = n_context
+        self.settle_time = settle_time
         self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
         self._val_dataset: Optional[Dataset] = None
 
@@ -762,6 +816,7 @@ class FVMDataModule:
                     d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
                     mesh_id=(mi if self.return_mesh_id else None),
                     n_context=self.n_context,
+                    settle_time=self.settle_time,
                     # Validation stays DETERMINISTIC: a random context would make
                     # the val metric a different measurement every epoch, and the
                     # whole point of the ratio is that its movement means something.

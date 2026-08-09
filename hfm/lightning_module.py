@@ -438,9 +438,11 @@ class FVMLightningDataModule(L.LightningDataModule):
         return_mesh_id: bool = True,
         val_fraction: float = 0.05,
         n_context: Optional[int] = None,
+        settle_time: float = 0.0,
     ):
         super().__init__()
         self._n_context = n_context
+        self._settle_time = settle_time
         self._return_mesh_id = return_mesh_id
         self._val_fraction = val_fraction
         self._data_dir    = data_dir
@@ -462,6 +464,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             return_mesh_id = self._return_mesh_id,
             val_fraction   = self._val_fraction,
             n_context      = self._n_context,
+            settle_time    = self._settle_time,
         )
 
     def prepare_data(self) -> None:
