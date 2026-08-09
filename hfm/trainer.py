@@ -95,29 +95,47 @@ class ContextProbe(nn.Module):
            and lets the model interpolate and extrapolate along the timestep axis
            rather than memorising a handful of classes.
 
-      bc : per-run boundary-condition summary (regression, z-scored) -- the
-           run-specific forcing that a single field frame does not reveal.
+      ctx: the hidden per-segment PHYSICS (regression on 8 z-scored parameters,
+           plus a 4-way classification of the viscosity model).  This is the label
+           gen_alternating exists to teach: viscosity, its shear-thinning
+           exponent, bulk viscosity, thermal conductivity, C_v and gamma are all
+           resampled per segment and are invisible in any single frame -- they can
+           only be inferred from how the field MOVES.  Without this head the probe
+           supervised only dt and the freestream.
+
+      bc : per-run boundary-condition summary (regression, z-scored).  Note this
+           is fixed per TRAJECTORY, not per segment (gen_alternating draws the
+           freestream once and holds it across the chain), so it is genuine
+           physics but it also identifies the trajectory -- read it alongside the
+           ctx head rather than on its own.
 
     Trained jointly with a small weight, each head both MEASURES whether the
     information is present in the context and applies gradient pressure on the
     encoder to put it there: a collapsed/constant context satisfies neither.
     """
 
-    def __init__(self, d_ctx: int, bc_dim: int = 0, **_legacy):
+    def __init__(self, d_ctx: int, bc_dim: int = 0, ctx_dim: int = 0,
+                 n_visc_models: int = 0, **_legacy):
         super().__init__()
         h = d_ctx // 2
         self.trunk = nn.Sequential(
             nn.LayerNorm(d_ctx), nn.Linear(d_ctx, h), nn.GELU(),
         )
-        self.dt_head = nn.Linear(h, 1)
-        self.bc_head = nn.Linear(h, bc_dim) if bc_dim > 0 else None
+        self.dt_head   = nn.Linear(h, 1)
+        self.bc_head   = nn.Linear(h, bc_dim) if bc_dim > 0 else None
+        self.ctx_head  = nn.Linear(h, ctx_dim) if ctx_dim > 0 else None
+        self.visc_head = nn.Linear(h, n_visc_models) if n_visc_models > 0 else None
 
     def forward(self, context: torch.Tensor) -> dict:
-        """context: [B, K, d_ctx] -> {'log_dt': [B], 'bc': [B, D]?}."""
+        """context: [B, K, d_ctx] -> dict of head outputs."""
         z = self.trunk(context.mean(dim=1))
         out = {'log_dt': self.dt_head(z).squeeze(-1)}
         if self.bc_head is not None:
             out['bc'] = self.bc_head(z)
+        if self.ctx_head is not None:
+            out['ctx'] = self.ctx_head(z)
+        if self.visc_head is not None:
+            out['visc'] = self.visc_head(z)
         return out
 
 
@@ -126,6 +144,8 @@ def probe_losses(
     context: torch.Tensor,
     dt: Optional[torch.Tensor] = None,
     bc: Optional[torch.Tensor] = None,
+    ctx: Optional[torch.Tensor] = None,
+    ctx_cls: Optional[torch.Tensor] = None,
     metrics: Optional[dict] = None,
 ) -> torch.Tensor:
     """
@@ -164,6 +184,27 @@ def probe_losses(
             if metrics is not None:
                 metrics['bc_mse'] = float(err.item())
 
+    if 'ctx' in out and ctx is not None:
+        tgt = ctx.to(dev).float()
+        valid = torch.isfinite(tgt).all(dim=-1)                     # [B]
+        if bool(valid.any()):
+            err = (out['ctx'].float()[valid] - tgt[valid]).pow(2).mean()
+            total = total + err
+            if metrics is not None:
+                metrics['ctx_mse'] = float(err.item())
+
+    if 'visc' in out and ctx_cls is not None:
+        lbl = ctx_cls.to(dev).long()
+        valid = lbl >= 0                     # -1 marks "not recorded for this run"
+        if bool(valid.any()):
+            logits = out['visc'].float()[valid]
+            err = F.cross_entropy(logits, lbl[valid])
+            total = total + err
+            if metrics is not None:
+                metrics['visc_ce'] = float(err.item())
+                metrics['visc_acc'] = float(
+                    (logits.argmax(-1) == lbl[valid]).float().mean().item())
+
     return total
 
 
@@ -193,6 +234,8 @@ def train_step_gan(
     probe: Optional[nn.Module] = None,
     probe_dt: Optional[torch.Tensor] = None,
     probe_bc: Optional[torch.Tensor] = None,
+    probe_ctx: Optional[torch.Tensor] = None,
+    probe_ctx_cls: Optional[torch.Tensor] = None,
     stride_cls_weight: float = 0.0,
     metrics: Optional[dict] = None,
 ) -> Tuple[float, float]:
@@ -257,6 +300,7 @@ def train_step_gan(
     if probe is not None and probe_dt is not None and stride_cls_weight > 0.0:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             probe_term = probe_losses(probe, context, dt=probe_dt, bc=probe_bc,
+                                      ctx=probe_ctx, ctx_cls=probe_ctx_cls,
                                       metrics=metrics)
 
     # ---- scheduled sampling: sometimes feed the model its own prediction ----
@@ -463,6 +507,8 @@ class GANTrainer:
         accum_steps: int = 1,
         use_gan: bool = True,
         probe_bc_dim: int = 0,
+        probe_ctx_dim: int = 0,
+        probe_n_visc_models: int = 0,
         **_legacy_probe_args,
     ):
         self.self_input_prob  = self_input_prob
@@ -492,7 +538,9 @@ class GANTrainer:
         # single stride, and the BC head is useful regardless.
         strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
         self.time_strides = strides
-        self.stride_probe = ContextProbe(cfg.d_ctx, bc_dim=probe_bc_dim)
+        self.stride_probe = ContextProbe(
+            cfg.d_ctx, bc_dim=probe_bc_dim, ctx_dim=probe_ctx_dim,
+            n_visc_models=probe_n_visc_models)
         self._stride_metrics: dict = {}
         self._last_stride: int = strides[0]
 
@@ -663,6 +711,8 @@ class GANTrainer:
         mesh_ids: Optional[torch.Tensor] = None,
         bc: Optional[torch.Tensor] = None,
         save_t: Optional[torch.Tensor] = None,
+        ctx: Optional[torch.Tensor] = None,
+        ctx_cls: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
         """frames: list of (n_context_frames + rollout_horizon) * max(time_strides) + 1
         tensors [B, C, H, W].  Each step samples one temporal stride s and trains on
@@ -735,6 +785,8 @@ class GANTrainer:
                 probe=self.stride_probe,
                 probe_dt=dt,
                 probe_bc=bc,
+                probe_ctx=ctx,
+                probe_ctx_cls=ctx_cls,
                 stride_cls_weight=getattr(self.cfg, 'stride_cls_weight', 0.0),
                 metrics=self._stride_metrics,
             )

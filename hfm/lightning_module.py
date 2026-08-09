@@ -61,6 +61,8 @@ class HFMLightningModule(L.LightningModule):
         self_input_prob: float = 0.5,
         use_gan: bool = True,
         probe_bc_dim: int = 8,
+        probe_ctx_dim: int = 0,
+        probe_n_visc_models: int = 0,
     ):
         super().__init__()
         self.automatic_optimization = False
@@ -85,7 +87,9 @@ class HFMLightningModule(L.LightningModule):
         # REGRESSES log(dt) from the context alone, plus the BC summary — evidence
         # + gradient pressure that the context carries them (trainer.ContextProbe).
         self.time_strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
-        self.stride_probe = ContextProbe(cfg.d_ctx, bc_dim=probe_bc_dim)
+        self.stride_probe = ContextProbe(
+            cfg.d_ctx, bc_dim=probe_bc_dim, ctx_dim=probe_ctx_dim,
+            n_visc_models=probe_n_visc_models)
 
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
@@ -168,12 +172,14 @@ class HFMLightningModule(L.LightningModule):
             gen_opt = self.optimizers()            # type: ignore[assignment]
         scheduler = self.lr_schedulers()
 
-        # (frames, mesh_id, bc, save_t) when the datamodule tags labels, else frames
-        mesh_ids = bc = save_t = None
+        # (frames, mesh_id, bc, save_t, ctx, ctx_cls) when tagged, else bare frames
+        mesh_ids = bc = save_t = ctx_vec = ctx_cls = None
         if isinstance(batch, (tuple, list)):
             mesh_ids = batch[1] if len(batch) > 1 else None
             bc       = batch[2] if len(batch) > 2 else None
             save_t   = batch[3] if len(batch) > 3 else None
+            ctx_vec  = batch[4] if len(batch) > 4 else None
+            ctx_cls  = batch[5] if len(batch) > 5 else None
             batch    = batch[0]
         frames = [batch[:, t] for t in range(batch.shape[1])]
         n        = self.cfg.n_context_frames
@@ -212,8 +218,8 @@ class HFMLightningModule(L.LightningModule):
         w_probe = getattr(self.cfg, 'stride_cls_weight', 0.0)
         if self.stride_probe is not None and w_probe > 0.0:
             pm = {}
-            probe_term = probe_losses(self.stride_probe, context,
-                                      dt=dt, bc=bc, metrics=pm)
+            probe_term = probe_losses(self.stride_probe, context, dt=dt, bc=bc,
+                                      ctx=ctx_vec, ctx_cls=ctx_cls, metrics=pm)
             self._probe_metrics = pm
             probed = True
 
@@ -282,7 +288,7 @@ class HFMLightningModule(L.LightningModule):
             logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                     's': float(s)}
             if probed:
-                for k in ('dt_mse', 'dt_rel_err', 'bc_mse'):
+                for k in ('dt_mse', 'dt_rel_err', 'bc_mse', 'ctx_mse', 'visc_acc'):
                     if k in self._probe_metrics:
                         logs[k] = self._probe_metrics[k]
             self.log_dict(logs, prog_bar=True, sync_dist=True)
@@ -347,7 +353,7 @@ class HFMLightningModule(L.LightningModule):
         logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                 'disc': d_loss, 'adv_w': adv_w, 's': float(s)}
         if probed:
-            for k in ('dt_mse', 'dt_rel_err', 'bc_mse'):
+            for k in ('dt_mse', 'dt_rel_err', 'bc_mse', 'ctx_mse', 'visc_acc'):
                 if k in self._probe_metrics:
                     logs[k] = self._probe_metrics[k]
         self.log_dict(logs, prog_bar=True, sync_dist=True)

@@ -354,6 +354,49 @@ def _frame_files(sim_dir: Path) -> "list[Path]":
     )
 
 
+# The per-segment physics context.  gen_alternating resamples every one of these
+# for each segment and writes them into that segment's params.json; the freestream
+# (ic_param_specs) is fixed per TRAJECTORY, so these are the only labels that
+# actually distinguish one segment from the next.  Loguniform-sampled parameters
+# are regressed in log space, which is both the space they were drawn from and the
+# one where a factor-of-two error costs the same at either end of the range.
+CTX_PARAM_KEYS = (
+    ('visc_n',           False),
+    ('visc_min_factor',  False),
+    ('visc_gamma_scale', True),
+    ('viscosity',        True),
+    ('visc_bulk',        True),
+    ('thermal_cond',     True),
+    ('C_v',              False),
+    ('gamma',            False),
+)
+CTX_MODEL_CHOICES = ('Newtonian', 'PowerLaw', 'Carreau', 'HerschelBulkley')
+
+
+def _read_context_params(sim_dir: Path) -> "tuple[Optional[torch.Tensor], int]":
+    """(continuous context vector, viscosity-model class) for one run.
+
+    Missing or unparseable values become NaN / -1, which the probe loss masks per
+    sample, so a dataset that predates these fields still trains (it just has no
+    context head to speak of)."""
+    try:
+        rec = json.loads((sim_dir / 'params.json').read_text())
+    except Exception:
+        return None, -1
+    vals = []
+    for k, is_log in CTX_PARAM_KEYS:
+        v = rec.get(k)
+        try:
+            v = float(v)                                    # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            vals.append(float('nan')); continue
+        vals.append(float(np.log(v)) if is_log and v > 0 else
+                    (float('nan') if is_log else v))
+    m = rec.get('visc_model')
+    cls = CTX_MODEL_CHOICES.index(m) if m in CTX_MODEL_CHOICES else -1
+    return torch.tensor(vals, dtype=torch.float32), cls
+
+
 def _read_save_t(sim_dir: Path, files: "list[Path]") -> float:
     """Frame interval of a run, in simulation time.
 
@@ -427,17 +470,38 @@ class FVMSequenceDataset(Dataset):
         # silently dropping the BC head from the probe entirely.  first_frame=20
         # used to hide this by never looking at t_0.
         self.bc_raw: Optional[torch.Tensor] = None
-        for f in files[:5]:
+        fallback = None
+        for f in files[:6]:
             try:
-                bc = np.load(f)['bc_primatives'].astype(np.float32)   # [N, C]
+                z  = np.load(f)
+                # De-normalise, exactly as the cell path above and the solver's own
+                # loader do (fvm_solver/.../saving.py).  The .npz stores bc_vals
+                # z-scored by THAT FRAME's cell statistics, so reading it raw gives
+                # "how far the boundary sits from this frame's own field mean, in
+                # units of its own field std" -- a frame-relative number that mixes
+                # the forcing with the field statistics, and is partly computable
+                # from the frame the encoder already sees.  That is the opposite of
+                # what this target is for.
+                bc = (z['bc_primatives'].astype(np.float32)
+                      * z['prim_std'] + z['prim_mean'])            # [N, C], physical
                 with np.errstate(invalid='ignore'):
                     summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
                 if not np.isfinite(summ).all():
+                    continue
+                if fallback is None:
+                    fallback = summ
+                # Skip a uniform frame: at t=0 a cold-start segment has a constant
+                # field, so the std half of the summary is all zeros.  Only s00
+                # segments start uniform, so accepting it would hand 25% of runs a
+                # differently-shaped label from the other 75%.
+                if not np.any(summ[bc.shape[1]:] > 0):
                     continue
                 self.bc_raw = torch.from_numpy(summ)                  # [2C]
                 break
             except Exception:
                 continue
+        if self.bc_raw is None and fallback is not None:
+            self.bc_raw = torch.from_numpy(fallback)
         self.bc = self.bc_raw                    # normalised via set_bc_norm()
 
         # Physical frame interval for this run.  gen_alternating draws save_t per
@@ -447,6 +511,12 @@ class FVMSequenceDataset(Dataset):
         # different dynamics in different runs.  Falls back to the frame timestamps
         # (older datasets that predate the field), then to the legacy 0.01.
         self.save_t = _read_save_t(sim_dir, files)
+
+        # The hidden per-segment physics.  This is what gen_alternating alternates
+        # and what the context encoder is supposed to infer from the motion; without
+        # it the probe supervises only dt and a trajectory-constant freestream.
+        self.ctx_raw, self.ctx_cls = _read_context_params(sim_dir)
+        self.ctx_vec = self.ctx_raw              # normalised via set_ctx_norm()
 
         # Where the context frames come from.  With n_context set and ctx_random on,
         # the context block is drawn from a RANDOM position earlier in the same run
@@ -471,6 +541,13 @@ class FVMSequenceDataset(Dataset):
         if self.bc_raw is not None:
             self.bc = (self.bc_raw - mean) / std.clamp(min=1e-6)
 
+    def set_ctx_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """z-score the physics-context vector, so all nine parameters carry equal
+        weight in the regression regardless of their native units (thermal_cond
+        spans 5e-7..5e-3, gamma spans 1.1..1.67)."""
+        if self.ctx_raw is not None:
+            self.ctx_vec = (self.ctx_raw - mean) / std.clamp(min=1e-6)
+
     def __len__(self) -> int:
         return max(0, len(self.paths) - self.seq_len + 1)
 
@@ -490,10 +567,13 @@ class FVMSequenceDataset(Dataset):
             try:
                 frames = torch.stack([self._get_frame(i) for i in self._window(idx)])
                 if self.mesh_id is not None:
-                    # + geometry id, + BC/forcing summary, + physical frame interval
+                    # + geometry id, + BC summary, + frame interval, + the hidden
+                    # per-segment physics context (vector, viscosity-model class)
                     bc = self.bc if self.bc is not None \
                         else torch.full((8,), float('nan'))
-                    return frames, self.mesh_id, bc, self.save_t
+                    cx = self.ctx_vec if self.ctx_vec is not None \
+                        else torch.full((len(CTX_PARAM_KEYS),), float('nan'))
+                    return frames, self.mesh_id, bc, self.save_t, cx, self.ctx_cls
                 return frames   # [T, C, H, W]
             except Exception as e:                       # unreadable/corrupt frame
                 if not FVMSequenceDataset._warned_corrupt:
@@ -723,6 +803,23 @@ class FVMDataModule:
             self.bc_mean = self.bc_std = None
             self.bc_dim = 0
 
+        # Same treatment for the physics context, fitted on TRAIN runs only.
+        cxs = [ds.ctx_raw for ds in datasets if ds.ctx_raw is not None
+               and bool(torch.isfinite(ds.ctx_raw).all())]
+        if cxs:
+            C = torch.stack(cxs)
+            self.ctx_mean, self.ctx_std = C.mean(0), C.std(0)
+            for ds in datasets + val_datasets:
+                ds.set_ctx_norm(self.ctx_mean, self.ctx_std)
+            self.ctx_dim = C.shape[1]
+        else:
+            self.ctx_mean = self.ctx_std = None
+            self.ctx_dim = 0
+        # Viscosity-model classes actually present, so the head is not sized for
+        # choices this dataset never uses.
+        seen_cls = {ds.ctx_cls for ds in datasets if ds.ctx_cls >= 0}
+        self.n_visc_models = len(CTX_MODEL_CHOICES) if seen_cls else 0
+
         self._dataset = ResilientConcat(ConcatDataset(datasets))
         self._val_dataset = (ResilientConcat(ConcatDataset(val_datasets))
                              if val_datasets else None)
@@ -738,6 +835,12 @@ class FVMDataModule:
         print(f'  save_t: min {st[0]:.4g}  median {st[len(st)//2]:.4g}  max {st[-1]:.4g}'
               + ('   [WARN] constant — dt probe target is degenerate'
                  if st[-1] - st[0] < 1e-9 else ''))
+        if self.ctx_dim:
+            print(f'  physics context: {self.ctx_dim} continuous params '
+                  f'+ {len(seen_cls)}/{len(CTX_MODEL_CHOICES)} viscosity models present')
+        else:
+            print('  [WARN] no per-segment physics context in params.json — the '
+                  'context head is disabled (dataset predates gen_alternating?)')
         if self._val_dataset is not None:
             vt = sorted(ds.save_t for ds in val_datasets)
             print(f'  val split: {len(self._val_dataset)} sequences from '

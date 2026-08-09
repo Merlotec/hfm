@@ -289,6 +289,8 @@ def main():
         use_gan               = use_gan,
         # Context-probe label spaces: geometry classes and BC-summary dimension.
         probe_bc_dim          = getattr(dm, 'bc_dim', 0),
+        probe_ctx_dim         = getattr(dm, 'ctx_dim', 0),
+        probe_n_visc_models   = getattr(dm, 'n_visc_models', 0),
     )
 
     # Per-sample masks: a batch mixes geometries, so ONE shared mask would be wrong
@@ -371,16 +373,19 @@ def main():
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
         for batch in train_dl:            # (frames, mesh_ids, bc, save_t) / ... / frames
-            mesh_b = bc_b = save_t_b = None
+            mesh_b = bc_b = save_t_b = ctx_b = ctx_cls_b = None
             if isinstance(batch, (tuple, list)):
-                mesh_b   = batch[1] if len(batch) > 1 else None
-                bc_b     = batch[2] if len(batch) > 2 else None
-                save_t_b = batch[3] if len(batch) > 3 else None
-                batch    = batch[0]
+                mesh_b    = batch[1] if len(batch) > 1 else None
+                bc_b      = batch[2] if len(batch) > 2 else None
+                save_t_b  = batch[3] if len(batch) > 3 else None
+                ctx_b     = batch[4] if len(batch) > 4 else None
+                ctx_cls_b = batch[5] if len(batch) > 5 else None
+                batch     = batch[0]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
             recon, disc = trainer.step(frames, pixel_mask=pixel_mask,
-                                       mesh_ids=mesh_b, bc=bc_b, save_t=save_t_b)
+                                       mesh_ids=mesh_b, bc=bc_b, save_t=save_t_b,
+                                       ctx=ctx_b, ctx_cls=ctx_cls_b)
             info = trainer.training_info()
             step = info['global_step']
 
@@ -433,6 +438,13 @@ def main():
                                   f" (rel {info.get('dt_rel_err', float('nan')):.2f})")
                 if 'bc_mse' in info:
                     probe_bit += f"  bc_loss={info['bc_mse']:.4f}"
+                # The head that matters most: the hidden per-segment physics.
+                # dt and bc are both inferable from things other than the dynamics
+                # (frame spacing, trajectory identity); ctx is not.
+                if 'ctx_mse' in info:
+                    probe_bit += f"  ctx_loss={info['ctx_mse']:.4f}"
+                if 'visc_acc' in info:
+                    probe_bit += f"  visc_acc={info['visc_acc']:.2f}"
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
                     f'recon={recon:.4f}  persist={persist:.4f}  ratio={ratio:.2f}  '
