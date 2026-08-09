@@ -439,6 +439,15 @@ def _context_params_from(rec: dict) -> "tuple[Optional[torch.Tensor], int]":
 # Run index
 # ---------------------------------------------------------------------------
 
+# Packed runs.  One .npy per run instead of one .npz per frame: the corpus is
+# ~99k files of ~120 KB, and each training step opens 320 of them per rank (32
+# samples x 10 frames), which is exactly the access pattern a parallel filesystem
+# is worst at.  Packing makes that 32 opens of one contiguous, mmap-able array.
+# Compression buys ~3% here (the payload is already fp16), so the pack is
+# uncompressed and can be paged in lazily rather than decompressed whole.
+PACK_FILE = 'frames_fp16.npy'
+PACK_META = 'frames_meta.npz'
+
 INDEX_FILE = 'hfm_run_index.json'
 # Bump when the fields scan_run produces change, so a stale index is rebuilt
 # rather than silently feeding old values into a new label space.
@@ -494,6 +503,7 @@ def scan_run(sim_dir: Path) -> dict:
     ctx, cls = _context_params_from(rec)
     return {
         'files':   [f.name for f in files],
+        'packed':  (sim_dir / PACK_FILE).exists() and (sim_dir / PACK_META).exists(),
         'save_t':  _save_t_from(rec, files),
         'cold':    _is_cold_start(sim_dir),
         'bc':      _bc_summary(files),
@@ -597,10 +607,23 @@ class FVMSequenceDataset(Dataset):
 
         if paths_override is not None:
             files = paths_override
+            offset = 0
         else:
-            files = [sim_dir / n for n in meta['files']][first_frame:]
-            files = files[_settle_skip(files, settle_time, meta['cold']):]
+            all_files = [sim_dir / n for n in meta['files']]
+            skip = first_frame
+            skip += _settle_skip(all_files[skip:], settle_time, meta['cold'])
+            files = all_files[skip:]
+            offset = skip
         self.paths      = files
+        # Packed-run access.  The memmap is opened lazily in _get_frame because a
+        # DataLoader worker is forked after construction and an inherited mmap is
+        # not safe to share; each worker gets its own handle on first use.
+        self.sim_dir     = sim_dir
+        self._packed     = bool(meta.get('packed')) and paths_override is None
+        self._pack_off   = offset
+        self._pack: Optional[np.ndarray] = None
+        self._pack_mean: Optional[np.ndarray] = None
+        self._pack_std:  Optional[np.ndarray] = None
         self.renderer   = renderer
         self.seq_len    = seq_len
         # Index into FVMDataModule.mesh_masks.  A batch mixes geometries freely
@@ -710,9 +733,21 @@ class FVMSequenceDataset(Dataset):
         c = int(torch.randint(idx + 2, (1,)).item())      # [0, idx+1]
         return list(range(c, c + nc)) + list(range(p, p + self.seq_len - nc))
 
+    def _open_pack(self) -> None:
+        self._pack = np.load(self.sim_dir / PACK_FILE, mmap_mode='r')
+        m = np.load(self.sim_dir / PACK_META)
+        self._pack_mean, self._pack_std = m['prim_mean'], m['prim_std']
+
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
             return self._cache[i]
+        if self._packed:
+            if self._pack is None:
+                self._open_pack()
+            j = self._pack_off + i
+            vals = (np.asarray(self._pack[j], dtype=np.float32)     # type: ignore[index]
+                    * self._pack_std[j] + self._pack_mean[j])       # type: ignore[index]
+            return (self.renderer.render_cell_smooth(vals) - self.mean) / self.std
         d    = np.load(self.paths[i])
         vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
         raw  = self.renderer.render_cell_smooth(vals)   # [C, H, W]
