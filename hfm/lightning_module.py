@@ -227,6 +227,9 @@ class HFMLightningModule(L.LightningModule):
         # feed the model its own no-grad prediction of frame n instead of the GT —
         # the target stays GT frame n+1 (see trainer.train_step_gan for rationale).
         # Largely subsumed by the horizon>1 rollout below, but kept for horizon=1.
+        # VALID ONLY for a contiguous context: frames[n-1] must be the frame
+        # immediately before the input, which ctx_random breaks (the datamodule's
+        # n_context option) -- keep self_input_prob=0 whenever that is enabled.
         if float(torch.rand(())) < self.hparams['self_input_prob']:
             with torch.no_grad():
                 x_in = self.model(frames[n - 1], context, pixel_mask=mask).float()

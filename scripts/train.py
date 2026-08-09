@@ -290,7 +290,15 @@ def main():
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
         pixel_mask            = pixel_mask,
-        self_input_prob       = SELF_INPUT_PROB,
+        # Scheduled sampling MUST be off with the random context block: it rolls
+        # frames[n_context-1] one step forward as a stand-in for the input, which
+        # is only the preceding frame when the context is contiguous.  With
+        # ctx_random the last context frame sits at an arbitrary earlier time, so
+        # the branch fed a state advanced from the wrong time and supervised it
+        # against a target that does not follow it -- 50% of steps had corrupted
+        # input/target pairs, which caps training at a hedged, blurred optimum.
+        # The horizon-4 BPTT rollout is the real exposure-bias mechanism anyway.
+        self_input_prob       = (0.0 if ctx_n is not None else SELF_INPUT_PROB),
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         accum_steps           = accum_steps,
         use_gan               = use_gan,
