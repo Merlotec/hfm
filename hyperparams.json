@@ -59,8 +59,9 @@
     "num_workers": 8,
 
     "_distributed": "Comms/DDP tuning. Each has an env override that WINS: HFM_ACCUM_STEPS, HFM_TRY_XCCL=1, HFM_GRAD_ALLREDUCE_BF16=1. On Dawn, scripts/dawn_task.sh sets the backend explicitly (shell env wins over these).",
-    "accum_steps": 1,
-    "try_xccl": true,
+    "_comms": "Host-staged gloo is the floor: device collectives (oneCCL-ZE AND torch-native xccl) both GPU-fault (NotPresent/PDE, drm_neo.cpp:288) on compute-runtime 25.18.33578.77 -- see dawn_task.sh RE-TEST RESULT. try_xccl stays false until the runtime moves past 25.18. Meanwhile: accum_steps=2 halves how often the ~170MB host allreduce runs (effective batch 256 -> 512; lr left as-is, which errs conservative), and grad_allreduce_bf16 halves its size (division still fp32). Validation is sharded across ranks (batch i -> rank i%world), so it no longer parks 7 tiles behind rank 0.",
+    "accum_steps": 2,
+    "try_xccl": false,
     "grad_allreduce_bf16": true,
 
     "_gan": "use_gan=false disables the discriminator completely (not built, trained, saved, or applied) — pure reconstruction training. Env HFM_USE_GAN=0/1 overrides.",

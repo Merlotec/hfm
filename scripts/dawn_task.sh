@@ -117,14 +117,19 @@ export OMP_NUM_THREADS=$(( _OMP > 6 ? 6 : _OMP ))
 # 8 ranks/node: GPU NotPresent(PDE) fault on first allreduce; SIGSEGV in comm
 # init under ZE_AFFINITY_MASK — is there a supported oneCCL config?"
 #
-# RE-TEST HOOK: torch>=2.7 +xpu ships a NATIVE 'xccl' backend (separate from
-# oneccl_bindings).  The probe reports `backend xccl: True`, meaning it is BUILT —
-# not that it runs here.  The one combination never cleanly tried is native xccl
-# with ZE *enabled*: the documented failures were oneCCL's ZE path (PDE fault) and
-# xccl with ZE *disabled* (CCL_ZE_ENABLE=0 -> "ze_data was not initialized").  Set
-# HFM_TRY_XCCL=1 (e.g. `sbatch --export=ALL,HFM_TRY_XCCL=1 ...`) to try it: that
-# switches to device collectives via DDP and drops the host staging entirely.  Keep
-# ZE ENABLED for the attempt — do NOT set CCL_ZE_ENABLE=0 or ZE_AFFINITY_MASK.
+# RE-TEST RESULT (2026-08-09, compute-runtime 25.18.33578.77): native xccl with
+# ZE enabled was cleanly tried and FAILS with the same GPU fault as oneCCL:
+#   Segmentation fault from GPU ... type: 0 (NotPresent), level: 1 (PDE)
+#   at drm_neo.cpp:288, on the FIRST reducer allreduce inside backward.
+# Everything before it worked (init via cpu:gloo,xpu:xccl, DDP param broadcast,
+# forwards, host-side collectives), so the fault is in the driver/compute
+# runtime, not in any one collectives library — every route to device
+# collectives on this driver hits it.  Host-staged gloo stays the floor.
+# Do NOT re-run HFM_TRY_XCCL=1 until the compute runtime moves past 25.18
+# (check: clinfo | grep -i driver, or the loaded intel module version).  The
+# support-ticket ask is now sharper: "GPU PDE NotPresent fault on first device
+# allreduce, reproduced on BOTH oneCCL-ZE and torch-native xccl, 8 ranks/node,
+# torch 2.8+xpu, compute-runtime 25.18.33578.77 — is a runtime fix available?"
 if [ "${HFM_TRY_XCCL:-0}" = "1" ]; then
   export HFM_DDP_BACKEND=xccl
   unset  HFM_HOST_GRAD_SYNC              # DDP device collectives, not host staging

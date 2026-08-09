@@ -602,6 +602,13 @@ class GANTrainer:
         divides that scale out, is the SAME quantity the training objective
         minimises when persist_norm_loss is on, and reads absolutely: 1.0 means
         "no better than copying the input", < 1 means it genuinely beats it.
+
+        SHARDED under DDP: batch i is scored by rank i % world, and the three
+        sums are allreduced at the end, so validation costs 1/world the wall
+        time instead of parking world-1 ranks at a barrier while rank 0 scores
+        everything.  COLLECTIVE: when distributed, every rank must call this
+        (all see the same dataloader; the shard is by batch index), and every
+        rank returns the same reduced numbers.
         """
         self.model.eval()
         self.context_encoder.eval()
@@ -609,8 +616,14 @@ class GANTrainer:
         device_type = device.type
         amp         = device_type in ('cuda', 'xpu')
         nc      = self.cfg.n_context_frames
+        rank, world = 0, 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank  = torch.distributed.get_rank()
+            world = torch.distributed.get_world_size()
         tot_recon, tot_persist, count = 0.0, 0.0, 0
-        for batch in dataloader:
+        for bi, batch in enumerate(dataloader):
+            if bi % world != rank:
+                continue
             # (frames, mesh_id, ...) when the datamodule tags labels, else frames
             if isinstance(batch, (tuple, list)):
                 batch, mesh_b = batch[0], batch[1]
@@ -642,6 +655,11 @@ class GANTrainer:
                 tot_recon   += loss
                 tot_persist += base
                 count += 1
+        if world > 1:
+            from .distributed import allreduce_stats
+            tot_recon, tot_persist, count = allreduce_stats(
+                tot_recon, tot_persist, float(count))
+            count = int(count)
         if count == 0:
             return {'recon': float('nan'), 'persist': float('nan'),
                     'ratio': float('nan')}

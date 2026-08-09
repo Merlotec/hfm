@@ -480,10 +480,12 @@ def main():
         train_loss  = epoch_recon_sum / n if epoch_recon_cnt else float('nan')
         train_ratio = epoch_ratio_sum / n if epoch_recon_cnt else float('nan')
 
-        # Validation on rank 0 only: val_dl has no DistributedSampler, so every rank
-        # would redundantly score the whole set.  Cheaper to do it once.
+        # Sharded validation: EVERY rank participates (batch i goes to rank
+        # i % world, sums are allreduced inside validate), so it is a collective
+        # and costs 1/world the wall time of the old rank-0-only scheme, which
+        # parked 7 tiles at the barrier while one scored the whole set.
         val = {'recon': float('nan'), 'persist': float('nan'), 'ratio': float('nan')}
-        if val_dl is not None and is_main():
+        if val_dl is not None:
             val = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
 
         if is_main():
@@ -509,10 +511,10 @@ def main():
                 path = CKPT_DIR / f'train_epoch{epoch:03d}.pt'
                 trainer.save(str(path))
                 print(f'  [ckpt] {path.name}')
-        # Long timeout: rank 0 may spend many minutes validating and writing,
-        # and the quadtree model costs ~2.4x a flat forward, so the default
-        # 300 s collective timeout is not a safe bound here.
-        barrier(long=True)   # keep ranks together while rank 0 validates / writes
+        # Long timeout: rank 0 still writes checkpoints/plots after the (now
+        # shared) validation, and the quadtree model costs ~2.4x a flat forward,
+        # so the default 300 s collective timeout is not a safe bound here.
+        barrier(long=True)   # keep ranks together while rank 0 writes
 
     if is_main() and loss_csv is not None:
         loss_csv.close()
