@@ -258,6 +258,12 @@ def quarantine_run(sim_dir: Path, reason: str) -> None:
         return
     _quarantined.add(sim_dir)
 
+    # Already gone: another rank deleted it and this process is just catching up
+    # (its in-memory dataset still references the dir).  Nothing to do, and
+    # warning about it every epoch from every worker is pure noise.
+    if not sim_dir.exists():
+        return
+
     looks_like_run = (
         sim_dir.is_dir()
         and sim_dir.name.startswith('run')

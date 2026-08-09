@@ -28,7 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hfm import HFM, ContextEncoder, build_model
 from hfm.config import HFMConfig
-from hfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
+from hfm.data import (build_renderer, FVMSequenceDataset, load_pixel_mask,
+                      is_val_run, TruncatedRunError, _frame_files as _frame_files_for)
+from hfm.trainer import FluidLoss
 from hfm.discriminator import HFMDiscriminator
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / 'data'
@@ -302,6 +304,13 @@ def main():
                              'and the un-refined prediction remains the AR state.')
     parser.add_argument('--refine-seed', type=int, default=None,
                         help='Seed for the refiner noise (reproducible samples)')
+    parser.add_argument('--val-only', action='store_true',
+                        help='Evaluate ONLY the runs the training val split holds out '
+                             '(same deterministic name-hash as training, so these runs '
+                             'were never trained on). Requires --val-fraction to match '
+                             'the training value.')
+    parser.add_argument('--val-fraction', type=float, default=0.05,
+                        help='val split fraction used in training (with --val-only)')
     parser.add_argument('--teacher-forcing', action='store_true',
                         help='Feed the GROUND-TRUTH frame as input at every step instead '
                              'of the model\'s own previous prediction. Turns the rollout '
@@ -406,23 +415,50 @@ def main():
 
     if not runs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
+    if args.val_only:
+        n_all = len(runs)
+        runs = [r for r in runs if is_val_run(r[0], args.val_fraction)]
+        print(f'  --val-only: {len(runs)} held-out run(s) of {n_all} '
+              f'(val_fraction={args.val_fraction})')
+        if not runs:
+            raise RuntimeError('No held-out runs matched — check --val-fraction '
+                               'matches the training split.')
     print(f'  Found {len(runs)} simulation runs across {len(mesh_dirs)} meshes\n')
 
     # With --time-stride s the raw sequence is s× longer and every s-th frame is
     # used: the context sees stride-s spacing, which is the ONLY way the model
     # learns what timestep it is being asked to predict at.
     stride  = max(1, args.time_stride)
-    seq_len = n_context + args.n_predict + 1
-    raw_len = (seq_len - 1) * stride + 1
 
     for sim_idx, (sim_dir, renderer, pixel_mask) in enumerate(runs):
         print(f'[{sim_idx+1}/{len(runs)}] {sim_dir.name}')
         run_out = out_dir / sim_dir.name
         run_out.mkdir(parents=True, exist_ok=True)
 
-        ds = FVMSequenceDataset.with_cache(
-            sim_dir, renderer, raw_len, mean, std, first_frame=args.first_frame
-        )
+        # Fit the request to the run instead of dying on it.  gen_alternating
+        # segments are ~31 frames, so a long --n-predict (or any --time-stride
+        # above 1) can ask for more frames than a segment holds; clamp the
+        # prediction count to what this run can support and say so.
+        avail = len(_frame_files_for(sim_dir)) - args.first_frame
+        n_pred = min(args.n_predict, (avail - 1) // stride - n_context)
+        if n_pred < 1:
+            print(f'  [skip] {avail} frames cannot fit context={n_context} '
+                  f'+ 1 prediction at stride {stride}')
+            continue
+        if n_pred < args.n_predict:
+            print(f'  [note] {avail} frames: n_predict clamped '
+                  f'{args.n_predict} -> {n_pred} at stride {stride}')
+        seq_len = n_context + n_pred + 1
+        raw_len = (seq_len - 1) * stride + 1
+        args.n_predict_run = n_pred
+
+        try:
+            ds = FVMSequenceDataset.with_cache(
+                sim_dir, renderer, raw_len, mean, std, first_frame=args.first_frame
+            )
+        except TruncatedRunError as e:
+            print(f'  [skip] {e}')
+            continue
         if len(ds) == 0:
             print(f'  [skip] no sequences available')
             continue
@@ -449,8 +485,20 @@ def main():
         x = frames_gt[n_context]
         ctx_vec = context.float().mean(dim=1) if refiner is not None else None
 
+        # Persistence-normalised metric, same construction as trainer.validate:
+        # the baseline "predicts no change" and is scored against the same
+        # target.  ratio 1.0 = no better than copying the input, < 1 beats it,
+        # and unlike MAE it is comparable across runs with different dt and
+        # different window transience.  Under the AR rollout the baseline
+        # persists the SEED frame (frames_gt[n_context]) for every step, exactly
+        # as in training; under teacher forcing each step's input is the true
+        # previous frame, so the honest baseline is one-step persistence.
+        crit = FluidLoss(l1_weight=0.1).to(device)
+        seed = frames_gt[n_context]
+        step_loss, step_base, step_loss_ref = [], [], []
+
         with torch.no_grad():
-            for t in range(args.n_predict):
+            for t in range(args.n_predict_run):
                 pred = model(x, context, pixel_mask=pixel_mask)
                 pred = pred.float() * pixel_mask
 
@@ -468,9 +516,20 @@ def main():
                 preds.append(pred.cpu())
                 gt.append(frames_gt[n_context + t].cpu())
 
-                if t + 1 < args.n_predict:
-                    mae = (frames_gt[n_context + t + 1] - pred).abs().mean().item()
-                    print(f'  t={t+1:3d}  MAE={mae:.5f}')
+                target = frames_gt[n_context + t + 1]
+                mae = (target - pred).abs().mean().item()
+                l   = crit(pred, target, pixel_mask=pixel_mask).item()
+                b_src = frames_gt[n_context + t] if args.teacher_forcing else seed
+                b   = crit(b_src, target, pixel_mask=pixel_mask).item()
+                step_loss.append(l)
+                step_base.append(b)
+                line = (f'  t={t+1:3d}  MAE={mae:.5f}  loss={l:.5f}  '
+                        f'persist={b:.5f}  ratio={l / b if b > 0 else float("inf"):.3f}')
+                if refined is not None:
+                    lr = crit(refined, target, pixel_mask=pixel_mask).item()
+                    step_loss_ref.append(lr)
+                    line += f'  ratio_refined={lr / b if b > 0 else float("inf"):.3f}'
+                print(line)
 
                 if discriminator is not None:
                     x_in_t = frames_gt[n_context + t]
@@ -485,6 +544,18 @@ def main():
                 true_frame = frames_gt[n_context + t + 1]
                 ar_state = refined if (args.refine_feedback and refined is not None) else pred
                 x = true_frame * aw + ar_state * (1.0 - aw) if args.teacher_forcing else ar_state
+
+        # Ratio of the MEANS, not the mean of per-step ratios: late-rollout
+        # steps have large baselines and would otherwise be drowned out by one
+        # near-static early step with a tiny denominator.
+        if step_loss:
+            tb = max(sum(step_base), 1e-12)
+            line = (f'  rollout: mean_loss={sum(step_loss) / len(step_loss):.5f}  '
+                    f'mean_persist={sum(step_base) / len(step_base):.5f}  '
+                    f'ratio={sum(step_loss) / tb:.3f}')
+            if step_loss_ref:
+                line += f'  ratio_refined={sum(step_loss_ref) / tb:.3f}'
+            print(line)
 
         # ---- save outputs ----
         gt_arr   = torch.cat(gt,    dim=0).numpy()
@@ -517,7 +588,7 @@ def main():
             mean, std,
         ) * pixel_mask.cpu().numpy()
         all_ts = (timestamps[:n_context + 1]
-                  + timestamps[n_context + 1: n_context + 1 + args.n_predict])
+                  + timestamps[n_context + 1: n_context + 1 + args.n_predict_run])
         save_viewer_frames(
             seed_phys    = seed_phys,
             pred_phys    = pred_phys,

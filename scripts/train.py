@@ -387,6 +387,7 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
+        prev_global = trainer.global_step
         for batch in train_dl:            # (frames, mesh_ids, bc, save_t) / ... / frames
             mesh_b = bc_b = save_t_b = ctx_b = ctx_cls_b = None
             if isinstance(batch, (tuple, list)):
@@ -403,6 +404,13 @@ def main():
                                        ctx=ctx_b, ctx_cls=ctx_cls_b)
             info = trainer.training_info()
             step = info['global_step']
+            # True only on the micro-batch that advanced the optimizer.  With
+            # accum_steps > 1 the same global_step is seen on several consecutive
+            # micro-batches, so gating the log and checkpoint blocks on the bare
+            # `step % N` printed every line twice and SAVED every checkpoint
+            # twice (two back-to-back writes to the same path).
+            stepped = step != prev_global
+            prev_global = step
 
             if not math.isfinite(recon):
                 nan_streak += 1
@@ -428,7 +436,7 @@ def main():
             epoch_ratio_sum += (recon / _p) if _p > 0 else float('nan')
             epoch_recon_cnt += 1
 
-            if is_main() and step % args.log_every == 0:
+            if is_main() and stepped and step % args.log_every == 0:
                 # Persistence baseline, matched to the SAME rollout `recon` averages:
                 # "predict no change" scored against every horizon target.  A one-step
                 # baseline would be wrong — the field drifts further from the input each
@@ -471,7 +479,7 @@ def main():
             # Step-based checkpoints.  An epoch over 18k sequences is long, so
             # epoch-only saves risk losing hours to a crash — and `--resume latest`
             # globs train_step*.pt, which nothing was writing until now.
-            if is_main() and args.ckpt_every > 0 and step > 0 and step % args.ckpt_every == 0:
+            if is_main() and stepped and args.ckpt_every > 0 and step % args.ckpt_every == 0:
                 path = CKPT_DIR / f'train_step{step:06d}.pt'
                 trainer.save(str(path))
                 print(f'  [ckpt] {path.name}  (step {step})')
