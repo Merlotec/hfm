@@ -10,6 +10,7 @@ pixel grid via barycentric interpolation.  It is built once per dataset and
 cached to disk alongside the data as renderer_cache_{H}x{W}.pt.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -325,6 +326,25 @@ class ResilientConcat(Dataset):
 # Single-run dataset
 # ---------------------------------------------------------------------------
 
+def is_val_run(sim_dir: Path, val_fraction: float) -> bool:
+    """Deterministic held-out split, decided per RUN.
+
+    Split at the RUN level, never at the window level: windows slide by one frame,
+    so two windows from the same run share up to seq_len-1 frames and a window-level
+    split would put near-copies of the training data in the validation set.
+
+    The decision is a stable md5 of the run's directory name, NOT Python's hash()
+    (salted per process, so the 8 ranks would each hold out a different subset) and
+    NOT an index into a sorted list (which reshuffles the whole split whenever a run
+    is added or pruned).  Same run name, same side of the split, on every rank and
+    across restarts.
+    """
+    if val_fraction <= 0.0:
+        return False
+    h = hashlib.md5(sim_dir.name.encode()).digest()
+    return (int.from_bytes(h[:4], 'big') % 10_000) < val_fraction * 10_000
+
+
 def _frame_files(sim_dir: Path) -> "list[Path]":
     """A run's t_*.npz frames in simulation-time order."""
     return sorted(
@@ -538,6 +558,11 @@ class FVMDataModule:
         # an already-developed field and are only 30 frames long, so there is no
         # transient to skip and a nonzero value just throws away training data.
         first_frame: int = 0,
+        # Fraction of RUNS held out for validation, drawn from the training corpus
+        # itself so train and val share a distribution.  A separate directory of
+        # old-solver runs does not: it was all save_t=0.01, i.e. the 5th percentile
+        # of what training now sees, so val measured one corner of the dt axis.
+        val_fraction: float = 0.05,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
@@ -554,7 +579,9 @@ class FVMDataModule:
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
         self.return_mesh_id = return_mesh_id
+        self.val_fraction = val_fraction
         self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
+        self._val_dataset: Optional[Dataset] = None
 
     def setup(self, recompute_stats: bool = False):
         mesh_dirs = mesh_dirs_for(self.data_dir)
@@ -600,17 +627,20 @@ class FVMDataModule:
         builder = FVMSequenceDataset.with_cache if self.cache_frames else (
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
         )
-        datasets = []
+        datasets, val_datasets = [], []
         for d, renderer, mi in runs:
             try:
-                datasets.append(builder(
+                ds = builder(
                     d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
-                    mesh_id=(mi if self.return_mesh_id else None)))
+                    mesh_id=(mi if self.return_mesh_id else None))
             except TruncatedRunError as e:
                 # Setup must not die on a bad run either: quarantine and carry on.
                 quarantine_run(e.sim_dir, e.reason)
+                continue
+            (val_datasets if is_val_run(d, self.val_fraction) else datasets).append(ds)
         n_short = sum(1 for ds in datasets if len(ds) == 0)
         datasets = [ds for ds in datasets if len(ds) > 0]
+        val_datasets = [ds for ds in val_datasets if len(ds) > 0]
         if not datasets:
             raise RuntimeError(
                 f'No usable sequences found: all {n_short} run(s) hold fewer than '
@@ -626,12 +656,14 @@ class FVMDataModule:
         # z-score the per-run BC summaries across runs so the probe regression
         # target is unit-scale.  Runs with no readable BCs keep NaN targets, which
         # the probe loss masks per sample.
+        # Fitted on the TRAIN runs only, then applied to both: fitting across the
+        # validation runs too would leak their statistics into the training target.
         bcs = [ds.bc_raw for ds in datasets if ds.bc_raw is not None
                and bool(torch.isfinite(ds.bc_raw).all())]
         if bcs:
             B = torch.stack(bcs)
             self.bc_mean, self.bc_std = B.mean(0), B.std(0)
-            for ds in datasets:
+            for ds in datasets + val_datasets:
                 ds.set_bc_norm(self.bc_mean, self.bc_std)
             self.bc_dim = B.shape[1]
         else:
@@ -639,6 +671,8 @@ class FVMDataModule:
             self.bc_dim = 0
 
         self._dataset = ResilientConcat(ConcatDataset(datasets))
+        self._val_dataset = (ResilientConcat(ConcatDataset(val_datasets))
+                             if val_datasets else None)
         # print the MESH count too: without it a multi-mesh run looks identical to a
         # single-mesh one, which is how the shared-mask bug stayed invisible.
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} '
@@ -651,6 +685,12 @@ class FVMDataModule:
         print(f'  save_t: min {st[0]:.4g}  median {st[len(st)//2]:.4g}  max {st[-1]:.4g}'
               + ('   [WARN] constant — dt probe target is degenerate'
                  if st[-1] - st[0] < 1e-9 else ''))
+        if self._val_dataset is not None:
+            vt = sorted(ds.save_t for ds in val_datasets)
+            print(f'  val split: {len(self._val_dataset)} sequences from '
+                  f'{len(val_datasets)} held-out runs '
+                  f'({100 * len(val_datasets) / (len(datasets) + len(val_datasets)):.1f}% '
+                  f'of runs), save_t median {vt[len(vt)//2]:.4g}')
         if len(mesh_dirs) > 1 and not self.return_mesh_id:
             print(f'  [WARN] {len(mesh_dirs)} geometries but return_mesh_id=False -- the '
                   f'caller will apply ONE mask to all of them, which is wrong for '
@@ -675,10 +715,13 @@ class FVMDataModule:
             persistent_workers = self.num_workers > 0,
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self) -> Optional[DataLoader]:
+        """The held-out runs.  None when val_fraction is 0."""
         assert self._dataset is not None, 'Call setup() first'
+        if self._val_dataset is None:
+            return None
         return DataLoader(
-            self._dataset,
+            self._val_dataset,
             batch_size         = self.batch_size,
             shuffle            = False,
             num_workers        = self.num_workers,

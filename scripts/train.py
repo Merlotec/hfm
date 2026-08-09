@@ -36,7 +36,6 @@ _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
 
 DEFAULT_DATA_DIR = _DATA_ROOT / 'fvm_gen_datasets'
-DEFAULT_TEST_DIR = _DATA_ROOT / 'test'
 CKPT_DIR         = _ROOT / 'checkpoints'
 HYPERPARAMS      = _ROOT / 'hyperparams.json'
 
@@ -133,20 +132,26 @@ def _save_loss_plot(log_path: Path, plot_path: Path) -> None:
     except ImportError:
         return
 
-    epochs, train_losses, val_losses = [], [], []
+    epochs, train_r, val_r = [], [], []
     with open(log_path) as f:
         for row in csv.DictReader(f):
             epochs.append(int(row['epoch']))
-            train_losses.append(float(row['train_loss']))
-            v = row['val_loss']
-            val_losses.append(float(v) if v and v != 'nan' else float('nan'))
+            def _f(key):
+                v = row.get(key)
+                return float(v) if v and v != 'nan' else float('nan')
+            # Plot the RATIOS: the raw losses are on incomparable scales.  Older
+            # logs only carry train_loss/val_loss, so fall back to those.
+            train_r.append(_f('train_ratio') if 'train_ratio' in row else _f('train_loss'))
+            val_r.append(_f('val_ratio') if 'val_ratio' in row else _f('val_loss'))
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(epochs, train_losses, label='train', linewidth=1.5)
-    if any(math.isfinite(v) for v in val_losses):
-        ax.plot(epochs, val_losses, label='val (test set)', linewidth=1.5)
+    ax.plot(epochs, train_r, label='train', linewidth=1.5)
+    if any(math.isfinite(v) for v in val_r):
+        ax.plot(epochs, val_r, label='val (held-out runs)', linewidth=1.5)
+    # 1.0 == "no better than copying the input", the line the model must stay under.
+    ax.axhline(1.0, color='0.6', linestyle='--', linewidth=1, label='persistence')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('Reconstruction loss')
+    ax.set_ylabel('Loss / persistence  (ratio)')
     ax.set_title('HFM training loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -163,8 +168,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
     parser.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR,
                         help='Dataset directory containing simulation subdirs')
-    parser.add_argument('--test-data',  type=Path, default=DEFAULT_TEST_DIR,
-                        help='Test/validation directory for out-of-sample loss (default: ../data/test)')
+    parser.add_argument('--val-fraction', type=float, default=0.05,
+                        help='Fraction of RUNS held out of training for validation '
+                             '(0 disables). Split is deterministic per run name.')
     parser.add_argument('--resume',     type=str, default=None, nargs='?', const='latest',
                         help='Checkpoint to resume from. Omit value to pick the latest train_step checkpoint.')
     parser.add_argument('--epochs',     type=int,  default=None,
@@ -218,6 +224,7 @@ def main():
         batch_size  = train_hp['batch_size'],
         num_workers = num_workers,
         return_mesh_id = True,
+        val_fraction   = args.val_fraction,
     )
     dm.setup()
 
@@ -238,42 +245,21 @@ def main():
         first_mdir, renderer, (cfg.img_size, cfg.img_size)
     ).to(device)
 
-    # ---- test/validation data (optional) ----
-    val_dl         = None
+    # ---- validation: a held-out slice of the TRAINING corpus ----
+    # Previously this was a separate directory (data/test) of old-solver runs, all
+    # at save_t=0.01.  Training now spans save_t ~ U(0.01, 0.2) with a median near
+    # 0.115, so that val set scored one extreme corner of the dt axis and its rising
+    # loss could not be told apart from ordinary overfitting.  The split here is by
+    # RUN and deterministic (see data.is_val_run), so every rank agrees on it and it
+    # survives restarts; the held-out runs are never trained on.
+    val_dl = dm.val_dataloader()
     val_pixel_mask = None
-    if args.test_data.exists():
-        print(f'Test data: {args.test_data}')
-        val_dm = FVMDataModule(
-            data_dir    = args.test_data,
-            seq_len     = seq_len,
-            batch_size  = train_hp['batch_size'],
-            num_workers = num_workers,
-            mean        = dm.mean,
-            std         = dm.std,
-            return_mesh_id = True,
-        )
-        val_dm.setup()
-        val_mesh_dirs = []
-        if (args.test_data / 'shared_mesh.pkl').exists():
-            val_mesh_dirs.append(args.test_data)
-        else:
-            for p in args.test_data.iterdir():
-                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
-                    val_mesh_dirs.append(p)
-                    
-        if not val_mesh_dirs:
-            raise RuntimeError(f'No shared_mesh.pkl found in {args.test_data} or its subdirectories')
-            
-        first_val_mdir = val_mesh_dirs[0]
-        val_renderer   = build_renderer(first_val_mdir, (cfg.img_size, cfg.img_size))
-        val_pixel_mask = load_pixel_mask(
-            first_val_mdir, val_renderer, (cfg.img_size, cfg.img_size)
-        ).to(device)
-        val_dl = val_dm.val_dataloader()
-        assert val_dm._dataset is not None
-        print(f'Test dataset:    {len(val_dm._dataset)} sequences\n')
+    if val_dl is not None:
+        assert dm._val_dataset is not None
+        print(f'Validation:      {len(dm._val_dataset)} sequences from held-out runs '
+              f'({dm.val_fraction:.0%} of the corpus)\n')
     else:
-        print(f'Test data dir not found ({args.test_data}) — val loss will not be computed\n')
+        print('Validation:      disabled (val_fraction=0) — val loss will not be computed\n')
 
     # ---- trainer ----
     trainer = GANTrainer(
@@ -296,11 +282,13 @@ def main():
     # Per-sample masks: a batch mixes geometries, so ONE shared mask would be wrong
     # for every mesh but the first (masks differ by ~13% of the frame between meshes).
     if dm.mesh_masks is not None:
-        trainer.set_mesh_tables(dm.mesh_masks.to(device))
-        print(f'Per-sample masks: {dm.mesh_masks.shape[0]} train geometries')
-    if val_dl is not None and getattr(val_dm, 'mesh_masks', None) is not None:
-        trainer.set_val_mesh_tables(val_dm.mesh_masks.to(device))
-        print(f'                  {val_dm.mesh_masks.shape[0]} val geometries')
+        masks = dm.mesh_masks.to(device)
+        trainer.set_mesh_tables(masks)
+        # The val runs are drawn from the SAME corpus, so they index the same mesh
+        # table.  With a separate directory they did not, and a stale val table
+        # silently scored each sample against another geometry's collider.
+        trainer.set_val_mesh_tables(masks)
+        print(f'Per-sample masks: {dm.mesh_masks.shape[0]} geometries (train + val)')
     # Pin the training normalisation into every checkpoint this run writes, so
     # inference can't silently normalise with different stats (see infer.load_stats).
     trainer.norm_mean, trainer.norm_std = dm.mean, dm.std
@@ -353,7 +341,8 @@ def main():
         loss_csv    = open(loss_log_path, 'a', newline='')
         loss_writer = csv.writer(loss_csv)
         if write_header:
-            loss_writer.writerow(['epoch', 'train_loss', 'val_loss'])
+            loss_writer.writerow(['epoch', 'train_ratio', 'val_ratio',
+                                  'train_loss', 'val_loss', 'val_persist'])
             loss_csv.flush()
 
     nan_streak = 0
@@ -364,6 +353,7 @@ def main():
 
     for epoch in range(start_epoch, n_epochs):
         epoch_recon_sum = 0.0
+        epoch_ratio_sum = 0.0
         epoch_recon_cnt = 0
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
@@ -398,6 +388,12 @@ def main():
             nan_streak = 0
 
             epoch_recon_sum += recon
+            # Accumulate the RATIO too, since that is what validation reports and
+            # what the generator actually minimises under persist_norm_loss.  The
+            # raw loss is not comparable epoch to epoch: it scales with the run's
+            # dt and with how transient the sampled windows were.
+            _p = info.get('persist', float('nan'))
+            epoch_ratio_sum += (recon / _p) if _p > 0 else float('nan')
             epoch_recon_cnt += 1
 
             if is_main() and step % args.log_every == 0:
@@ -441,21 +437,32 @@ def main():
                 trainer.save(str(path))
                 print(f'  [ckpt] {path.name}  (step {step})')
 
-        train_loss = epoch_recon_sum / epoch_recon_cnt if epoch_recon_cnt > 0 else float('nan')
+        n = max(1, epoch_recon_cnt)
+        train_loss  = epoch_recon_sum / n if epoch_recon_cnt else float('nan')
+        train_ratio = epoch_ratio_sum / n if epoch_recon_cnt else float('nan')
 
         # Validation on rank 0 only: val_dl has no DistributedSampler, so every rank
         # would redundantly score the whole set.  Cheaper to do it once.
-        val_loss = float('nan')
+        val = {'recon': float('nan'), 'persist': float('nan'), 'ratio': float('nan')}
         if val_dl is not None and is_main():
-            val_loss = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
+            val = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
 
         if is_main():
+            # Ratios first: they are the comparable pair.  train_ratio vs val_ratio
+            # is the generalisation gap; the raw losses beside them are on different
+            # scales (different dt, different window transience) and cannot be
+            # subtracted from one another.
             print(
-                f'  [epoch {epoch:3d}] train_loss={train_loss:.4f}  '
-                f'val_loss={val_loss:.4f}'
+                f'  [epoch {epoch:3d}] train_ratio={train_ratio:.3f}  '
+                f'val_ratio={val["ratio"]:.3f}   '
+                f'(raw: train={train_loss:.4f}  val={val["recon"]:.4f}  '
+                f'val_persist={val["persist"]:.4f})'
             )
             if loss_writer is not None and loss_csv is not None:
-                loss_writer.writerow([epoch, f'{train_loss:.6f}', f'{val_loss:.6f}'])
+                loss_writer.writerow([
+                    epoch, f'{train_ratio:.6f}', f'{val["ratio"]:.6f}',
+                    f'{train_loss:.6f}', f'{val["recon"]:.6f}',
+                    f'{val["persist"]:.6f}'])
                 loss_csv.flush()
             _save_loss_plot(loss_log_path, loss_plot_path)
 

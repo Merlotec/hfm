@@ -192,7 +192,8 @@ class HFMLightningModule(L.LightningModule):
         off = int(torch.randint(len(frames) - need + 1, (1,)).item())
         frames = frames[off : off + need : s]
         # Physical timestep per sample: the run's frame interval times the stride.
-        dt = (save_t.to(self.device).float() * s if save_t is not None
+        # .float() BEFORE .to(): collate gives float64 and MPS rejects float64.
+        dt = (save_t.float().to(self.device) * s if save_t is not None
               else torch.full((batch.shape[0],), float(s) * 0.01, device=self.device))
 
         x_in     = frames[n]
@@ -429,9 +430,11 @@ class FVMLightningDataModule(L.LightningDataModule):
         num_workers: int = 4,
         first_frame: int = 0,
         return_mesh_id: bool = True,
+        val_fraction: float = 0.05,
     ):
         super().__init__()
         self._return_mesh_id = return_mesh_id
+        self._val_fraction = val_fraction
         self._data_dir    = data_dir
         self._seq_len     = seq_len
         self._resolution  = resolution
@@ -449,6 +452,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             num_workers = self._num_workers,
             first_frame = self._first_frame,
             return_mesh_id = self._return_mesh_id,
+            val_fraction   = self._val_fraction,
         )
 
     def prepare_data(self) -> None:

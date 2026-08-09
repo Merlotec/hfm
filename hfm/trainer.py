@@ -543,41 +543,66 @@ class GANTrainer:
         self,
         dataloader,
         pixel_mask: Optional[torch.Tensor] = None,
-    ) -> float:
-        """Mean reconstruction loss over a validation dataloader (no gradient update)."""
+    ) -> dict:
+        """Held-out metrics: {'recon', 'persist', 'ratio'}.
+
+        `ratio` is the number to read.  The raw loss is not comparable across
+        anything: the persistence baseline spans ~7500x within a single run
+        (3.59 over the startup transient, 0.00048 once the flow is developed) and
+        scales with dt, which now varies per run.  So a raw val loss mostly
+        reports which windows landed in the set.  ratio = recon / persistence
+        divides that scale out, is the SAME quantity the training objective
+        minimises when persist_norm_loss is on, and reads absolutely: 1.0 means
+        "no better than copying the input", < 1 means it genuinely beats it.
+        """
         self.model.eval()
         self.context_encoder.eval()
         device      = next(self.model.parameters()).device
         device_type = device.type
         amp         = device_type in ('cuda', 'xpu')
         nc      = self.cfg.n_context_frames
-        total, count = 0.0, 0
+        tot_recon, tot_persist, count = 0.0, 0.0, 0
         for batch in dataloader:
-            # (frames, mesh_id) when the datamodule tags geometries, else just frames
+            # (frames, mesh_id, ...) when the datamodule tags labels, else frames
             if isinstance(batch, (tuple, list)):
                 batch, mesh_b = batch[0], batch[1]
             else:
                 mesh_b = None
-            pixel_mask = self._mask_ctx(pixel_mask, mesh_b, val=True)
+            mask     = self._mask_ctx(pixel_mask, mesh_b, val=True)
             frames   = [batch[:, t].to(device) for t in range(batch.shape[1])]
             horizon  = max(1, min(getattr(self.cfg, 'rollout_horizon', 1),
                                   len(frames) - nc - 1))
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-                context = self.context_encoder(frames[:nc], pixel_mask=pixel_mask)
-                # Same unrolled metric as training: predict horizon steps,
-                # feeding predictions forward, average loss over the horizon.
-                x_cur, terms = frames[nc], []
+                context = self.context_encoder(frames[:nc], pixel_mask=mask)
+                # Same unrolled metric as training: predict horizon steps, feeding
+                # predictions forward, average over the horizon.
+                x_cur, terms, bases = frames[nc], [], []
                 for k in range(horizon):
-                    pred = self.model(x_cur, context, pixel_mask=pixel_mask)
-                    pred_m = pred.float() * pixel_mask if pixel_mask is not None else pred.float()
-                    terms.append(self.criterion(pred_m, frames[nc + 1 + k],
-                                                pixel_mask=pixel_mask).item())
+                    pred = self.model(x_cur, context, pixel_mask=mask)
+                    pred_m = pred.float() * mask if mask is not None else pred.float()
+                    target = frames[nc + 1 + k]
+                    terms.append(self.criterion(pred_m, target, pixel_mask=mask).item())
+                    # Baseline from the CLEAN input frame, matched to the SAME
+                    # rollout: "predict no change" scored against every horizon
+                    # target, exactly as in training.
+                    bases.append(self.criterion(frames[nc], target,
+                                                pixel_mask=mask).item())
                     x_cur = pred_m
             loss = sum(terms) / len(terms)
+            base = sum(bases) / len(bases)
             if loss == loss:   # finite check (NaN != NaN)
-                total += loss
+                tot_recon   += loss
+                tot_persist += base
                 count += 1
-        return total / count if count > 0 else float('nan')
+        if count == 0:
+            return {'recon': float('nan'), 'persist': float('nan'),
+                    'ratio': float('nan')}
+        recon, persist = tot_recon / count, tot_persist / count
+        # Ratio of the MEANS, not the mean of per-batch ratios: a batch that is
+        # nearly static has a near-zero baseline, and averaging its ratio would
+        # let that one batch dominate the number.
+        return {'recon': recon, 'persist': persist,
+                'ratio': recon / persist if persist > 0 else float('inf')}
 
     def to(self, device: torch.device) -> "GANTrainer":
         self.model           = self.model.to(device)
@@ -669,7 +694,9 @@ class GANTrainer:
         # (gen_alternating samples it per segment), so dt varies across the batch
         # even though the stride does not.
         B = frames[0].shape[0]
-        dt = (save_t.to(frames[0].device).float() * s if save_t is not None
+        # .float() BEFORE .to(): collate gives float64 (Python floats), and MPS
+        # rejects a float64 tensor outright rather than converting on arrival.
+        dt = (save_t.float().to(frames[0].device) * s if save_t is not None
               else torch.full((B,), float(s) * 0.01, device=frames[0].device))
         self._stride_metrics['dt'] = float(dt.mean().item())
         # Persistence baseline AT THIS STRIDE — the honest "model vs copy-input"
