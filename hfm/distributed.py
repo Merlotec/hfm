@@ -166,15 +166,28 @@ def wrap_ddp(module: torch.nn.Module, device: torch.device,
     find_unused_parameters is needed for the GAN path: the generator step does not
     touch every discriminator parameter (and vice versa), so the reducer would
     otherwise wait forever for grads that never arrive.
+
+    broadcast_buffers=False is REQUIRED, not an optimisation.  DDP's default
+    broadcasts every buffer in place at the start of every wrapped forward, and
+    the BPTT rollout calls the model 4+ times per step, so forward k+1's
+    broadcast bumps the version of a buffer forward k's graph saved (the
+    decoder's weight_kernel enters a mul, whose backward saves it) — the first
+    backward then dies with "modified by an inplace operation ... [576]".
+    Safe to disable here: every buffer (tent kernel, norm_map, RoPE caches,
+    quadtree masks) is a deterministic constant computed identically on all
+    ranks from the config, and there is no BatchNorm anywhere (GroupNorm and
+    LayerNorm carry no running stats).  Also removes one broadcast per forward.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return module
     if device.type in ('cuda', 'xpu'):
         return torch.nn.parallel.DistributedDataParallel(
             module, device_ids=[device.index], output_device=device.index,
+            broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
     return torch.nn.parallel.DistributedDataParallel(
-        module, find_unused_parameters=find_unused_parameters)
+        module, broadcast_buffers=False,
+        find_unused_parameters=find_unused_parameters)
 
 
 def unwrap(module: torch.nn.Module) -> torch.nn.Module:
