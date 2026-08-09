@@ -54,7 +54,7 @@ class HFMLightningModule(L.LightningModule):
         l1_weight: float = 0.1,
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 2_000,
-        disc_update_threshold: float = 0.3,
+        disc_update_threshold: float = 0.5,
         cosine_t_max: int = 10_000,
         pixel_mask: Optional[torch.Tensor] = None,
         mesh_masks: Optional[torch.Tensor] = None,

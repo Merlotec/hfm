@@ -176,7 +176,7 @@ def main() -> None:
         l1_weight             = train_hp['l1_weight'],
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
-        disc_update_threshold = DISC_UPDATE_THRESHOLD,
+        disc_update_threshold = train_hp.get('disc_update_threshold', DISC_UPDATE_THRESHOLD),
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         pixel_mask            = pixel_mask,
         mesh_masks            = mesh_masks,

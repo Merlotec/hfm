@@ -457,7 +457,7 @@ PACK_META = 'frames_meta.npz'
 INDEX_FILE = 'hfm_run_index.json'
 # Bump when the fields scan_run produces change, so a stale index is rebuilt
 # rather than silently feeding old values into a new label space.
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 
 def _bc_summary(files: "list[Path]") -> "Optional[list]":
@@ -511,6 +511,9 @@ def scan_run(sim_dir: Path) -> dict:
         'files':   [f.name for f in files],
         'packed':  (sim_dir / PACK_FILE).exists() and (sim_dir / PACK_META).exists(),
         'save_t':  _save_t_from(rec, files),
+        # Distinguishes gen_alternating output (explicit per-segment save_t) from
+        # legacy fixed-interval corpora, which get temporal-stride augmentation.
+        'has_save_t': bool(rec.get('save_t')),
         'cold':    _is_cold_start(sim_dir),
         'bc':      _bc_summary(files),
         'ctx':     None if ctx is None else [float(x) for x in ctx],
@@ -601,6 +604,7 @@ class FVMSequenceDataset(Dataset):
         n_context:   Optional[int] = None,
         ctx_random:  bool = True,
         settle_time: float = 0.0,
+        dt_stride_max: int = 1,
         meta:        Optional[dict] = None,
     ):
         # `meta` is a pre-scanned record from the dataset index (see scan_run).
@@ -669,6 +673,16 @@ class FVMSequenceDataset(Dataset):
         self.n_context  = n_context
         self.ctx_random = bool(ctx_random and n_context is not None)
 
+        # Temporal-stride augmentation for LEGACY fixed-interval corpora.  A
+        # gen_alternating segment carries its dt in save_t and is used at stride
+        # 1; an old-style run is stuck at save_t=0.01, so each sample draws a
+        # stride s in [1, dt_stride_max] and uses every s-th frame, making its
+        # effective timestep s * save_t.  The dt LABEL returned with the sample
+        # is that effective value, so the probe target and everything downstream
+        # stay exact, and the trainer needs no striding of its own.
+        self._rand_stride = bool(ctx_random)     # deterministic in validation
+        self.dt_stride_max = max(1, int(dt_stride_max))
+
     def set_bc_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """z-score the BC summary with dataset-level stats (regression target)."""
         if self.bc_raw is not None:
@@ -698,15 +712,17 @@ class FVMSequenceDataset(Dataset):
         n = max(1, len(self))
         for _ in range(4):
             try:
-                frames = torch.stack([self._get_frame(i) for i in self._window(idx)])
+                idxs, stride = self._window(idx)
+                frames = torch.stack([self._get_frame(i) for i in idxs])
                 if self.mesh_id is not None:
-                    # + geometry id, + BC summary, + frame interval, + the hidden
-                    # per-segment physics context (vector, viscosity-model class)
+                    # + geometry id, + BC summary, + EFFECTIVE frame interval,
+                    # + the hidden physics context (vector, viscosity-model class)
                     bc = self.bc if self.bc is not None \
                         else torch.full((8,), float('nan'))
                     cx = self.ctx_vec if self.ctx_vec is not None \
                         else torch.full((len(CTX_PARAM_KEYS),), float('nan'))
-                    return frames, self.mesh_id, bc, self.save_t, cx, self.ctx_cls
+                    return (frames, self.mesh_id, bc, self.save_t * stride,
+                            cx, self.ctx_cls)
                 return frames   # [T, C, H, W]
             except Exception as e:                       # unreadable/corrupt frame
                 if not FVMSequenceDataset._warned_corrupt:
@@ -719,25 +735,42 @@ class FVMSequenceDataset(Dataset):
         raise TruncatedRunError(self.paths[0].parent,
                                 'no valid sequence after 4 attempts')
 
-    def _window(self, idx: int) -> "list[int]":
-        """Frame indices for sample `idx`: context block then prediction block.
+    def _window(self, idx: int) -> "tuple[list[int], int]":
+        """(frame indices, stride) for sample `idx`: context block then prediction.
 
         Layout matches what the trainer expects, frames[:n_context] is the context
         and frames[n_context:] is the input frame plus its targets, so nothing
-        downstream changes.  The only difference is that the context block may come
-        from earlier in the run.
+        downstream changes.  Both blocks share one stride s, so the sequence is a
+        faithful sampling of the run at effective timestep s * save_t.
 
-        With nc = n_context, the prediction block starts at p = idx + nc and the
-        context block starts at c, drawn uniformly from [0, idx + 1].  c = idx is
-        the legacy contiguous case, and c = idx + 1 ends the context on the input
-        frame itself, which the model already sees.  Every choice is causal.
+        Stride: 1 unless dt_stride_max > 1 (legacy corpora), where s is drawn
+        uniformly when ctx_random is on and cycles deterministically (1 + idx mod
+        max) in validation, clamped so the window fits inside the run.
+
+        Context block: starts at c, drawn uniformly from [0, idx + s] when
+        ctx_random is on (c = idx is the contiguous case; c = idx + s ends the
+        context ON the input frame, which the model already sees).  Its last
+        frame c + (nc-1)s never exceeds the input frame p = idx + nc*s, so no
+        target can leak into the conditioning.
         """
         nc = self.n_context
+        span = self.seq_len - 1
+        s_fit = max(1, (len(self.paths) - 1 - idx) // max(1, span))
+        if self.dt_stride_max > 1:
+            if self._rand_stride:
+                s = 1 + int(torch.randint(min(self.dt_stride_max, s_fit), (1,)).item())
+                s = min(s, s_fit)
+            else:
+                s = 1 + idx % self.dt_stride_max
+                s = min(s, s_fit)
+        else:
+            s = 1
         if not self.ctx_random or nc is None:
-            return list(range(idx, idx + self.seq_len))
-        p = idx + nc
-        c = int(torch.randint(idx + 2, (1,)).item())      # [0, idx+1]
-        return list(range(c, c + nc)) + list(range(p, p + self.seq_len - nc))
+            return list(range(idx, idx + (span + 1) * s, s))[:self.seq_len], s
+        p = idx + nc * s
+        c = int(torch.randint(idx + s + 1, (1,)).item())      # [0, idx + s]
+        return ([c + k * s for k in range(nc)]
+                + [p + k * s for k in range(self.seq_len - nc)]), s
 
     def _open_pack(self) -> None:
         self._pack = np.load(self.sim_dir / PACK_FILE, mmap_mode='r')
@@ -830,6 +863,12 @@ class FVMDataModule:
         # an already-developed field and are only 30 frames long, so there is no
         # transient to skip and a nonzero value just throws away training data.
         first_frame: int = 0,
+        # data_dir may be one directory or a LIST: every root's meshes and runs
+        # are pooled into one dataset (mesh_ids number across all roots, so the
+        # mask table stays consistent).  Runs whose params.json carries save_t
+        # (gen_alternating) train at stride 1; legacy fixed-interval runs get
+        # per-sample stride augmentation 1..legacy_stride_max, covering effective
+        # dt = save_t .. legacy_stride_max * save_t.
         # Fraction of RUNS held out for validation, drawn from the training corpus
         # itself so train and val share a distribution.  A separate directory of
         # old-solver runs does not: it was all save_t=0.01, i.e. the 5th percentile
@@ -844,12 +883,18 @@ class FVMDataModule:
         # only where there is actually a transient, so continuation segments keep
         # all 30 of their frames.
         settle_time: float = 0.0,
+        # Stride-augmentation ceiling for legacy corpora (1 disables).  10 at
+        # save_t=0.01 spans effective dt 0.01..0.10, meeting the alternating
+        # corpus's U(0.01, 0.2) across most of its range.
+        legacy_stride_max: int = 10,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
         return_mesh_id: bool = False,
     ):
-        self.data_dir     = Path(data_dir)
+        dirs = data_dir if isinstance(data_dir, (list, tuple)) else [data_dir]
+        self.data_dirs    = [Path(d) for d in dirs]
+        self.data_dir     = self.data_dirs[0]     # primary: stats + index home
         self.seq_len      = seq_len
         self.resolution   = resolution
         self.batch_size   = batch_size
@@ -863,13 +908,17 @@ class FVMDataModule:
         self.val_fraction = val_fraction
         self.n_context = n_context
         self.settle_time = settle_time
+        self.legacy_stride_max = max(1, int(legacy_stride_max))
         self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
         self._val_dataset: Optional[Dataset] = None
 
     def setup(self, recompute_stats: bool = False):
-        mesh_dirs = mesh_dirs_for(self.data_dir)
-        if not mesh_dirs:
-            raise RuntimeError(f'No shared_mesh.pkl found in {self.data_dir} or its subdirectories')
+        mesh_dirs = []
+        for root in self.data_dirs:
+            found = mesh_dirs_for(root)
+            if not found:
+                raise RuntimeError(f'No shared_mesh.pkl found in {root} or its subdirectories')
+            mesh_dirs.extend(found)
 
         runs: list[tuple[Path, MeshRenderer, int]] = []
         mesh_masks = []
@@ -890,7 +939,12 @@ class FVMDataModule:
         # One cached pass over every run's metadata, instead of ~5 filesystem
         # operations per run per rank.  See load_run_index.
         _t0 = time.perf_counter()
-        meta = load_run_index(self.data_dir, [d for d, _r, _mi in runs])
+        meta = {}
+        for root in self.data_dirs:
+            in_root = [d for d, _r, _mi in runs
+                       if root == d.parents[1] or root == d.parents[0]]
+            if in_root:
+                meta.update(load_run_index(root, in_root))
         print(f'  Run index: {len(meta)} runs in {time.perf_counter() - _t0:.1f}s')
 
         # Load or compute normalisation stats (skip if already provided externally)
@@ -926,6 +980,10 @@ class FVMDataModule:
                     n_context=self.n_context,
                     settle_time=self.settle_time,
                     meta=meta[d],
+                    # Legacy fixed-interval runs get stride augmentation; runs
+                    # with a real per-segment save_t train at stride 1.
+                    dt_stride_max=(1 if meta[d].get('has_save_t')
+                                   else self.legacy_stride_max),
                     # Validation stays DETERMINISTIC: a random context would make
                     # the val metric a different measurement every epoch, and the
                     # whole point of the ratio is that its movement means something.
@@ -984,7 +1042,28 @@ class FVMDataModule:
         seen_cls = {ds.ctx_cls for ds in datasets if ds.ctx_cls >= 0}
         self.n_visc_models = len(CTX_MODEL_CHOICES) if seen_cls else 0
 
-        self._dataset = ResilientConcat(ConcatDataset(datasets))
+        # Balance the two corpus types so training genuinely alternates between
+        # them.  Legacy runs are ~700 frames against alternating's ~31, so raw
+        # window counts would let the legacy corpus drown out the alternating one
+        # ~20:1.  Every k-th window of each legacy run is kept (windows overlap by
+        # seq_len-1 frames, so thinning them loses variety, not coverage), which
+        # brings the two types to roughly equal draw probability under shuffle.
+        legacy = [ds for ds in datasets if ds.dt_stride_max > 1]
+        modern = [ds for ds in datasets if ds.dt_stride_max == 1]
+        n_leg, n_mod = sum(len(d) for d in legacy), sum(len(d) for d in modern)
+        train_parts: list = list(datasets)
+        if legacy and modern and n_leg > n_mod:
+            k = max(1, round(n_leg / n_mod))
+            train_parts = modern + [
+                torch.utils.data.Subset(ds, range(0, len(ds), k)) for ds in legacy]
+            n_leg = sum(len(t) for t in train_parts) - n_mod
+            print(f'  corpus balance: legacy thinned x{k} -> '
+                  f'{n_leg} legacy vs {n_mod} alternating sequences')
+        elif legacy:
+            print(f'  corpora: {n_leg} legacy (stride-augmented 1..'
+                  f'{self.legacy_stride_max}) / {n_mod} alternating sequences')
+
+        self._dataset = ResilientConcat(ConcatDataset(train_parts))
         self._val_dataset = (ResilientConcat(ConcatDataset(val_datasets))
                              if val_datasets else None)
         # print the MESH count too: without it a multi-mesh run looks identical to a

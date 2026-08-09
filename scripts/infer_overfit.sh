@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 DATA_DIR="$(pwd)/../data/fvm_gen_alternating"
 OUT_DIR="$(pwd)/out/infer"
 # CKPT="$(pwd)/checkpoints/ckpt-step037500.ckpt"
-CKPT="$(pwd)/checkpoints/train_step004500.pt"
+CKPT="$(pwd)/checkpoints/train_step006000.pt"
 DET_CKPT="$(pwd)/checkpoints/refiner_step020000.pt"
 
 echo "Checkpoint : $CKPT"

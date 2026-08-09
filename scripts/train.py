@@ -166,8 +166,13 @@ def _save_loss_plot(log_path: Path, plot_path: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
-    parser.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR,
-                        help='Dataset directory containing simulation subdirs')
+    parser.add_argument('--data',       type=Path, nargs='+', default=[DEFAULT_DATA_DIR],
+                        help='One or more dataset directories.  All are pooled: runs '
+                             'with per-segment save_t (gen_alternating) train at '
+                             'stride 1; legacy fixed-interval runs (val.json/gen.json '
+                             'output) get per-sample stride augmentation 1..10, so '
+                             'their effective dt spans 0.01..0.10.  The two corpus '
+                             'types are balanced to roughly equal draw probability.')
     parser.add_argument('--settle-time', type=float, default=None,
                         help='Override settle_time from hyperparams.json: sim-time (s) '
                              'discarded from the front of COLD-START runs only, where '
@@ -247,17 +252,21 @@ def main():
     )
     dm.setup()
 
+    # Fallback shared mask only; per-sample masks come from dm.mesh_masks, which
+    # already spans every root passed to --data.  The primary (first) root is the
+    # representative geometry source here.
+    primary = args.data[0]
     mesh_dirs = []
-    if (args.data / 'shared_mesh.pkl').exists():
-        mesh_dirs.append(args.data)
+    if (primary / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(primary)
     else:
-        for p in args.data.iterdir():
+        for p in primary.iterdir():
             if p.is_dir() and (p / 'shared_mesh.pkl').exists():
                 mesh_dirs.append(p)
-                
+
     if not mesh_dirs:
-        raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
-        
+        raise RuntimeError(f'No shared_mesh.pkl found in {primary} or its subdirectories')
+
     first_mdir = mesh_dirs[0]
     renderer   = build_renderer(first_mdir, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(
@@ -288,7 +297,8 @@ def main():
         l1_weight             = train_hp['l1_weight'],
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
-        disc_update_threshold = DISC_UPDATE_THRESHOLD,
+        disc_update_threshold = train_hp.get('disc_update_threshold',
+                                             DISC_UPDATE_THRESHOLD),
         pixel_mask            = pixel_mask,
         # Scheduled sampling MUST be off with the random context block: it rolls
         # frames[n_context-1] one step forward as a stand-in for the input, which
