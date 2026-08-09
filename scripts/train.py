@@ -218,6 +218,17 @@ def main():
 
     # ---- training data ----
     num_workers = train_hp.get('num_workers', 8)
+    # Random causal context block, unless temporal striding is on.  The two are
+    # mutually exclusive: with a random context the returned tensor is two blocks
+    # spliced together, and the trainer's stride subsample (frames[off::s]) would
+    # cut across the splice and silently build a nonsense sequence.  Striding is
+    # retired now that dt comes from save_t, so this only bites if it is turned
+    # back on, and then it says so rather than corrupting the batch.
+    ctx_n = cfg.n_context_frames
+    if max_stride > 1:
+        print(f'  [WARN] time_strides={cfg.time_strides}: random context frames '
+              f'disabled (incompatible with temporal striding)')
+        ctx_n = None
     dm = FVMDataModule(
         data_dir    = args.data,
         seq_len     = seq_len,
@@ -225,6 +236,7 @@ def main():
         num_workers = num_workers,
         return_mesh_id = True,
         val_fraction   = args.val_fraction,
+        n_context      = ctx_n,
     )
     dm.setup()
 

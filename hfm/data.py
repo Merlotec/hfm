@@ -396,6 +396,8 @@ class FVMSequenceDataset(Dataset):
         frame_cache: Optional[list[torch.Tensor]] = None,
         mesh_id:     Optional[int] = None,
         paths_override: "Optional[list[Path]]" = None,
+        n_context:   Optional[int] = None,
+        ctx_random:  bool = True,
     ):
         files = paths_override if paths_override is not None else \
             _frame_files(sim_dir)[first_frame:]
@@ -446,6 +448,24 @@ class FVMSequenceDataset(Dataset):
         # (older datasets that predate the field), then to the legacy 0.01.
         self.save_t = _read_save_t(sim_dir, files)
 
+        # Where the context frames come from.  With n_context set and ctx_random on,
+        # the context block is drawn from a RANDOM position earlier in the same run
+        # rather than always sitting immediately before the prediction.
+        #
+        # Always taking the preceding frames lets the context double as "a few extra
+        # recent frames": the model can read x_{t-1} out of it and finite-difference
+        # its way forward, instead of using the context for what it is meant to
+        # carry, the run's physics (dt, BCs, the hidden regime).  It also pins one
+        # context to each prediction point, so a run offers |windows| distinct
+        # (context, target) pairs; drawing the context freely gives ~|windows| times
+        # more, which is real augmentation against memorising specific triples.
+        #
+        # The block is constrained to end at or before the INPUT frame, so no target
+        # frame can ever appear in the context.  Without that the model could read
+        # the answer straight out of its own conditioning.
+        self.n_context  = n_context
+        self.ctx_random = bool(ctx_random and n_context is not None)
+
     def set_bc_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """z-score the BC summary with dataset-level stats (regression target)."""
         if self.bc_raw is not None:
@@ -468,8 +488,7 @@ class FVMSequenceDataset(Dataset):
         n = max(1, len(self))
         for _ in range(4):
             try:
-                frames = torch.stack(
-                    [self._get_frame(idx + i) for i in range(self.seq_len)])
+                frames = torch.stack([self._get_frame(i) for i in self._window(idx)])
                 if self.mesh_id is not None:
                     # + geometry id, + BC/forcing summary, + physical frame interval
                     bc = self.bc if self.bc is not None \
@@ -487,6 +506,26 @@ class FVMSequenceDataset(Dataset):
         raise TruncatedRunError(self.paths[0].parent,
                                 'no valid sequence after 4 attempts')
 
+    def _window(self, idx: int) -> "list[int]":
+        """Frame indices for sample `idx`: context block then prediction block.
+
+        Layout matches what the trainer expects, frames[:n_context] is the context
+        and frames[n_context:] is the input frame plus its targets, so nothing
+        downstream changes.  The only difference is that the context block may come
+        from earlier in the run.
+
+        With nc = n_context, the prediction block starts at p = idx + nc and the
+        context block starts at c, drawn uniformly from [0, idx + 1].  c = idx is
+        the legacy contiguous case, and c = idx + 1 ends the context on the input
+        frame itself, which the model already sees.  Every choice is causal.
+        """
+        nc = self.n_context
+        if not self.ctx_random or nc is None:
+            return list(range(idx, idx + self.seq_len))
+        p = idx + nc
+        c = int(torch.randint(idx + 2, (1,)).item())      # [0, idx+1]
+        return list(range(c, c + nc)) + list(range(p, p + self.seq_len - nc))
+
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
             return self._cache[i]
@@ -499,7 +538,9 @@ class FVMSequenceDataset(Dataset):
     def with_cache(cls, sim_dir: Path, renderer: MeshRenderer, seq_len: int,
                    mean: torch.Tensor, std: torch.Tensor,
                    first_frame: int = 0,
-                   mesh_id: Optional[int] = None) -> "FVMSequenceDataset":
+                   mesh_id: Optional[int] = None,
+                   n_context: Optional[int] = None,
+                   ctx_random: bool = True) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
         files = _frame_files(sim_dir)
         files = files[first_frame:]
@@ -524,7 +565,8 @@ class FVMSequenceDataset(Dataset):
             raise TruncatedRunError(
                 sim_dir, f'only {len(cache)} readable frames, need {seq_len}')
         return cls(sim_dir, renderer, seq_len, mean, std, first_frame,
-                   frame_cache=cache, mesh_id=mesh_id, paths_override=files)
+                   frame_cache=cache, mesh_id=mesh_id, paths_override=files,
+                   n_context=n_context, ctx_random=ctx_random)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +605,10 @@ class FVMDataModule:
         # old-solver runs does not: it was all save_t=0.01, i.e. the 5th percentile
         # of what training now sees, so val measured one corner of the dt axis.
         val_fraction: float = 0.05,
+        # Frames the context encoder sees.  Set it to draw the context block from a
+        # random causal position in the run instead of always the frames directly
+        # before the prediction (see FVMSequenceDataset._window).
+        n_context: Optional[int] = None,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
@@ -580,6 +626,7 @@ class FVMDataModule:
         self.std:  Optional[torch.Tensor] = std
         self.return_mesh_id = return_mesh_id
         self.val_fraction = val_fraction
+        self.n_context = n_context
         self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
         self._val_dataset: Optional[Dataset] = None
 
@@ -630,14 +677,20 @@ class FVMDataModule:
         datasets, val_datasets = [], []
         for d, renderer, mi in runs:
             try:
+                is_val = is_val_run(d, self.val_fraction)
                 ds = builder(
                     d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
-                    mesh_id=(mi if self.return_mesh_id else None))
+                    mesh_id=(mi if self.return_mesh_id else None),
+                    n_context=self.n_context,
+                    # Validation stays DETERMINISTIC: a random context would make
+                    # the val metric a different measurement every epoch, and the
+                    # whole point of the ratio is that its movement means something.
+                    ctx_random=not is_val)
             except TruncatedRunError as e:
                 # Setup must not die on a bad run either: quarantine and carry on.
                 quarantine_run(e.sim_dir, e.reason)
                 continue
-            (val_datasets if is_val_run(d, self.val_fraction) else datasets).append(ds)
+            (val_datasets if is_val else datasets).append(ds)
         n_short = sum(1 for ds in datasets if len(ds) == 0)
         datasets = [ds for ds in datasets if len(ds) > 0]
         val_datasets = [ds for ds in val_datasets if len(ds) > 0]

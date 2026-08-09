@@ -431,8 +431,10 @@ class FVMLightningDataModule(L.LightningDataModule):
         first_frame: int = 0,
         return_mesh_id: bool = True,
         val_fraction: float = 0.05,
+        n_context: Optional[int] = None,
     ):
         super().__init__()
+        self._n_context = n_context
         self._return_mesh_id = return_mesh_id
         self._val_fraction = val_fraction
         self._data_dir    = data_dir
@@ -453,6 +455,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             first_frame = self._first_frame,
             return_mesh_id = self._return_mesh_id,
             val_fraction   = self._val_fraction,
+            n_context      = self._n_context,
         )
 
     def prepare_data(self) -> None:
