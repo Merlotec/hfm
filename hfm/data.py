@@ -12,6 +12,7 @@ cached to disk alongside the data as renderer_cache_{H}x{W}.pt.
 
 import hashlib
 import json
+import time
 import os
 import shutil
 import sys
@@ -414,16 +415,12 @@ def _settle_skip(files: "list[Path]", settle_time: float, cold: bool) -> int:
     return len(files)          # whole run is transient
 
 
-def _read_context_params(sim_dir: Path) -> "tuple[Optional[torch.Tensor], int]":
+def _context_params_from(rec: dict) -> "tuple[Optional[torch.Tensor], int]":
     """(continuous context vector, viscosity-model class) for one run.
 
     Missing or unparseable values become NaN / -1, which the probe loss masks per
     sample, so a dataset that predates these fields still trains (it just has no
     context head to speak of)."""
-    try:
-        rec = json.loads((sim_dir / 'params.json').read_text())
-    except Exception:
-        return None, -1
     vals = []
     for k, is_log in CTX_PARAM_KEYS:
         v = rec.get(k)
@@ -438,15 +435,120 @@ def _read_context_params(sim_dir: Path) -> "tuple[Optional[torch.Tensor], int]":
     return torch.tensor(vals, dtype=torch.float32), cls
 
 
-def _read_save_t(sim_dir: Path, files: "list[Path]") -> float:
+# ---------------------------------------------------------------------------
+# Run index
+# ---------------------------------------------------------------------------
+
+INDEX_FILE = 'hfm_run_index.json'
+# Bump when the fields scan_run produces change, so a stale index is rebuilt
+# rather than silently feeding old values into a new label space.
+INDEX_VERSION = 1
+
+
+def _bc_summary(files: "list[Path]") -> "Optional[list]":
+    """Physical boundary-condition summary [mean(C), std(C)] for a run."""
+    fallback = None
+    for f in files[:6]:
+        try:
+            z = np.load(f)
+            # De-normalise, exactly as the cell path and the solver's own loader do
+            # (fvm_solver/.../saving.py).  The .npz stores bc_vals z-scored by THAT
+            # FRAME's cell statistics, so reading it raw gives "how far the boundary
+            # sits from this frame's own field mean, in units of its own field std"
+            # -- a frame-relative number that mixes the forcing with the field
+            # statistics and is partly computable from the frame the encoder already
+            # sees.  That is the opposite of what this target is for.
+            bc = (z['bc_primatives'].astype(np.float32)
+                  * z['prim_std'] + z['prim_mean'])            # [N, C], physical
+            with np.errstate(invalid='ignore'):
+                summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
+            if not np.isfinite(summ).all():
+                continue
+            if fallback is None:
+                fallback = summ
+            # Skip a uniform frame: at t=0 a cold-start segment has a constant
+            # field, so the std half of the summary is all zeros.  Only s00
+            # segments start uniform, so accepting it would hand those runs a
+            # differently-shaped label from every continuation segment.
+            if not np.any(summ[bc.shape[1]:] > 0):
+                continue
+            return [float(x) for x in summ]
+        except Exception:
+            continue
+    return None if fallback is None else [float(x) for x in fallback]
+
+
+def scan_run(sim_dir: Path) -> dict:
+    """Everything about a run that does not depend on seq_len, in ONE pass.
+
+    This is the only place that touches a run's files at setup time, so the
+    result can be cached in the dataset index and reused by every rank and every
+    later job.  params.json used to be opened twice (save_t, then the context
+    parameters); it is read once here.
+    """
+    files = _frame_files(sim_dir)
+    try:
+        rec = json.loads((sim_dir / 'params.json').read_text())
+    except Exception:
+        rec = {}
+    ctx, cls = _context_params_from(rec)
+    return {
+        'files':   [f.name for f in files],
+        'save_t':  _save_t_from(rec, files),
+        'cold':    _is_cold_start(sim_dir),
+        'bc':      _bc_summary(files),
+        'ctx':     None if ctx is None else [float(x) for x in ctx],
+        'ctx_cls': cls,
+    }
+
+
+def load_run_index(data_dir: Path, run_dirs: "list[Path]") -> dict:
+    """Scanned metadata for every run, reusing a cached index where possible.
+
+    Warm start costs one file read plus one directory listing per mesh, instead
+    of ~5 filesystem operations per run on every rank.  Only runs that are new
+    since the index was written are scanned, and entries for runs that have gone
+    (pruned by quarantine_run, say) are dropped, so the index self-heals without
+    ever needing a full rebuild.
+    """
+    path = data_dir / INDEX_FILE
+    cached: dict = {}
+    try:
+        blob = json.loads(path.read_text())
+        if blob.get('version') == INDEX_VERSION:
+            cached = blob['runs']
+    except Exception:
+        pass
+
+    keys = {d: str(d.relative_to(data_dir)) for d in run_dirs}
+    index, missing = {}, []
+    for d, k in keys.items():
+        if k in cached:
+            index[k] = cached[k]
+        else:
+            missing.append((d, k))
+    if missing:
+        print(f'  Indexing {len(missing)} new run(s)'
+              + (f' (of {len(run_dirs)})' if len(missing) != len(run_dirs) else ''))
+        for d, k in missing:
+            index[k] = scan_run(d)
+    if missing or len(index) != len(cached):
+        try:
+            _atomic_write(path, lambda tmp: tmp.write_text(json.dumps(
+                {'version': INDEX_VERSION, 'runs': index})))
+        except Exception as e:
+            print(f'  [warn] could not write {path.name}: {type(e).__name__}: {e}')
+    return {d: index[k] for d, k in keys.items()}
+
+
+def _save_t_from(rec: dict, files: "list[Path]") -> float:
     """Frame interval of a run, in simulation time.
 
     Prefers params.json['save_t'] (written per segment by gen_alternating);
     otherwise infers it from consecutive frame timestamps, which is exact for
     any evenly-sampled run; otherwise the legacy constant."""
     try:
-        with open(sim_dir / 'params.json') as fh:
-            v = json.load(fh).get('save_t')
+        v = rec.get('save_t')
         if v:
             return float(v)
     except Exception:
@@ -483,13 +585,21 @@ class FVMSequenceDataset(Dataset):
         n_context:   Optional[int] = None,
         ctx_random:  bool = True,
         settle_time: float = 0.0,
+        meta:        Optional[dict] = None,
     ):
+        # `meta` is a pre-scanned record from the dataset index (see scan_run).
+        # Without it this constructor touches the filesystem five times per run --
+        # one directory listing, params.json, ic.json and one or two .npz loads --
+        # which every rank repeats for every run at startup.  On a shared
+        # parallel filesystem that is the dominant cost of setup().
+        if meta is None:
+            meta = scan_run(sim_dir)
+
         if paths_override is not None:
             files = paths_override
         else:
-            files = _frame_files(sim_dir)[first_frame:]
-            files = files[_settle_skip(files, settle_time,
-                                       _is_cold_start(sim_dir)):]
+            files = [sim_dir / n for n in meta['files']][first_frame:]
+            files = files[_settle_skip(files, settle_time, meta['cold']):]
         self.paths      = files
         self.renderer   = renderer
         self.seq_len    = seq_len
@@ -503,65 +613,13 @@ class FVMSequenceDataset(Dataset):
         self.std        = std.view(-1, 1, 1)
         self._cache     = frame_cache            # optional pre-rendered cache
 
-        # Per-run boundary-condition summary: per-channel mean+std of the first
-        # readable frame's bc_primatives -> [2C].  This is the forcing information
-        # that is NOT reliably visible in a single field frame; the context probe
-        # regresses it so the encoder is pushed to carry run-specific physics.
-        # NaN-safe (some runs carry NaN bc rows); an unreadable/all-NaN run yields
-        # NaN targets, which consumers mask out of the loss.
-        # Keep scanning until a frame yields a FINITE summary, not merely a
-        # readable one: t_0.npz is the initial condition and its bc_primatives
-        # reduce to NaN, so accepting the first readable frame made every run's
-        # target NaN, which the datamodule then filtered out and set bc_dim=0 --
-        # silently dropping the BC head from the probe entirely.  first_frame=20
-        # used to hide this by never looking at t_0.
-        self.bc_raw: Optional[torch.Tensor] = None
-        fallback = None
-        for f in files[:6]:
-            try:
-                z  = np.load(f)
-                # De-normalise, exactly as the cell path above and the solver's own
-                # loader do (fvm_solver/.../saving.py).  The .npz stores bc_vals
-                # z-scored by THAT FRAME's cell statistics, so reading it raw gives
-                # "how far the boundary sits from this frame's own field mean, in
-                # units of its own field std" -- a frame-relative number that mixes
-                # the forcing with the field statistics, and is partly computable
-                # from the frame the encoder already sees.  That is the opposite of
-                # what this target is for.
-                bc = (z['bc_primatives'].astype(np.float32)
-                      * z['prim_std'] + z['prim_mean'])            # [N, C], physical
-                with np.errstate(invalid='ignore'):
-                    summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
-                if not np.isfinite(summ).all():
-                    continue
-                if fallback is None:
-                    fallback = summ
-                # Skip a uniform frame: at t=0 a cold-start segment has a constant
-                # field, so the std half of the summary is all zeros.  Only s00
-                # segments start uniform, so accepting it would hand 25% of runs a
-                # differently-shaped label from the other 75%.
-                if not np.any(summ[bc.shape[1]:] > 0):
-                    continue
-                self.bc_raw = torch.from_numpy(summ)                  # [2C]
-                break
-            except Exception:
-                continue
-        if self.bc_raw is None and fallback is not None:
-            self.bc_raw = torch.from_numpy(fallback)
-        self.bc = self.bc_raw                    # normalised via set_bc_norm()
-
-        # Physical frame interval for this run.  gen_alternating draws save_t per
-        # segment from U(0.01, 0.2) and records it in params.json, so the timestep
-        # is a CONTINUOUS per-run quantity rather than a global constant: one
-        # sampled stride s means a physical dt = s * save_t, and the same s means
-        # different dynamics in different runs.  Falls back to the frame timestamps
-        # (older datasets that predate the field), then to the legacy 0.01.
-        self.save_t = _read_save_t(sim_dir, files)
-
-        # The hidden per-segment physics.  This is what gen_alternating alternates
-        # and what the context encoder is supposed to infer from the motion; without
-        # it the probe supervises only dt and a trajectory-constant freestream.
-        self.ctx_raw, self.ctx_cls = _read_context_params(sim_dir)
+        self.bc_raw  = (torch.tensor(meta['bc'], dtype=torch.float32)
+                        if meta['bc'] is not None else None)
+        self.bc      = self.bc_raw               # normalised via set_bc_norm()
+        self.save_t  = meta['save_t']
+        self.ctx_raw = (torch.tensor(meta['ctx'], dtype=torch.float32)
+                        if meta['ctx'] is not None else None)
+        self.ctx_cls = meta['ctx_cls']
         self.ctx_vec = self.ctx_raw              # normalised via set_ctx_norm()
 
         # Where the context frames come from.  With n_context set and ctx_random on,
@@ -667,10 +725,13 @@ class FVMSequenceDataset(Dataset):
                    mesh_id: Optional[int] = None,
                    n_context: Optional[int] = None,
                    ctx_random: bool = True,
-                   settle_time: float = 0.0) -> "FVMSequenceDataset":
+                   settle_time: float = 0.0,
+                   meta: Optional[dict] = None) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
-        files = _frame_files(sim_dir)[first_frame:]
-        files = files[_settle_skip(files, settle_time, _is_cold_start(sim_dir)):]
+        if meta is None:
+            meta = scan_run(sim_dir)
+        files = [sim_dir / n for n in meta['files']][first_frame:]
+        files = files[_settle_skip(files, settle_time, meta['cold']):]
         m = mean.view(-1, 1, 1)
         s = std.view(-1, 1, 1)
         cache = []
@@ -694,7 +755,7 @@ class FVMSequenceDataset(Dataset):
         return cls(sim_dir, renderer, seq_len, mean, std, first_frame,
                    frame_cache=cache, mesh_id=mesh_id, paths_override=files,
                    n_context=n_context, ctx_random=ctx_random,
-                   settle_time=settle_time)
+                   settle_time=settle_time, meta=meta)
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +846,12 @@ class FVMDataModule:
         if not runs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 
+        # One cached pass over every run's metadata, instead of ~5 filesystem
+        # operations per run per rank.  See load_run_index.
+        _t0 = time.perf_counter()
+        meta = load_run_index(self.data_dir, [d for d, _r, _mi in runs])
+        print(f'  Run index: {len(meta)} runs in {time.perf_counter() - _t0:.1f}s')
+
         # Load or compute normalisation stats (skip if already provided externally)
         if self.mean is None or self.std is None:
             stats_path = self.data_dir / self.STATS_FILE
@@ -817,6 +884,7 @@ class FVMDataModule:
                     mesh_id=(mi if self.return_mesh_id else None),
                     n_context=self.n_context,
                     settle_time=self.settle_time,
+                    meta=meta[d],
                     # Validation stays DETERMINISTIC: a random context would make
                     # the val metric a different measurement every epoch, and the
                     # whole point of the ratio is that its movement means something.

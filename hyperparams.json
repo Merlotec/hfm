@@ -52,6 +52,8 @@
 
   "training": {
     "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic — training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",
+    "_settle_time": "Sim-time (s) dropped from the front of COLD-START runs only (gen_alternating segment 0, or any run_gen trajectory; detected from ic.json segment_id). Measured one-step persistence after an impulsive start: 1.635 at 0-0.05s, 0.829 at 0.1-0.2s, 0.301 at 0.2-0.4s, 0.077 at 0.4-0.7s, 0.012 at 0.7-1.0s, i.e. the field settles by ~0.7s, a 140x drop. The cut is in SIM TIME not frames because a segment spans 30*save_t: at save_t=0.01 all 30 frames are transient, at save_t=0.2 only the first four are. Costs ~8.5% of the corpus; continuation segments are never touched.",
+    "settle_time": 0.7,
     "batch_size": 32,
     "n_epochs": 200,
     "num_workers": 8,
