@@ -281,7 +281,7 @@ class HFMLightningModule(L.LightningModule):
             logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                     's': float(s)}
             if probed:
-                for k in ('dt_rel_err', 'bc_mse'):
+                for k in ('dt_mse', 'dt_rel_err', 'bc_mse'):
                     if k in self._probe_metrics:
                         logs[k] = self._probe_metrics[k]
             self.log_dict(logs, prog_bar=True, sync_dist=True)
@@ -346,7 +346,7 @@ class HFMLightningModule(L.LightningModule):
         logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                 'disc': d_loss, 'adv_w': adv_w, 's': float(s)}
         if probed:
-            for k in ('dt_rel_err', 'bc_mse'):
+            for k in ('dt_mse', 'dt_rel_err', 'bc_mse'):
                 if k in self._probe_metrics:
                     logs[k] = self._probe_metrics[k]
         self.log_dict(logs, prog_bar=True, sync_dist=True)

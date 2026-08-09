@@ -398,11 +398,20 @@ class FVMSequenceDataset(Dataset):
         # regresses it so the encoder is pushed to carry run-specific physics.
         # NaN-safe (some runs carry NaN bc rows); an unreadable/all-NaN run yields
         # NaN targets, which consumers mask out of the loss.
+        # Keep scanning until a frame yields a FINITE summary, not merely a
+        # readable one: t_0.npz is the initial condition and its bc_primatives
+        # reduce to NaN, so accepting the first readable frame made every run's
+        # target NaN, which the datamodule then filtered out and set bc_dim=0 --
+        # silently dropping the BC head from the probe entirely.  first_frame=20
+        # used to hide this by never looking at t_0.
         self.bc_raw: Optional[torch.Tensor] = None
-        for f in files[:3]:                      # tolerate a corrupt first file
+        for f in files[:5]:
             try:
                 bc = np.load(f)['bc_primatives'].astype(np.float32)   # [N, C]
-                summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
+                with np.errstate(invalid='ignore'):
+                    summ = np.concatenate([np.nanmean(bc, 0), np.nanstd(bc, 0)])
+                if not np.isfinite(summ).all():
+                    continue
                 self.bc_raw = torch.from_numpy(summ)                  # [2C]
                 break
             except Exception:

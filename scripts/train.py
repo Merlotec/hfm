@@ -171,7 +171,7 @@ def main():
                         help='Override n_epochs from hyperparams.json')
     parser.add_argument('--log-every',  type=int,  default=50,
                         help='Print a log line every N steps')
-    parser.add_argument('--ckpt-every', type=int,  default=1000,
+    parser.add_argument('--ckpt-every', type=int,  default=500,
                         help='Save train_step<N>.pt every N steps (0 disables). '
                              'These are what `--resume latest` looks for.')
     args = parser.parse_args()
@@ -412,12 +412,23 @@ def main():
                 persist = info.get('persist', float('nan'))
                 ratio = recon / persist if persist > 0 else float('inf')
                 stride_bit = f"s={info.get('stride', 1)} dt={info.get('dt', 0):.3g}"
-                if 'dt_rel_err' in info:
-                    stride_bit += f"  dt_err={info['dt_rel_err']:.2f}"
+                # Both probe heads, reported separately: they are summed into one
+                # term before the weight is applied, so a single number cannot say
+                # which of the two the context is failing to carry.  dt_loss is MSE
+                # on the standardised log-timestep, bc_loss is MSE on the z-scored
+                # BC summary, and both are therefore O(1) at init and -> 0 when the
+                # context is informative.  dt_rel is the same dt error expressed as
+                # a fraction of dt, which is the interpretable one.
+                probe_bit = ''
+                if 'dt_mse' in info:
+                    probe_bit += (f"  dt_loss={info['dt_mse']:.4f}"
+                                  f" (rel {info.get('dt_rel_err', float('nan')):.2f})")
+                if 'bc_mse' in info:
+                    probe_bit += f"  bc_loss={info['bc_mse']:.4f}"
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
                     f'recon={recon:.4f}  persist={persist:.4f}  ratio={ratio:.2f}  '
-                    f'{stride_bit}  '
+                    f'{stride_bit}{probe_bit}  '
                     f'disc={disc:.4f}  '
                     f'adv_w={info["adv_weight"]:.3f}'
                 )
