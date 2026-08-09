@@ -12,8 +12,10 @@ cached to disk alongside the data as renderer_cache_{H}x{W}.pt.
 
 import json
 import os
+import shutil
 import sys
 import pickle
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -216,6 +218,110 @@ def compute_normalisation_stats(
 
 
 # ---------------------------------------------------------------------------
+# Truncated runs
+# ---------------------------------------------------------------------------
+
+class TruncatedRunError(RuntimeError):
+    """A run directory that could not yield a single readable sequence."""
+
+    def __init__(self, sim_dir: Path, reason: str):
+        super().__init__(f'{sim_dir}: {reason} — this run is truncated')
+        self.sim_dir = Path(sim_dir)
+        self.reason = reason
+
+
+# Runs this PROCESS has already dealt with, so a dead run is not re-attempted (or
+# re-deleted) on every draw.  Per-process by design: workers are forked copies and
+# the on-disk delete is what they actually share.
+_quarantined: set = set()
+
+
+def prune_enabled() -> bool:
+    """Delete truncated runs on sight.  HFM_PRUNE_BAD_RUNS=0 quarantines without
+    deleting, which is the setting to use on a dataset you cannot regenerate."""
+    return os.environ.get('HFM_PRUNE_BAD_RUNS', '1') not in ('0', 'false', 'False')
+
+
+def quarantine_run(sim_dir: Path, reason: str) -> None:
+    """Take a truncated run out of circulation, deleting it when pruning is on.
+
+    Guarded deliberately: this removes data irreversibly, so it refuses anything
+    that is not shaped like a solver run directory (name starts with 'run',
+    carries params.json, sits under a mesh dir).  A path that fails the guard is
+    only skipped, never deleted — a bug in the caller must not be able to take
+    out a mesh directory or the dataset root.
+    """
+    sim_dir = Path(sim_dir)
+    if sim_dir in _quarantined:
+        return
+    _quarantined.add(sim_dir)
+
+    looks_like_run = (
+        sim_dir.is_dir()
+        and sim_dir.name.startswith('run')
+        and (sim_dir / 'params.json').exists()
+        and sim_dir.parent != sim_dir
+    )
+    if not looks_like_run:
+        print(f'  [warn] refusing to delete {sim_dir}: does not look like a run '
+              f'directory; skipping it for this process only')
+        return
+    if not prune_enabled():
+        print(f'  [warn] truncated run {sim_dir} ({reason}); skipping '
+              f'(HFM_PRUNE_BAD_RUNS=0, not deleting)')
+        return
+
+    n_frames = len(list(sim_dir.glob('t_*.npz')))
+    try:
+        shutil.rmtree(sim_dir)
+    except Exception as e:
+        print(f'  [warn] could not delete {sim_dir}: {type(e).__name__}: {e}')
+        return
+    print(f'  [prune] deleted truncated run {sim_dir} ({reason}, {n_frames} frames)')
+    # Append-only record so a pruned dataset can still be accounted for later.
+    # One small O_APPEND write per line, which is atomic across ranks.
+    try:
+        line = (f'{datetime.now().isoformat(timespec="seconds")}\t{sim_dir.name}\t'
+                f'{n_frames} frames\t{reason}\n')
+        with open(sim_dir.parent / 'deleted_runs.log', 'a') as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+class ResilientConcat(Dataset):
+    """ConcatDataset that cannot be killed by one bad run.
+
+    A truncated run used to raise out of the DataLoader worker, which killed the
+    rank, which stranded every other rank in its next collective ("Connection
+    closed by peer").  One unreadable file took down all 8 ranks hours in.  Here
+    the bad run is quarantined (and deleted, see quarantine_run) and the draw is
+    retried at a different random index, so training simply continues.
+    """
+
+    def __init__(self, dataset: ConcatDataset, max_retries: int = 8):
+        self.dataset = dataset
+        self.max_retries = max_retries
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        n = len(self.dataset)
+        for _ in range(self.max_retries):
+            try:
+                return self.dataset[idx]
+            except TruncatedRunError as e:
+                quarantine_run(e.sim_dir, e.reason)
+            except Exception as e:
+                print(f'  [warn] sample {idx} failed ({type(e).__name__}: {e}); redrawing')
+            idx = int(torch.randint(n, (1,)).item())
+        raise RuntimeError(
+            f'{self.max_retries} consecutive unreadable samples — the dataset is '
+            'likely mostly truncated; check it with scripts/check_frames.py')
+
+
+# ---------------------------------------------------------------------------
 # Single-run dataset
 # ---------------------------------------------------------------------------
 
@@ -269,9 +375,10 @@ class FVMSequenceDataset(Dataset):
         first_frame: int = 0,
         frame_cache: Optional[list[torch.Tensor]] = None,
         mesh_id:     Optional[int] = None,
+        paths_override: "Optional[list[Path]]" = None,
     ):
-        files = _frame_files(sim_dir)
-        files = files[first_frame:]
+        files = paths_override if paths_override is not None else \
+            _frame_files(sim_dir)[first_frame:]
         self.paths      = files
         self.renderer   = renderer
         self.seq_len    = seq_len
@@ -348,9 +455,8 @@ class FVMSequenceDataset(Dataset):
                     print('         python scripts/check_frames.py <data_dir>')
                     FVMSequenceDataset._warned_corrupt = True
                 idx = (idx + self.seq_len) % n
-        raise RuntimeError(
-            f'{self.paths[0].parent}: could not read a valid sequence after 4 attempts '
-            '— this run is likely truncated; remove or repair it.')
+        raise TruncatedRunError(self.paths[0].parent,
+                                'no valid sequence after 4 attempts')
 
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
@@ -371,13 +477,25 @@ class FVMSequenceDataset(Dataset):
         m = mean.view(-1, 1, 1)
         s = std.view(-1, 1, 1)
         cache = []
-        for path in files:
-            d    = np.load(path)
-            vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-            raw  = renderer.render_cell_smooth(vals)
+        for i, path in enumerate(files):
+            try:
+                d    = np.load(path)
+                vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+                raw  = renderer.render_cell_smooth(vals)
+            except Exception as e:
+                # Stop at the first unreadable frame rather than skipping it: the
+                # frames already cached are contiguous in time, and splicing across
+                # a gap would silently hand the model a discontinuous sequence.
+                print(f'  [warn] {sim_dir.name}: unreadable frame {path.name} '
+                      f'({type(e).__name__}); keeping the first {i} frame(s)')
+                files = files[:i]
+                break
             cache.append((raw - m) / s)
+        if len(cache) < seq_len:
+            raise TruncatedRunError(
+                sim_dir, f'only {len(cache)} readable frames, need {seq_len}')
         return cls(sim_dir, renderer, seq_len, mean, std, first_frame,
-                   frame_cache=cache, mesh_id=mesh_id)
+                   frame_cache=cache, mesh_id=mesh_id, paths_override=files)
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +591,15 @@ class FVMDataModule:
         builder = FVMSequenceDataset.with_cache if self.cache_frames else (
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
         )
-        datasets = [
-            builder(d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
-                    mesh_id=(mi if self.return_mesh_id else None))
-            for d, renderer, mi in runs
-        ]
+        datasets = []
+        for d, renderer, mi in runs:
+            try:
+                datasets.append(builder(
+                    d, renderer, self.seq_len, self.mean, self.std, self.first_frame,
+                    mesh_id=(mi if self.return_mesh_id else None)))
+            except TruncatedRunError as e:
+                # Setup must not die on a bad run either: quarantine and carry on.
+                quarantine_run(e.sim_dir, e.reason)
         n_short = sum(1 for ds in datasets if len(ds) == 0)
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
@@ -507,11 +629,11 @@ class FVMDataModule:
             self.bc_mean = self.bc_std = None
             self.bc_dim = 0
 
-        self._dataset = ConcatDataset(datasets)
+        self._dataset = ResilientConcat(ConcatDataset(datasets))
         # print the MESH count too: without it a multi-mesh run looks identical to a
         # single-mesh one, which is how the shared-mask bug stayed invisible.
-        print(f'Dataset ready: {len(self._dataset)} sequences across {len(runs)} runs '
-              f'/ {len(mesh_dirs)} mesh(es)')
+        print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} '
+              f'usable runs (of {len(runs)} found) / {len(mesh_dirs)} mesh(es)')
         # Frame-interval spread across runs: with gen_alternating this should span
         # roughly 0.01..0.2, and a single value means the dataset predates save_t
         # (or params.json is missing), so the dt probe has nothing to regress.
