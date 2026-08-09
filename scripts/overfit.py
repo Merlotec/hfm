@@ -46,7 +46,7 @@ CFG = HFMConfig(n_warmup_frames=3, gradient_checkpointing=True)
 
 N_WARMUP    = CFG.n_warmup_frames
 SEQ_LEN     = N_WARMUP + 2        # warmup frames + prediction input + target
-FIRST_FRAME = 20
+FIRST_FRAME = 0
 LR          = 1e-4
 N_STEPS_1   = 5000                # stage 1: no residual
 N_STEPS_2   = 5000                # stage 2: with residual

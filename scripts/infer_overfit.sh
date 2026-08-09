@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 
 DATA_DIR="$(pwd)/../data/fvm_validation"
 OUT_DIR="$(pwd)/out/infer"
-CKPT="$(pwd)/checkpoints/ckpt-step003000.ckpt"
+CKPT="$(pwd)/checkpoints/ckpt-step037500.ckpt"
+DET_CKPT="$(pwd)/checkpoints/refiner_step020000.pt"
 
 echo "Checkpoint : $CKPT"
 echo "Data       : $DATA_DIR"
@@ -16,6 +17,7 @@ echo ""
 
 python infer.py \
     --checkpoint "$CKPT" \
+    --refine "$DET_CKPT" \
     --data-dir   "$DATA_DIR" \
     --out-dir    "$OUT_DIR" \
     --n-predict  30 

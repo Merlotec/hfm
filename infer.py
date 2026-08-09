@@ -104,6 +104,7 @@ def save_viewer_frames(
     n_seed: int,
     run_name: str,
     viewer_dir: Path,
+    refined_phys: Optional[np.ndarray] = None,
 ):
     """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c.
 
@@ -111,6 +112,10 @@ def save_viewer_frames(
     marked is_seed=True; ``pred_phys`` are the predictions.  Including the input frame as
     the last seed is what makes the viewer's first predicted delta be pred[0]-input (the
     model's actual one-step change) rather than a GT delta smeared across the gap.
+
+    ``refined_phys`` (optional) are the flow-matching refiner's outputs for the same
+    predicted frames; when present they are stored alongside as ``grid_refined`` so the
+    viewer can show the detail model's output as its own row.
     """
     run_dir = viewer_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -121,14 +126,17 @@ def save_viewer_frames(
 
     T = len(timestamps)
     for i, ts in enumerate(timestamps):
+        extra = {}
         if i < n_seed:
             grid    = seed_phys[i].astype(np.float32)
             is_seed = True
         else:
             grid    = pred_phys[i - n_seed].astype(np.float32)
             is_seed = False
+            if refined_phys is not None:
+                extra['grid_refined'] = refined_phys[i - n_seed].astype(np.float32)
         np.savez(run_dir / f't_{ts:.4g}.npz',
-                 grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed))
+                 grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed), **extra)
 
     print(f'  Saved {T} viewer frames → {run_dir}')
 
@@ -268,8 +276,8 @@ def main():
                         help='Number of frames to predict autoregressively')
     parser.add_argument('--seq-start',  type=int, default=None,
                         help='Frame index to start from (defaults to middle of run)')
-    parser.add_argument('--first-frame', type=int, default=20,
-                        help='Skip this many initial transient frames')
+    parser.add_argument('--first-frame', type=int, default=0,
+                        help='Skip this many initial frames (0: keep all)')
     parser.add_argument('--no-images',    action='store_true',
                         help='Skip PNG generation')
     parser.add_argument('--disc-saliency', action='store_true',
@@ -511,12 +519,13 @@ def main():
         all_ts = (timestamps[:n_context + 1]
                   + timestamps[n_context + 1: n_context + 1 + args.n_predict])
         save_viewer_frames(
-            seed_phys  = seed_phys,
-            pred_phys  = show_phys,
-            timestamps = all_ts,
-            n_seed     = n_context + 1,
-            run_name   = sim_dir.name,
-            viewer_dir = out_dir / 'viewer',
+            seed_phys    = seed_phys,
+            pred_phys    = pred_phys,
+            timestamps   = all_ts,
+            n_seed       = n_context + 1,
+            run_name     = sim_dir.name,
+            viewer_dir   = out_dir / 'viewer',
+            refined_phys = refined_phys if preds_refined else None,
         )
 
         if not args.no_images:

@@ -100,7 +100,8 @@ def load_config() -> tuple[HFMConfig, dict]:
         mlp_ratio              = m['mlp_ratio'],
         dropout                = m['dropout'],
         rollout_horizon        = m.get('rollout_horizon', 4),
-        time_strides           = tuple(m.get('time_strides', (1, 2, 4))),
+        time_strides           = tuple(m.get('time_strides',
+                                          HFMConfig.time_strides)),
         stride_cls_weight      = m.get('stride_cls_weight', 0.5),
         n_context_frames       = m['n_context_frames'],
         ctx_patch_px           = m['ctx_patch_px'],
@@ -289,7 +290,6 @@ def main():
         accum_steps           = accum_steps,
         use_gan               = use_gan,
         # Context-probe label spaces: geometry classes and BC-summary dimension.
-        probe_n_meshes        = (dm.mesh_masks.shape[0] if dm.mesh_masks is not None else 0),
         probe_bc_dim          = getattr(dm, 'bc_dim', 0),
     )
 
@@ -368,16 +368,17 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)       # reshuffle this rank's shard
 
-        for batch in train_dl:            # (frames, mesh_ids, bc) / (frames, mesh_ids) / frames
-            mesh_b = bc_b = None
+        for batch in train_dl:            # (frames, mesh_ids, bc, save_t) / ... / frames
+            mesh_b = bc_b = save_t_b = None
             if isinstance(batch, (tuple, list)):
-                mesh_b = batch[1] if len(batch) > 1 else None
-                bc_b   = batch[2] if len(batch) > 2 else None
-                batch  = batch[0]
+                mesh_b   = batch[1] if len(batch) > 1 else None
+                bc_b     = batch[2] if len(batch) > 2 else None
+                save_t_b = batch[3] if len(batch) > 3 else None
+                batch    = batch[0]
             frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
 
             recon, disc = trainer.step(frames, pixel_mask=pixel_mask,
-                                       mesh_ids=mesh_b, bc=bc_b)
+                                       mesh_ids=mesh_b, bc=bc_b, save_t=save_t_b)
             info = trainer.training_info()
             step = info['global_step']
 
@@ -410,9 +411,9 @@ def main():
                 # so the ratio stays honest when the timestep varies.
                 persist = info.get('persist', float('nan'))
                 ratio = recon / persist if persist > 0 else float('inf')
-                stride_bit = f"s={info.get('stride', 1)}"
-                if 'stride_acc' in info:
-                    stride_bit += f"  sacc={info['stride_acc']:.2f}"
+                stride_bit = f"s={info.get('stride', 1)} dt={info.get('dt', 0):.3g}"
+                if 'dt_rel_err' in info:
+                    stride_bit += f"  dt_err={info['dt_rel_err']:.2f}"
                 print(
                     f'epoch {epoch:3d}  step {step:6d} | '
                     f'recon={recon:.4f}  persist={persist:.4f}  ratio={ratio:.2f}  '

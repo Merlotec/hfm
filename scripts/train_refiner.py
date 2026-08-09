@@ -239,10 +239,13 @@ def main():
 
     # ---- sigma_d calibration (teacher-forced k=1 only; fixed for the model's life) ----
     if sigma_d is None:
-        print(f'Calibrating sigma_d over {args.sigma_calib_batches} batches...')
+        print(f'Calibrating sigma_d over {args.sigma_calib_batches} batches '
+              f'(data-loader bound: expect minutes, GPU mostly idle)...', flush=True)
         ssum = torch.zeros(cfg.in_channels, device=device)
         cnt = torch.zeros(cfg.in_channels, device=device)
-        for _ in range(args.sigma_calib_batches):
+        for _i in range(args.sigma_calib_batches):
+            if _i and _i % 20 == 0:
+                print(f'  calib {_i}/{args.sigma_calib_batches}', flush=True)
             frames, mesh_b = next(it)
             x_in, pred, target, mask, _, s, _ = make_pair(
                 frames, mesh_b, mesh_masks, model, ce, cfg, device, amp,
@@ -309,7 +312,7 @@ def main():
             avg = run_loss / max(1, run_n)
             rate = run_n / (time.time() - t0)
             print(f'step {global_step:6d} | loss={avg:.4f}  s={s} k={k}  '
-                  f'lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} it/s')
+                  f'lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} it/s', flush=True)
             with open(log_path, 'a', newline='') as f:
                 csv.writer(f).writerow([global_step, f'{avg:.5f}', s, k,
                                         f'{sched.get_last_lr()[0]:.3e}'])

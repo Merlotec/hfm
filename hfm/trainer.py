@@ -69,40 +69,53 @@ class FluidLoss(nn.Module):
 # Stride probe: does the context actually encode the timestep?
 # ---------------------------------------------------------------------------
 
+# Fixed affine standardisation of the log-timestep regression target.  dt = s *
+# save_t with s in {1,2,4} and save_t ~ U(0.01, 0.2), so log(dt) runs about
+# -4.6 .. -0.2 with mean ~ -2.5 and spread ~ 1.  Without this the raw target
+# sits near -4.6 while a fresh zero-init head predicts ~0, so the probe term
+# starts at ~20 and swamps the reconstruction loss (~0.01) for the first
+# thousand steps.  CONSTANTS, not batch statistics: a running normaliser would
+# make the loss scale drift and the metric incomparable across runs.
+LOG_DT_MEAN = -2.5
+LOG_DT_STD  = 1.0
+
+
 class ContextProbe(nn.Module):
     """
-    Recover everything we have labels for from the context tokens alone:
+    Recover from the context tokens alone the quantities the context must carry:
 
-      stride : which temporal stride was sampled (classification) — exists only
-               in the inter-frame motion of the context frames
-      mesh   : which geometry this sample comes from (classification)
-      bc     : per-run boundary-condition summary (regression, z-scored) — the
-               run-specific forcing that a single field frame does not reliably
-               carry, i.e. exactly the information the context-swap test showed
-               the model was not using
+      dt : the physical timestep the transition spans, as log(dt) (REGRESSION).
+           gen_alternating draws save_t per segment from a continuous range and
+           the trainer samples a stride s on top, so the timestep is a continuous
+           quantity dt = s * save_t -- not a member of a small fixed set.  A
+           classifier over discrete strides cannot represent that, and would also
+           be degenerate here: the same stride means different physical dt in
+           different runs, so the label would not identify the prediction task.
+           Regressing log(dt) makes the target scale-free (dt spans ~1.5 decades),
+           and lets the model interpolate and extrapolate along the timestep axis
+           rather than memorising a handful of classes.
 
-    Trained jointly (small weight), each head both MEASURES whether that
+      bc : per-run boundary-condition summary (regression, z-scored) -- the
+           run-specific forcing that a single field frame does not reveal.
+
+    Trained jointly with a small weight, each head both MEASURES whether the
     information is present in the context and applies gradient pressure on the
-    encoder to put it there: a collapsed/constant context satisfies none of them.
+    encoder to put it there: a collapsed/constant context satisfies neither.
     """
 
-    def __init__(self, d_ctx: int, n_strides: int,
-                 n_meshes: int = 0, bc_dim: int = 0):
+    def __init__(self, d_ctx: int, bc_dim: int = 0, **_legacy):
         super().__init__()
         h = d_ctx // 2
         self.trunk = nn.Sequential(
             nn.LayerNorm(d_ctx), nn.Linear(d_ctx, h), nn.GELU(),
         )
-        self.stride_head = nn.Linear(h, n_strides)
-        self.mesh_head = nn.Linear(h, n_meshes) if n_meshes > 1 else None
+        self.dt_head = nn.Linear(h, 1)
         self.bc_head = nn.Linear(h, bc_dim) if bc_dim > 0 else None
 
     def forward(self, context: torch.Tensor) -> dict:
-        """context: [B, K, d_ctx] → {'stride': [B,S], 'mesh': [B,M]?, 'bc': [B,D]?}."""
+        """context: [B, K, d_ctx] -> {'log_dt': [B], 'bc': [B, D]?}."""
         z = self.trunk(context.mean(dim=1))
-        out = {'stride': self.stride_head(z)}
-        if self.mesh_head is not None:
-            out['mesh'] = self.mesh_head(z)
+        out = {'log_dt': self.dt_head(z).squeeze(-1)}
         if self.bc_head is not None:
             out['bc'] = self.bc_head(z)
         return out
@@ -111,34 +124,36 @@ class ContextProbe(nn.Module):
 def probe_losses(
     probe: nn.Module,
     context: torch.Tensor,
-    stride_label: int,
-    mesh_ids: Optional[torch.Tensor] = None,
+    dt: Optional[torch.Tensor] = None,
     bc: Optional[torch.Tensor] = None,
     metrics: Optional[dict] = None,
 ) -> torch.Tensor:
     """
-    Combined probe loss (CE ~ ln(n) and z-scored MSE are comparable scales, so
-    the terms are summed unweighted; the caller applies one overall weight).
-    NaN bc rows (runs with unreadable BCs) are masked out per sample.
+    Combined probe loss.  Both terms are z-scale-ish regressions, so they are
+    summed unweighted and the caller applies one overall weight.  Non-finite
+    rows (runs with unreadable BCs) are masked out per sample.
+
+    dt: [B] physical timestep of the transition being predicted (seconds of
+        simulation time).  Regressed in log space.
     """
     out = probe(context)
-    B = context.shape[0]
     dev = context.device
+    total = context.sum() * 0.0            # typed zero on the right device/graph
 
-    labels = torch.full((B,), stride_label, dtype=torch.long, device=dev)
-    total = F.cross_entropy(out['stride'].float(), labels)
-    if metrics is not None:
-        metrics['stride_loss'] = float(total.item())
-        metrics['stride_acc'] = float((out['stride'].argmax(-1) == labels)
-                                      .float().mean().item())
-
-    if 'mesh' in out and mesh_ids is not None:
-        m_lab = mesh_ids.to(dev).long()
-        m_loss = F.cross_entropy(out['mesh'].float(), m_lab)
-        total = total + m_loss
+    if dt is not None:
+        log_dt = torch.log(dt.to(dev).float().clamp_min(1e-8))
+        tgt  = (log_dt - LOG_DT_MEAN) / LOG_DT_STD
+        pred = out['log_dt'].float()
+        err  = F.mse_loss(pred, tgt)
+        total = total + err
         if metrics is not None:
-            metrics['mesh_acc'] = float((out['mesh'].argmax(-1) == m_lab)
-                                        .float().mean().item())
+            with torch.no_grad():
+                # median |dt_pred/dt - 1|: the interpretable number, and median
+                # rather than mean so one badly-predicted sample cannot dominate
+                # while the head is still warming up.
+                rel = (((pred - tgt) * LOG_DT_STD).exp() - 1.0).abs().median()
+                metrics['dt_mse'] = float(err.item())
+                metrics['dt_rel_err'] = float(rel.item())
 
     if 'bc' in out and bc is not None:
         tgt = bc.to(dev).float()
@@ -176,8 +191,7 @@ def train_step_gan(
     micro_first: bool = True,
     micro_last: bool = True,
     probe: Optional[nn.Module] = None,
-    stride_label: Optional[int] = None,
-    probe_mesh_ids: Optional[torch.Tensor] = None,
+    probe_dt: Optional[torch.Tensor] = None,
     probe_bc: Optional[torch.Tensor] = None,
     stride_cls_weight: float = 0.0,
     metrics: Optional[dict] = None,
@@ -240,10 +254,9 @@ def train_step_gan(
     # the encoder only through the inter-frame motion.  The probe both measures
     # and enforces that the context carries each labelled quantity.
     probe_term = None
-    if probe is not None and stride_label is not None and stride_cls_weight > 0.0:
+    if probe is not None and probe_dt is not None and stride_cls_weight > 0.0:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            probe_term = probe_losses(probe, context, stride_label,
-                                      mesh_ids=probe_mesh_ids, bc=probe_bc,
+            probe_term = probe_losses(probe, context, dt=probe_dt, bc=probe_bc,
                                       metrics=metrics)
 
     # ---- scheduled sampling: sometimes feed the model its own prediction ----
@@ -449,8 +462,8 @@ class GANTrainer:
         cosine_t_max: int = 10_000,
         accum_steps: int = 1,
         use_gan: bool = True,
-        probe_n_meshes: int = 0,
         probe_bc_dim: int = 0,
+        **_legacy_probe_args,
     ):
         self.self_input_prob  = self_input_prob
         self.cosine_t_max     = cosine_t_max
@@ -474,15 +487,12 @@ class GANTrainer:
             hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
         )
 
-        # Stride probe: only meaningful when there is more than one stride to
-        # classify.  Joint-trained with a small weight (cfg.stride_cls_weight).
+        # Context probe.  Always built now: the timestep is continuous
+        # (dt = stride * run save_t), so it varies sample to sample even with a
+        # single stride, and the BC head is useful regardless.
         strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
         self.time_strides = strides
-        self.stride_probe = (
-            ContextProbe(cfg.d_ctx, len(strides),
-                         n_meshes=probe_n_meshes, bc_dim=probe_bc_dim)
-            if len(strides) > 1 else None
-        )
+        self.stride_probe = ContextProbe(cfg.d_ctx, bc_dim=probe_bc_dim)
         self._stride_metrics: dict = {}
         self._last_stride: int = strides[0]
 
@@ -627,6 +637,7 @@ class GANTrainer:
         pixel_mask: Optional[torch.Tensor] = None,
         mesh_ids: Optional[torch.Tensor] = None,
         bc: Optional[torch.Tensor] = None,
+        save_t: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
         """frames: list of (n_context_frames + rollout_horizon) * max(time_strides) + 1
         tensors [B, C, H, W].  Each step samples one temporal stride s and trains on
@@ -654,6 +665,13 @@ class GANTrainer:
         frames = frames[off : off + need : s]
         self._last_stride = s
         self._stride_metrics = {}
+        # Physical timestep of each transition in this batch.  save_t is per RUN
+        # (gen_alternating samples it per segment), so dt varies across the batch
+        # even though the stride does not.
+        B = frames[0].shape[0]
+        dt = (save_t.to(frames[0].device).float() * s if save_t is not None
+              else torch.full((B,), float(s) * 0.01, device=frames[0].device))
+        self._stride_metrics['dt'] = float(dt.mean().item())
         # Persistence baseline AT THIS STRIDE — the honest "model vs copy-input"
         # comparison for the log (stride-1 persistence would flatter larger strides).
         with torch.no_grad():
@@ -688,8 +706,7 @@ class GANTrainer:
                 micro_first=micro_first,
                 micro_last=micro_last,
                 probe=self.stride_probe,
-                stride_label=s_idx,
-                probe_mesh_ids=mesh_ids,
+                probe_dt=dt,
                 probe_bc=bc,
                 stride_cls_weight=getattr(self.cfg, 'stride_cls_weight', 0.0),
                 metrics=self._stride_metrics,
@@ -718,7 +735,7 @@ class GANTrainer:
             'gan_active':  self._current_adv_weight() > 0.0,
             'stride':      self._last_stride,
         }
-        info.update(self._stride_metrics)      # stride_loss / stride_acc when present
+        info.update(self._stride_metrics)      # dt / persist / dt_rel_err / bc_mse
         return info
 
     @torch.no_grad()
@@ -782,7 +799,17 @@ class GANTrainer:
             print(f'  New/missing model keys (random init): {missing}')
 
         if 'context_encoder' in ckpt:
-            self.context_encoder.load_state_dict(ckpt['context_encoder'])
+            try:
+                self.context_encoder.load_state_dict(ckpt['context_encoder'])
+            except RuntimeError as e:
+                print(f'  [ERROR] context encoder does not match this config: {e}')
+                raise SystemExit(
+                    'Cannot resume: the checkpoint was trained with a different context '
+                    'encoder shape.  n_ctx_tokens changed 64 -> 16 and the probe head '
+                    'changed from a discrete stride classifier to a continuous log(dt) '
+                    'regressor, so both the summary table and the optimizer state are '
+                    'incompatible.  Train from scratch, or set n_ctx_tokens back to the '
+                    "checkpoint's value in hyperparams.json.")
         else:
             print('  [warn] no context_encoder in checkpoint; starting fresh')
 

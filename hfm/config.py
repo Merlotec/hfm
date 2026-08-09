@@ -40,7 +40,14 @@ class HFMConfig:
     # timestep is parameterised purely by the context (the encoder sees how far
     # the flow moves between its input frames), never as an explicit input.
     # Needs seq_len = (n_context_frames + rollout_horizon) * max(stride) + 1.
-    time_strides: tuple = (1, 2, 4)
+    # (1,) by default: the timestep axis is now carried by save_t, which the
+    # solver draws per segment over 0.01..0.2, so strides are no longer needed to
+    # produce a spread of dt and would only shrink the usable windows per 30-frame
+    # segment (stride 2 needs 19 frames instead of 10, i.e. 12 windows not 21).
+    # The machinery is kept because it is the only way to reach dt above
+    # max(save_t), and the only source of same-state/different-dt pairs; setting
+    # e.g. (1, 2) here switches it back on with no code change.
+    time_strides: tuple = (1,)
     # Weight of the auxiliary stride-classification loss on the context tokens.
     # A small probe must recover the sampled stride from the context alone —
     # direct evidence (and gradient pressure) that the context actually encodes
@@ -67,7 +74,7 @@ class HFMConfig:
     n_context_frames: int = 5
     ctx_patch_px: int = 16
     d_ctx: int = 256
-    n_ctx_tokens: int = 64
+    n_ctx_tokens: int = 16
     n_ctx_layers: int = 4
     n_ctx_heads: int = 8
 

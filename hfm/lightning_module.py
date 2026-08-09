@@ -80,16 +80,12 @@ class HFMLightningModule(L.LightningModule):
 
         # Multi-timestep training: each step samples a stride s from time_strides and
         # trains on every s-th frame, so the timestep reaches the model only through
-        # the context (spacing of its input frames).  The probe recovers stride,
-        # geometry, and BC summary from the context alone — evidence + gradient
-        # pressure that the context carries them (see trainer.ContextProbe).
+        # the context (spacing of its input frames).  The physical timestep is
+        # dt = s * save_t with save_t drawn per run, so it is continuous; the probe
+        # REGRESSES log(dt) from the context alone, plus the BC summary — evidence
+        # + gradient pressure that the context carries them (trainer.ContextProbe).
         self.time_strides = tuple(getattr(cfg, 'time_strides', (1,)) or (1,))
-        n_meshes = 0 if mesh_masks is None else int(mesh_masks.shape[0])
-        self.stride_probe = (
-            ContextProbe(cfg.d_ctx, len(self.time_strides),
-                         n_meshes=n_meshes, bc_dim=probe_bc_dim)
-            if len(self.time_strides) > 1 else None
-        )
+        self.stride_probe = ContextProbe(cfg.d_ctx, bc_dim=probe_bc_dim)
 
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
@@ -128,7 +124,17 @@ class HFMLightningModule(L.LightningModule):
         if missing:
             print(f'  New/missing model keys (random init): {missing}')
         if 'context_encoder' in ckpt:
-            self.context_encoder.load_state_dict(ckpt['context_encoder'])
+            try:
+                self.context_encoder.load_state_dict(ckpt['context_encoder'])
+            except RuntimeError as e:
+                print(f'  [ERROR] context encoder does not match this config: {e}')
+                raise SystemExit(
+                    'Cannot resume: the checkpoint was trained with a different context '
+                    'encoder shape.  n_ctx_tokens changed 64 -> 16 and the probe head '
+                    'changed from a discrete stride classifier to a continuous log(dt) '
+                    'regressor, so both the summary table and the optimizer state are '
+                    'incompatible.  Train from scratch, or set n_ctx_tokens back to the '
+                    "checkpoint's value in hyperparams.json.")
         else:
             print('  [warn] no context_encoder in checkpoint; keeping random weights')
         if self.discriminator is not None and 'discriminator' in ckpt:
@@ -162,11 +168,12 @@ class HFMLightningModule(L.LightningModule):
             gen_opt = self.optimizers()            # type: ignore[assignment]
         scheduler = self.lr_schedulers()
 
-        # (frames, mesh_id, bc) when the datamodule tags labels, else bare frames
-        mesh_ids = bc = None
+        # (frames, mesh_id, bc, save_t) when the datamodule tags labels, else frames
+        mesh_ids = bc = save_t = None
         if isinstance(batch, (tuple, list)):
             mesh_ids = batch[1] if len(batch) > 1 else None
             bc       = batch[2] if len(batch) > 2 else None
+            save_t   = batch[3] if len(batch) > 3 else None
             batch    = batch[0]
         frames = [batch[:, t] for t in range(batch.shape[1])]
         n        = self.cfg.n_context_frames
@@ -184,6 +191,9 @@ class HFMLightningModule(L.LightningModule):
             need = (n + H) * s + 1
         off = int(torch.randint(len(frames) - need + 1, (1,)).item())
         frames = frames[off : off + need : s]
+        # Physical timestep per sample: the run's frame interval times the stride.
+        dt = (save_t.to(self.device).float() * s if save_t is not None
+              else torch.full((batch.shape[0],), float(s) * 0.01, device=self.device))
 
         x_in     = frames[n]
         x_target = frames[n + 1]
@@ -195,16 +205,16 @@ class HFMLightningModule(L.LightningModule):
 
         context = self.context_encoder(frames[:n], pixel_mask=mask)
 
-        # ---- stride probe: recover the timestep from the context alone ----
+        # ---- context probe: recover dt and the BCs from the context alone ----
         probe_term = None
-        sacc = None
+        probed = False
         w_probe = getattr(self.cfg, 'stride_cls_weight', 0.0)
         if self.stride_probe is not None and w_probe > 0.0:
             pm = {}
-            probe_term = probe_losses(self.stride_probe, context, s_idx,
-                                      mesh_ids=mesh_ids, bc=bc, metrics=pm)
-            sacc = torch.tensor(pm.get('stride_acc', 0.0))
+            probe_term = probe_losses(self.stride_probe, context,
+                                      dt=dt, bc=bc, metrics=pm)
             self._probe_metrics = pm
+            probed = True
 
         # scheduled sampling (exposure-bias fix): with probability self_input_prob,
         # feed the model its own no-grad prediction of frame n instead of the GT —
@@ -270,9 +280,8 @@ class HFMLightningModule(L.LightningModule):
             scheduler.step()  # type: ignore[union-attr]
             logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                     's': float(s)}
-            if sacc is not None:
-                logs['sacc'] = sacc
-                for k in ('mesh_acc', 'bc_mse'):
+            if probed:
+                for k in ('dt_rel_err', 'bc_mse'):
                     if k in self._probe_metrics:
                         logs[k] = self._probe_metrics[k]
             self.log_dict(logs, prog_bar=True, sync_dist=True)
@@ -336,9 +345,8 @@ class HFMLightningModule(L.LightningModule):
 
         logs = {'recon': recon, 'persist': persist, 'ratio': ratio,
                 'disc': d_loss, 'adv_w': adv_w, 's': float(s)}
-        if sacc is not None:
-            logs['sacc'] = sacc
-            for k in ('mesh_acc', 'bc_mse'):
+        if probed:
+            for k in ('dt_rel_err', 'bc_mse'):
                 if k in self._probe_metrics:
                     logs[k] = self._probe_metrics[k]
         self.log_dict(logs, prog_bar=True, sync_dist=True)
@@ -419,7 +427,7 @@ class FVMLightningDataModule(L.LightningDataModule):
         resolution:  tuple[int, int] = (256, 256),
         batch_size:  int = 4,
         num_workers: int = 4,
-        first_frame: int = 20,
+        first_frame: int = 0,
         return_mesh_id: bool = True,
     ):
         super().__init__()

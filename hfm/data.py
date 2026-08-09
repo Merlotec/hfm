@@ -33,6 +33,32 @@ from renderer import MeshRenderer  # noqa: E402  (needs path injection above)
 
 
 # ---------------------------------------------------------------------------
+# Cache writes
+# ---------------------------------------------------------------------------
+
+def _atomic_write(path: Path, write_fn) -> None:
+    """Write a cache file so no reader can ever observe a partial one.
+
+    Every rank runs setup() and every rank builds the same caches, so 8 processes
+    used to torch.save() over the same path at once.  A reader landing mid-write
+    sees a truncated file, which surfaces as whichever of EOFError / OSError
+    (Errno 22) / UnpicklingError('Unsupported operand') the bytes happen to hit
+    -- exactly the three different errors the ranks reported.
+
+    write_fn writes to a private per-process temp path in the SAME directory;
+    os.replace then swaps it in atomically, so a concurrent reader gets either
+    the whole old file or the whole new one, never a mixture.
+    """
+    tmp = path.with_name(f'{path.name}.tmp.{os.getpid()}')
+    try:
+        write_fn(tmp)
+        os.replace(tmp, path)          # atomic within a directory
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Renderer factory
 # ---------------------------------------------------------------------------
 
@@ -54,17 +80,22 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
     y0, y1 = float(verts[:, 1].min()), float(verts[:, 1].max())
 
     if cache.exists():
-        renderer = MeshRenderer.from_cache(str(cache), device=device)
-        eps = 1e-3
-        cache_ok = (
-            renderer._c2v_tri.max().item() + 1 == n_cells
-            and abs(renderer.xlim[0] - x0) < eps and abs(renderer.xlim[1] - x1) < eps
-            and abs(renderer.ylim[0] - y0) < eps and abs(renderer.ylim[1] - y1) < eps
-        )
-        if cache_ok:
-            return renderer
-        print('  Renderer cache stale (mesh mismatch), rebuilding...')
-        cache.unlink()
+        # A read failure is treated as a stale cache, not a fatal error: the cache
+        # is derived data we can always rebuild, and a corrupt one (interrupted
+        # write, killed job, full quota) should not take down the run.
+        try:
+            renderer = MeshRenderer.from_cache(str(cache), device=device)
+            eps = 1e-3
+            cache_ok = (
+                renderer._c2v_tri.max().item() + 1 == n_cells
+                and abs(renderer.xlim[0] - x0) < eps and abs(renderer.xlim[1] - x1) < eps
+                and abs(renderer.ylim[0] - y0) < eps and abs(renderer.ylim[1] - y1) < eps
+            )
+            if cache_ok:
+                return renderer
+            print('  Renderer cache stale (mesh mismatch), rebuilding...')
+        except Exception as e:
+            print(f'  Renderer cache unreadable ({type(e).__name__}: {e}), rebuilding...')
 
     renderer = MeshRenderer(
         verts,
@@ -72,7 +103,8 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
         resolution=resolution,
         device=device,
     )
-    renderer.save_cache(str(cache))
+    # Atomic: do NOT unlink the old cache first -- another rank may be reading it.
+    _atomic_write(cache, lambda tmp: renderer.save_cache(str(tmp)))
     return renderer
 
 
@@ -118,15 +150,17 @@ def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
     cache = dataset_dir / f'pixel_mask_{H}x{W}.pt'
     n_interior = len(renderer._interior_idx)
     if cache.exists():
-        m = torch.load(cache, weights_only=True)
-        if (m.shape == (1, 1, H, W)
-                and int(m.sum()) == n_interior
-                and m.view(-1)[renderer._interior_idx].all()):
-            return m
-        print('  Pixel mask stale (renderer mismatch), rebuilding...')
-        cache.unlink()
+        try:
+            m = torch.load(cache, weights_only=True)
+            if (m.shape == (1, 1, H, W)
+                    and int(m.sum()) == n_interior
+                    and m.view(-1)[renderer._interior_idx].all()):
+                return m
+            print('  Pixel mask stale (renderer mismatch), rebuilding...')
+        except Exception as e:
+            print(f'  Pixel mask unreadable ({type(e).__name__}: {e}), rebuilding...')
     mask = build_pixel_mask(renderer, resolution)
-    torch.save(mask, cache)
+    _atomic_write(cache, lambda tmp: torch.save(mask, tmp))
     print(f'  Pixel mask saved — {mask.sum().item()} fluid / {mask.numel()} total pixels')
     return mask
 
@@ -138,15 +172,13 @@ def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
 def compute_normalisation_stats(
     runs: list[tuple[Path, MeshRenderer]],
     n_samples: int = 300,
-    first_frame: int = 20,
+    first_frame: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Estimate per-channel mean and std by sampling frames across all runs."""
     all_files: list[tuple[Path, MeshRenderer]] = []
     for d, renderer in runs:
-        all_files.extend([(f, renderer) for f in sorted(
-            [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
-            key=lambda f: float(f.stem[2:]),
-        )[first_frame:]])
+        fs = _frame_files(d)
+        all_files.extend([(f, renderer) for f in fs[first_frame:]])
 
     n = min(n_samples, len(all_files))
     idx = torch.randperm(len(all_files))[:n].tolist()
@@ -187,6 +219,38 @@ def compute_normalisation_stats(
 # Single-run dataset
 # ---------------------------------------------------------------------------
 
+def _frame_files(sim_dir: Path) -> "list[Path]":
+    """A run's t_*.npz frames in simulation-time order."""
+    return sorted(
+        [f for f in sim_dir.iterdir()
+         if f.name.startswith('t_') and f.name.endswith('.npz')],
+        key=lambda f: float(f.stem[2:]),
+    )
+
+
+def _read_save_t(sim_dir: Path, files: "list[Path]") -> float:
+    """Frame interval of a run, in simulation time.
+
+    Prefers params.json['save_t'] (written per segment by gen_alternating);
+    otherwise infers it from consecutive frame timestamps, which is exact for
+    any evenly-sampled run; otherwise the legacy constant."""
+    try:
+        with open(sim_dir / 'params.json') as fh:
+            v = json.load(fh).get('save_t')
+        if v:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        if len(files) >= 2:
+            dt = float(files[1].stem[2:]) - float(files[0].stem[2:])
+            if dt > 0:
+                return dt
+    except Exception:
+        pass
+    return 0.01
+
+
 class FVMSequenceDataset(Dataset):
     """
     Sliding-window sequences of `seq_len` consecutive rendered frames from one
@@ -202,14 +266,12 @@ class FVMSequenceDataset(Dataset):
         seq_len:     int,
         mean:        torch.Tensor,
         std:         torch.Tensor,
-        first_frame: int = 20,
+        first_frame: int = 0,
         frame_cache: Optional[list[torch.Tensor]] = None,
         mesh_id:     Optional[int] = None,
     ):
-        files = sorted(
-            [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
-            key=lambda f: float(f.stem[2:]),
-        )[first_frame:]
+        files = _frame_files(sim_dir)
+        files = files[first_frame:]
         self.paths      = files
         self.renderer   = renderer
         self.seq_len    = seq_len
@@ -240,6 +302,14 @@ class FVMSequenceDataset(Dataset):
                 continue
         self.bc = self.bc_raw                    # normalised via set_bc_norm()
 
+        # Physical frame interval for this run.  gen_alternating draws save_t per
+        # segment from U(0.01, 0.2) and records it in params.json, so the timestep
+        # is a CONTINUOUS per-run quantity rather than a global constant: one
+        # sampled stride s means a physical dt = s * save_t, and the same s means
+        # different dynamics in different runs.  Falls back to the frame timestamps
+        # (older datasets that predate the field), then to the legacy 0.01.
+        self.save_t = _read_save_t(sim_dir, files)
+
     def set_bc_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """z-score the BC summary with dataset-level stats (regression target)."""
         if self.bc_raw is not None:
@@ -265,10 +335,10 @@ class FVMSequenceDataset(Dataset):
                 frames = torch.stack(
                     [self._get_frame(idx + i) for i in range(self.seq_len)])
                 if self.mesh_id is not None:
-                    # + which geometry this sample is, + its BC/forcing summary
+                    # + geometry id, + BC/forcing summary, + physical frame interval
                     bc = self.bc if self.bc is not None \
                         else torch.full((8,), float('nan'))
-                    return frames, self.mesh_id, bc
+                    return frames, self.mesh_id, bc, self.save_t
                 return frames   # [T, C, H, W]
             except Exception as e:                       # unreadable/corrupt frame
                 if not FVMSequenceDataset._warned_corrupt:
@@ -293,13 +363,11 @@ class FVMSequenceDataset(Dataset):
     @classmethod
     def with_cache(cls, sim_dir: Path, renderer: MeshRenderer, seq_len: int,
                    mean: torch.Tensor, std: torch.Tensor,
-                   first_frame: int = 20,
+                   first_frame: int = 0,
                    mesh_id: Optional[int] = None) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
-        files = sorted(
-            [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
-            key=lambda f: float(f.stem[2:]),
-        )[first_frame:]
+        files = _frame_files(sim_dir)
+        files = files[first_frame:]
         m = mean.view(-1, 1, 1)
         s = std.view(-1, 1, 1)
         cache = []
@@ -338,7 +406,11 @@ class FVMDataModule:
         resolution:  tuple[int, int] = (256, 256),
         batch_size:  int = 4,
         num_workers: int = 4,
-        first_frame: int = 20,
+        # Off by default.  It was 20, to skip the cold-start transient of
+        # run_gen's ~1000-frame trajectories.  gen_alternating segments continue
+        # an already-developed field and are only 30 frames long, so there is no
+        # transient to skip and a nonzero value just throws away training data.
+        first_frame: int = 0,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
@@ -381,17 +453,21 @@ class FVMDataModule:
         # Load or compute normalisation stats (skip if already provided externally)
         if self.mean is None or self.std is None:
             stats_path = self.data_dir / self.STATS_FILE
+            stats = None
             if stats_path.exists() and not recompute_stats:
-                with open(stats_path) as f:
-                    s = json.load(f)
-                self.mean = torch.tensor(s['mean'])
-                self.std  = torch.tensor(s['std'])
+                try:
+                    stats = json.loads(stats_path.read_text())
+                except Exception as e:
+                    print(f'  Stats file unreadable ({type(e).__name__}: {e}), recomputing...')
+            if stats is not None:
+                self.mean = torch.tensor(stats['mean'])
+                self.std  = torch.tensor(stats['std'])
             else:
                 print('Computing normalisation stats...')
                 self.mean, self.std = compute_normalisation_stats(
                     [(d, r) for d, r, _mi in runs], first_frame=self.first_frame)
-                with open(stats_path, 'w') as f:
-                    json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
+                _atomic_write(stats_path, lambda tmp: tmp.write_text(json.dumps(
+                    {'mean': self.mean.tolist(), 'std': self.std.tolist()})))
                 print(f'Stats saved to {stats_path}')
 
         builder = FVMSequenceDataset.with_cache if self.cache_frames else (
@@ -402,9 +478,19 @@ class FVMDataModule:
                     mesh_id=(mi if self.return_mesh_id else None))
             for d, renderer, mi in runs
         ]
+        n_short = sum(1 for ds in datasets if len(ds) == 0)
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
-            raise RuntimeError('No usable sequences found — try reducing seq_len or first_frame')
+            raise RuntimeError(
+                f'No usable sequences found: all {n_short} run(s) hold fewer than '
+                f'seq_len={self.seq_len} frames after first_frame={self.first_frame}. '
+                'gen_alternating writes short segments (30 frames by default), so '
+                'lower max(time_strides), rollout_horizon or first_frame.')
+        if n_short:
+            # Loud, because a silent drop looks identical to a smaller dataset:
+            # one over-large stride can discard most of the corpus unnoticed.
+            print(f'  [WARN] dropped {n_short}/{n_short + len(datasets)} run(s) with '
+                  f'fewer than seq_len={self.seq_len} usable frames')
 
         # z-score the per-run BC summaries across runs so the probe regression
         # target is unit-scale.  Runs with no readable BCs keep NaN targets, which
@@ -426,6 +512,14 @@ class FVMDataModule:
         # single-mesh one, which is how the shared-mask bug stayed invisible.
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(runs)} runs '
               f'/ {len(mesh_dirs)} mesh(es)')
+        # Frame-interval spread across runs: with gen_alternating this should span
+        # roughly 0.01..0.2, and a single value means the dataset predates save_t
+        # (or params.json is missing), so the dt probe has nothing to regress.
+        st = sorted(ds.save_t for ds in datasets)
+        self.save_t_min, self.save_t_max = st[0], st[-1]
+        print(f'  save_t: min {st[0]:.4g}  median {st[len(st)//2]:.4g}  max {st[-1]:.4g}'
+              + ('   [WARN] constant — dt probe target is degenerate'
+                 if st[-1] - st[0] < 1e-9 else ''))
         if len(mesh_dirs) > 1 and not self.return_mesh_id:
             print(f'  [WARN] {len(mesh_dirs)} geometries but return_mesh_id=False -- the '
                   f'caller will apply ONE mask to all of them, which is wrong for '
