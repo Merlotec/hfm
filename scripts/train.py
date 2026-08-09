@@ -111,7 +111,7 @@ def load_config() -> tuple[HFMConfig, dict]:
         disc_dim               = m['disc_dim'],
         disc_adv_weight        = m['disc_adv_weight'],
         disc_lr                = m['disc_lr'],
-        gradient_checkpointing = True,
+        gradient_checkpointing = m.get('gradient_checkpointing', False),
         **ml_kwargs,
     )
     return cfg, t
