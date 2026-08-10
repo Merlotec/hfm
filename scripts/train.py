@@ -179,6 +179,11 @@ def main():
                              'discarded from the front of COLD-START runs only, where '
                              'an impulsive start makes the field change ~140x faster '
                              'than developed flow. Pass 0 to keep everything.')
+    parser.add_argument('--val-budget', type=int, default=512,
+                        help='Max windows in the val set, spread evenly over all '
+                             'held-out runs. Cost knob only: the run-level split '
+                             'is fixed by --val-fraction, so changing this never '
+                             'moves a run between train and val.')
     parser.add_argument('--val-fraction', type=float, default=0.05,
                         help='Fraction of RUNS held out of training for validation '
                              '(0 disables). Split is deterministic per run name.')
@@ -247,6 +252,7 @@ def main():
         num_workers = num_workers,
         return_mesh_id = True,
         val_fraction   = args.val_fraction,
+        val_budget     = args.val_budget,
         n_context      = ctx_n,
         settle_time    = (args.settle_time if args.settle_time is not None
                           else train_hp.get('settle_time', 0.0)),

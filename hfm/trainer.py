@@ -654,9 +654,12 @@ class GANTrainer:
                 tot_persist += base
                 count += 1
         if world > 1:
-            from .distributed import allreduce_stats
+            # long=True: ranks arrive here minutes apart (each rendered its own
+            # shard, at Lustre speed, possibly through corrupt-run retries); the
+            # default 300 s group turned that spread into a timeout that killed
+            # the whole job at an epoch boundary.
             tot_recon, tot_persist, count = allreduce_stats(
-                tot_recon, tot_persist, float(count))
+                tot_recon, tot_persist, float(count), long=True)
             count = int(count)
         if count == 0:
             return {'recon': float('nan'), 'persist': float('nan'),

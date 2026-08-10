@@ -237,15 +237,23 @@ def allreduce_grads(modules) -> None:
         off += n
 
 
-def allreduce_stats(*vals: float):
+def allreduce_stats(*vals: float, long: bool = False):
     """Sum a few scalars across ranks (host-side).  Returns the summed list, or
     the inputs unchanged when not distributed.  Use it to make control-flow
     decisions (health gates, NaN bails) IDENTICAL on every rank — a per-rank
-    branch around a backward/step desyncs both DDP and manual grad averaging."""
+    branch around a backward/step desyncs both DDP and manual grad averaging.
+
+    long=True runs the collective on the 7200 s group.  Needed wherever ranks
+    arrive at the reduce far apart: sharded validation is the canonical case —
+    each rank scores its own slice, the fastest rank enters the allreduce and
+    starts the clock while the slowest is still rendering, and on Lustre (plus
+    retry storms around corrupt runs) that spread can exceed the default 300 s.
+    The default group stays short everywhere else so a dead rank still surfaces
+    in minutes, not hours."""
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return list(vals)
     t = torch.tensor(vals, dtype=torch.float64)
-    torch.distributed.all_reduce(t)
+    torch.distributed.all_reduce(t, group=_long_group() if long else None)
     return t.tolist()
 
 
@@ -256,6 +264,19 @@ def is_main() -> bool:
 
 
 _LONG_GROUP = None
+
+
+def _long_group():
+    """The 7200 s process group, created lazily.  Creation is itself a
+    collective, so every rank must first call this from the same program point;
+    both callers (barrier(long=True), allreduce_stats(long=True)) satisfy that
+    because all ranks reach validation and the epoch barrier together."""
+    global _LONG_GROUP
+    if _LONG_GROUP is None:
+        import datetime
+        _LONG_GROUP = torch.distributed.new_group(
+            timeout=datetime.timedelta(seconds=7200))
+    return _LONG_GROUP
 
 
 def barrier(long: bool = False):
@@ -273,13 +294,7 @@ def barrier(long: bool = False):
         torch.distributed.barrier()
         return
 
-    global _LONG_GROUP
-    if _LONG_GROUP is None:
-        # Collective — every rank must reach this, which they do via this call.
-        import datetime
-        _LONG_GROUP = torch.distributed.new_group(
-            timeout=datetime.timedelta(seconds=7200))
-    torch.distributed.barrier(group=_LONG_GROUP)
+    torch.distributed.barrier(group=_long_group())
 
 
 def cleanup():

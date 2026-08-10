@@ -874,6 +874,11 @@ class FVMDataModule:
         # old-solver runs does not: it was all save_t=0.01, i.e. the 5th percentile
         # of what training now sees, so val measured one corner of the dt axis.
         val_fraction: float = 0.05,
+        # Total windows the val set may hold, spread evenly across every held-out
+        # run (deterministic every-k-th thinning).  Controls validation COST only;
+        # the run-level split itself stays at val_fraction, so no run ever moves
+        # between train and val when this changes.
+        val_budget: int = 512,
         # Frames the context encoder sees.  Set it to draw the context block from a
         # random causal position in the run instead of always the frames directly
         # before the prediction (see FVMSequenceDataset._window).
@@ -906,6 +911,7 @@ class FVMDataModule:
         self.std:  Optional[torch.Tensor] = std
         self.return_mesh_id = return_mesh_id
         self.val_fraction = val_fraction
+        self.val_budget = max(0, int(val_budget))
         self.n_context = n_context
         self.settle_time = settle_time
         self.legacy_stride_max = max(1, int(legacy_stride_max))
@@ -1077,12 +1083,22 @@ class FVMDataModule:
             k = max(1, -(-len(ds) // VAL_MAX_WINDOWS))
             val_parts.append(torch.utils.data.Subset(ds, range(0, len(ds), k))
                              if k > 1 else ds)
-        if any(len(a) != len(b) for a, b in zip(val_parts, val_datasets)):
-            print(f'  val capped: {sum(len(v) for v in val_parts)} windows '
-                  f'(from {sum(len(v) for v in val_datasets)}) across '
+        self._val_dataset = None
+        if val_parts:
+            raw_total = sum(len(v) for v in val_datasets)
+            val_cat = ConcatDataset(val_parts)
+            # Global budget on top of the per-run cap: every-k-th window of the
+            # concatenation, which spreads the kept windows across ALL held-out
+            # runs rather than truncating to the first few.  Deterministic, so
+            # the val metric is the same measurement every epoch and across
+            # resumes.
+            if self.val_budget and len(val_cat) > self.val_budget:
+                k = -(-len(val_cat) // self.val_budget)
+                val_cat = torch.utils.data.Subset(val_cat, range(0, len(val_cat), k))
+            self._val_dataset = ResilientConcat(val_cat)
+            print(f'  val: {len(self._val_dataset)} windows scored '
+                  f'(budget {self.val_budget}) from {raw_total} across '
                   f'{len(val_parts)} held-out runs')
-        self._val_dataset = (ResilientConcat(ConcatDataset(val_parts))
-                             if val_parts else None)
         # print the MESH count too: without it a multi-mesh run looks identical to a
         # single-mesh one, which is how the shared-mask bug stayed invisible.
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} '
