@@ -31,20 +31,47 @@ from .distributed import allreduce_grads, allreduce_stats, host_grad_sync_enable
 # ---------------------------------------------------------------------------
 
 class FluidLoss(nn.Module):
-    """MSE + L1 reconstruction loss over valid (non-hole) pixels only."""
+    """MSE + L1 reconstruction loss over valid (non-hole) pixels only, with an
+    optional gradient-difference term.
+
+    The gradient term penalises WRONG spatial gradients, |grad(pred) - grad(gt)|,
+    not gradient magnitude.  That distinction is what lets it suppress grain
+    without blurring sharp features: speckle manufactures thousands of small
+    gradients absent from the target and pays for every one, while a sharp shear
+    layer is REWARDED for being sharp, since matching the target's steep gradient
+    reduces the term.  L1 on the differences (not L2) so the few large errors at
+    true edges do not drown the many small ones grain produces.  Differences are
+    counted only where BOTH pixels of the pair are fluid, so mask boundaries and
+    collider rims contribute nothing.
+    """
 
     def __init__(
         self,
         l1_weight: float = 0.1,
         pixel_mask: Optional[torch.Tensor] = None,
+        grad_weight: float = 0.0,
         **kwargs,  # absorb removed hole_weight / hole_fill_sigma args
     ):
         super().__init__()
         self.l1_weight = l1_weight
+        self.grad_weight = grad_weight
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
         else:
             self.pixel_mask: Optional[torch.Tensor] = None
+
+    def _grad_term(self, pred: torch.Tensor, target: torch.Tensor,
+                   w: Optional[torch.Tensor]) -> torch.Tensor:
+        d = pred - target
+        gx = d[:, :, :, 1:] - d[:, :, :, :-1]      # d/dx of the error field
+        gy = d[:, :, 1:, :] - d[:, :, :-1, :]      # d/dy
+        if w is None:
+            return gx.abs().mean() + gy.abs().mean()
+        wx = w[:, :, :, 1:] * w[:, :, :, :-1]      # pair-valid: both pixels fluid
+        wy = w[:, :, 1:, :] * w[:, :, :-1, :]
+        nx = wx.expand_as(gx).sum().clamp_min(1.0)
+        ny = wy.expand_as(gy).sum().clamp_min(1.0)
+        return (gx.abs() * wx).sum() / nx + (gy.abs() * wy).sum() / ny
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -54,7 +81,10 @@ class FluidLoss(nn.Module):
         m = pixel_mask if pixel_mask is not None else self.pixel_mask
         if m is None:
             d = pred - target
-            return d.pow(2).mean() + self.l1_weight * d.abs().mean()
+            loss = d.pow(2).mean() + self.l1_weight * d.abs().mean()
+            if self.grad_weight > 0.0:
+                loss = loss + self.grad_weight * self._grad_term(pred, target, None)
+            return loss
         # Boolean indexing flattens across samples; weight instead so a per-sample
         # mask broadcasts and the normaliser counts only that sample's fluid pixels.
         w = m[:, :1].to(pred.dtype)
@@ -62,7 +92,10 @@ class FluidLoss(nn.Module):
             w = w.expand(pred.shape[0], -1, -1, -1)
         d = pred - target
         n = w.expand_as(d).sum().clamp_min(1.0)
-        return ((d.pow(2) * w).sum() / n) + self.l1_weight * ((d.abs() * w).sum() / n)
+        loss = ((d.pow(2) * w).sum() / n) + self.l1_weight * ((d.abs() * w).sum() / n)
+        if self.grad_weight > 0.0:
+            loss = loss + self.grad_weight * self._grad_term(pred, target, w)
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +529,7 @@ class GANTrainer:
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
+        grad_weight: float = 0.0,
         hole_weight: float = 0.1,
         hole_fill_sigma: float = 15.0,
         gan_start_step: int = 10_000,
@@ -529,7 +563,7 @@ class GANTrainer:
         # trained, saved, or applied — training is pure reconstruction.
         self.discriminator    = HFMDiscriminator(cfg) if use_gan else None
         self.criterion        = FluidLoss(
-            l1_weight, pixel_mask=pixel_mask,
+            l1_weight, pixel_mask=pixel_mask, grad_weight=grad_weight,
             hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
         )
 

@@ -75,6 +75,8 @@
     "lr_schedule": "cosine",
     "cosine_t_max": 50000,
 
+    "_grad_weight": "Gradient-difference loss |grad(pred) - grad(gt)|_1, masked to pairs where both pixels are fluid. Penalises WRONG gradients, so it suppresses grain (gradients absent from GT) without blurring sharp features (matching a steep true gradient REDUCES it). Enters the criterion, so the persistence baseline and the logged ratio include it consistently. 0 disables.",
+    "grad_weight": 0.2,
     "l1_weight": 0.01,
     "precision": "bf16-mixed"
   }
