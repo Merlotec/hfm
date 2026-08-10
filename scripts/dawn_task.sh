@@ -20,11 +20,71 @@
 module purge
 module load default-dawn                       # base env + GPU (level-zero) driver
 
-# venv with the XPU build of torch (must be e.g. 2.8.0+xpu — NOT +cu128):
-source "$HOME/rds/hpc-work/venvs/flsim-xpu/bin/activate"   # EDIT to your env
+# ---- venv (XPU build of torch, e.g. 2.8.0+xpu — NOT +cu128) -----------------
+# Default: activate straight off RDS.  HFM_STAGE_VENV=1 instead unpacks a
+# tarball of the venv onto NODE-LOCAL disk once per node and runs from there,
+# which takes RDS out of the import path entirely — both the ESHUTDOWN
+# stale-mount failures (pvc-s-197 2026-08-09, pvc-s-256 2026-08-10) and most of
+# the startup metadata storm (a python import is ~10^4 stat+read RPCs PER RANK,
+# all against the RDS metadata server).  One-time prep on a login node, and
+# again after ANY pip install (the mtime+size key invalidates stale copies):
+#   tar -cf ~/rds/hpc-work/venvs/flsim-xpu.tar -C ~/rds/hpc-work/venvs flsim-xpu
+# The staged copy works because the venv's base interpreter (pyvenv.cfg) is the
+# system python3.9 on the node image; python finds site-packages relative to
+# its own bin/ path, so the venv is relocatable without touching activate.
+_VENV_RDS="$HOME/rds/hpc-work/venvs/flsim-xpu"     # EDIT to your env
+if [ "${HFM_STAGE_VENV:-0}" = "1" ]; then
+  _TAR="${HFM_VENV_TAR:-${_VENV_RDS}.tar}"
+  _KEY=$(stat -c '%Y_%s' "$_TAR" 2>/dev/null) \
+    || { echo "[fatal] HFM_STAGE_VENV=1 but no venv tarball at $_TAR" >&2; exit 1; }
+  _DEST="${TMPDIR:-/tmp}/$USER/flsim-xpu-$_KEY"
+  mkdir -p "$_DEST"
+  exec 9>"$_DEST.lock"
+  flock 9            # first rank on the node extracts; the other 7 block here
+  if [ ! -e "$_DEST/.staged" ]; then
+    echo "[stage] $(hostname): unpacking venv tarball to $_DEST"
+    tar -xf "$_TAR" -C "$_DEST" --strip-components=1 && touch "$_DEST/.staged" \
+      || { echo "[fatal] $(hostname): venv staging failed" >&2; exit 1; }
+  fi
+  exec 9>&-
+  export VIRTUAL_ENV="$_DEST"
+  export PATH="$VIRTUAL_ENV/bin:$PATH"   # what bin/activate does, minus its
+                                         # hard-coded RDS VIRTUAL_ENV path
+else
+  source "$_VENV_RDS/bin/activate"
+fi
 
 # Make the venv's bundled oneAPI runtime win over anything the base module adds.
 export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib64:${VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH:-}"
+
+# Preflight: prove this node can actually DELIVER the venv before train.py
+# imports it.  History: pvc-s-197 and pvc-s-256 both died at import with
+#   ImportError: libtorch_cpu.so: cannot stat shared object:
+#   Cannot send after transport endpoint shutdown            (errno 108)
+# i.e. the node's RDS/Lustre client lost its server connection.  On pvc-s-256
+# the old 1MB head-read of libtorch_cpu.so PASSED seconds before dlopen failed
+# — the mount flaps rather than dying cleanly — so the probe must be the real
+# thing (import torch), and retried, not a token read.  The probe's cost is
+# mostly reclaimed: it populates the page cache, so train.py's own import is
+# then nearly free.  Failing nodes are appended to badnodes.txt next to the
+# batch script for --exclude on resubmission.
+_ok=0
+for _try in 1 2 3; do
+  _err=$(python -c 'import torch' 2>&1) && { _ok=1; break; }
+  echo "[preflight] $(hostname) rank ${SLURM_PROCID:-?}: import torch failed" \
+       "(attempt $_try/3): $(printf '%s' "$_err" | tail -n 1)" >&2
+  sleep 20
+done
+if [ "$_ok" != "1" ]; then
+  echo "$(date -Is) $(hostname) job=${SLURM_JOB_ID:-?}" \
+    >> "${SLURM_SUBMIT_DIR:-.}/badnodes.txt" 2>/dev/null
+  echo "[fatal] $(hostname): venv unreadable after 3 attempts over 40s —" >&2
+  echo "        stale/flapping RDS (Lustre) client on this node.  Resubmit:" >&2
+  echo "        sbatch --exclude=\$(awk '{print \$2}' badnodes.txt | sort -u | paste -sd,) dawn_train.slurm" >&2
+  echo "        and report the node to Dawn support (errno 108 ESHUTDOWN," >&2
+  echo "        reads intermittently failing while others succeed)." >&2
+  exit 1
+fi
 
 # ---- XPU / oneCCL configuration --------------------------------------------
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT           # expose each PVC tile as its own XPU

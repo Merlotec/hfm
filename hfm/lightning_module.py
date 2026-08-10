@@ -65,8 +65,21 @@ class HFMLightningModule(L.LightningModule):
         probe_bc_dim: int = 8,
         probe_ctx_dim: int = 0,
         probe_n_visc_models: int = 0,
+        ctx_random: bool = False,
     ):
         super().__init__()
+        # Scheduled sampling advances frames[n-1] one step as a stand-in for the
+        # input, which is only valid when the context block is CONTIGUOUS with
+        # the input frame.  With the random causal context (the datamodule's
+        # n_context option) the last context frame sits at an arbitrary earlier
+        # time, so 50% of steps would train on corrupted input/target pairs —
+        # the exact bug that capped the Dawn run at ratio ~0.5.  Refuse the
+        # combination outright rather than trusting every caller to know this.
+        if ctx_random and self_input_prob > 0:
+            raise ValueError(
+                'self_input_prob > 0 is invalid with random context frames '
+                '(ctx_random=True): scheduled sampling assumes the context is '
+                'contiguous with the input.  Pass self_input_prob=0.')
         self.automatic_optimization = False
         self.save_hyperparameters(ignore=['cfg', 'pixel_mask', 'mesh_masks'])
 
@@ -365,6 +378,62 @@ class HFMLightningModule(L.LightningModule):
                     logs[k] = self._probe_metrics[k]
         self.log_dict(logs, prog_bar=True, sync_dist=True)
 
+    # ---- validation: mirrors GANTrainer.validate ---------------------------
+    # `val_ratio` is the number to read: recon / persistence, aggregated as a
+    # ratio of SUMS across batches and ranks (the raw val loss spans ~7500x
+    # between startup-transient and developed-flow windows and scales with dt,
+    # so on its own it mostly reports which windows landed in the set).
+    # Lightning runs this under no_grad + eval() + the precision plugin's
+    # autocast, so the numerics match GANTrainer.validate's bf16 path.
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_sums = [0.0, 0.0, 0.0]   # recon, persist, batch count
+
+    def validation_step(self, batch, batch_idx: int) -> None:
+        mesh_ids = None
+        if isinstance(batch, (tuple, list)):
+            mesh_ids = batch[1] if len(batch) > 1 else None
+            batch = batch[0]
+        frames = [batch[:, t] for t in range(batch.shape[1])]
+        n    = self.cfg.n_context_frames
+        mask = (self.mesh_masks[mesh_ids.to(self.mesh_masks.device).long()]
+                if (mesh_ids is not None and self.mesh_masks is not None)
+                else self.pixel_mask)
+        horizon = max(1, min(getattr(self.cfg, 'rollout_horizon', 1),
+                             len(frames) - n - 1))
+        context = self.context_encoder(frames[:n], pixel_mask=mask)
+        x_cur, terms, bases = frames[n], [], []
+        for k in range(horizon):
+            pred   = self.model(x_cur, context, pixel_mask=mask)
+            pred_m = pred.float() * mask if mask is not None else pred.float()
+            target = frames[n + 1 + k]
+            terms.append(self.criterion(pred_m, target, pixel_mask=mask).item())
+            # Persistence baseline from the CLEAN input frame, scored against
+            # every horizon target — same rollout, same as training.
+            bases.append(self.criterion(frames[n], target, pixel_mask=mask).item())
+            x_cur = pred_m
+        loss = sum(terms) / len(terms)
+        if loss == loss:                                   # finite (NaN != NaN)
+            self._val_sums[0] += loss
+            self._val_sums[1] += sum(bases) / len(bases)
+            self._val_sums[2] += 1.0
+
+    def on_validation_epoch_end(self) -> None:
+        # float32, not 64: MPS has no float64.  all_gather is a collective —
+        # every rank reaches here because every rank runs the full val loop on
+        # its own DistributedSampler shard.
+        t = self.all_gather(torch.tensor(self._val_sums, dtype=torch.float32,
+                                         device=self.device))
+        if t.dim() > 1:                                    # [world, 3] under DDP
+            t = t.sum(0)
+        recon, persist, count = (float(v) for v in t)
+        if count == 0:
+            return
+        self.log_dict({'val_recon':   recon / count,
+                       'val_persist': persist / count,
+                       'val_ratio':   recon / max(persist, 1e-8)},
+                      prog_bar=True, sync_dist=False)      # already reduced
+
     def configure_optimizers(self):  # type: ignore[override]
         gen_params = list(self.model.parameters()) + list(self.context_encoder.parameters())
         if self.stride_probe is not None:
@@ -436,7 +505,7 @@ class FVMLightningDataModule(L.LightningDataModule):
 
     def __init__(
         self,
-        data_dir:    str,
+        data_dir,                     # one root, or a LIST of roots (multi-corpus)
         seq_len:     int,
         resolution:  tuple[int, int] = (256, 256),
         batch_size:  int = 4,
@@ -444,6 +513,7 @@ class FVMLightningDataModule(L.LightningDataModule):
         first_frame: int = 0,
         return_mesh_id: bool = True,
         val_fraction: float = 0.05,
+        val_budget:   int = 512,
         n_context: Optional[int] = None,
         settle_time: float = 0.0,
     ):
@@ -452,6 +522,7 @@ class FVMLightningDataModule(L.LightningDataModule):
         self._settle_time = settle_time
         self._return_mesh_id = return_mesh_id
         self._val_fraction = val_fraction
+        self._val_budget  = val_budget
         self._data_dir    = data_dir
         self._seq_len     = seq_len
         self._resolution  = resolution
@@ -461,8 +532,9 @@ class FVMLightningDataModule(L.LightningDataModule):
         self._inner: Optional[FVMDataModule] = None
 
     def _make_dm(self) -> FVMDataModule:
+        d = self._data_dir
         return FVMDataModule(
-            data_dir    = Path(self._data_dir),
+            data_dir    = Path(d) if isinstance(d, (str, Path)) else d,
             seq_len     = self._seq_len,
             resolution  = self._resolution,
             batch_size  = self._batch_size,
@@ -470,6 +542,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             first_frame = self._first_frame,
             return_mesh_id = self._return_mesh_id,
             val_fraction   = self._val_fraction,
+            val_budget     = self._val_budget,
             n_context      = self._n_context,
             settle_time    = self._settle_time,
         )
@@ -485,3 +558,12 @@ class FVMLightningDataModule(L.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         assert self._inner is not None, 'setup() not called'
         return self._inner.train_dataloader()
+
+    def val_dataloader(self) -> Optional[DataLoader]:
+        # shard=False: Lightning injects its own DistributedSampler, so the
+        # datamodule's batch-aligned sharding would double-shard to 1/W^2.
+        # (Lightning's interleaved shard + padding means multi-GPU val metrics
+        # can drift ~1-2% from the single-process number — fine for a signal,
+        # use scripts/train.py's validate path for exactly reproducible values.)
+        assert self._inner is not None, 'setup() not called'
+        return self._inner.val_dataloader(shard=False)

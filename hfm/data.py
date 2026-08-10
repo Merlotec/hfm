@@ -10,6 +10,7 @@ pixel grid via barycentric interpolation.  It is built once per dataset and
 cached to disk alongside the data as renderer_cache_{H}x{W}.pt.
 """
 
+import errno
 import hashlib
 import json
 import time
@@ -223,6 +224,28 @@ def compute_normalisation_stats(
 # Truncated runs
 # ---------------------------------------------------------------------------
 
+# errno values that mean "the filesystem transport is broken" — a stale NFS
+# handle or an evicted/reconnecting Lustre client — as opposed to "this file's
+# bytes are bad".  Seen live on Dawn (pvc-s-197 2026-08-09, pvc-s-256
+# 2026-08-10): ESHUTDOWN(108) from the RDS client, intermittently, while other
+# reads on the same mount still succeeded.  EIO is included because Lustre
+# surfaces client eviction as EIO on open/read.  Failures with these errnos
+# must never be attributed to the DATA: the run is (probably) fine, the NODE is
+# sick, and treating them as truncation ends with quarantine_run deleting
+# healthy runs.
+# (guarded lookup: ECOMM / EREMOTEIO are Linux-only and absent on macOS)
+_TRANSPORT_ERRNOS = frozenset(
+    getattr(errno, _n) for _n in (
+        'EIO', 'ECOMM', 'ENOTCONN', 'ESHUTDOWN', 'ETIMEDOUT',
+        'EHOSTDOWN', 'EHOSTUNREACH', 'ESTALE', 'EREMOTEIO',
+    ) if hasattr(errno, _n)
+)
+
+
+def _is_transport_error(e: BaseException) -> bool:
+    return isinstance(e, OSError) and e.errno in _TRANSPORT_ERRNOS
+
+
 class TruncatedRunError(RuntimeError):
     """A run directory that could not yield a single readable sequence."""
 
@@ -277,6 +300,17 @@ def quarantine_run(sim_dir: Path, reason: str) -> None:
     if not prune_enabled():
         print(f'  [warn] truncated run {sim_dir} ({reason}); skipping '
               f'(HFM_PRUNE_BAD_RUNS=0, not deleting)')
+        return
+
+    # Mount-health probe before the irreversible step: params.json answered
+    # exists() a moment ago; prove the mount can actually deliver its bytes.
+    # On a flapping RDS/Lustre client, stat can succeed while read fails (and
+    # vice versa) second to second, and that state must never delete data.
+    try:
+        (sim_dir / 'params.json').read_bytes()
+    except OSError as e:
+        print(f'  [warn] NOT deleting {sim_dir}: filesystem unhealthy '
+              f'({type(e).__name__}: {e}) — node-level problem, not a bad run')
         return
 
     n_frames = len(list(sim_dir.glob('t_*.npz')))
@@ -725,6 +759,13 @@ class FVMSequenceDataset(Dataset):
                             cx, self.ctx_cls)
                 return frames   # [T, C, H, W]
             except Exception as e:                       # unreadable/corrupt frame
+                if _is_transport_error(e):
+                    # The MOUNT is failing, not the file.  Retrying other
+                    # windows fails the same way and ends in TruncatedRunError,
+                    # i.e. quarantine_run deleting a run that is perfectly
+                    # healthy.  Die loudly instead; the job is lost anyway on a
+                    # node that cannot read its data.
+                    raise
                 if not FVMSequenceDataset._warned_corrupt:
                     bad = self.paths[min(idx, len(self.paths) - 1)]
                     print(f'  [warn] unreadable frame near {bad}: {type(e).__name__}: {e}')

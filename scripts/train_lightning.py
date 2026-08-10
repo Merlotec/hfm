@@ -30,7 +30,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hfm.config import HFMConfig
-from hfm.data import build_renderer, load_pixel_mask, load_mesh_masks
+from hfm.data import build_renderer, load_pixel_mask
 from hfm.lightning_module import HFMLightningModule, FVMLightningDataModule
 
 # ---------------------------------------------------------------------------
@@ -46,9 +46,13 @@ HYPERPARAMS      = _ROOT / 'hyperparams.json'
 # GAN curriculum constants
 # ---------------------------------------------------------------------------
 
-GAN_START_STEP        = 10_000
-GAN_RAMP_STEPS        = 2_000
+# Keep in sync with scripts/train.py — a checkpoint must see the same GAN
+# curriculum regardless of which script trains it.
+GAN_START_STEP        = 2_500   # step at which adversarial loss switches on
+GAN_RAMP_STEPS        = 2_000   # adv_weight ramps 0 → disc_adv_weight over this
 DISC_UPDATE_THRESHOLD = 0.5
+SELF_INPUT_PROB       = 0.5     # scheduled sampling: P(input = own prediction);
+                                # forced to 0 whenever random context is active
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,8 +108,18 @@ def load_config() -> tuple[HFMConfig, dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train HFM with Lightning')
-    parser.add_argument('--data',        type=Path, default=DEFAULT_DATA_DIR,
-                        help='Dataset directory')
+    parser.add_argument('--data',        type=Path, nargs='+',
+                        default=[DEFAULT_DATA_DIR],
+                        help='Dataset root(s); several may be given, and the '
+                             'corpora are balanced by the datamodule')
+    parser.add_argument('--val-fraction', type=float, default=0.05,
+                        help='Fraction of runs held out for validation '
+                             '(deterministic run-name split; 0 disables)')
+    parser.add_argument('--val-budget',  type=int, default=512,
+                        help='Max validation windows scored per epoch')
+    parser.add_argument('--settle-time', type=float, default=None,
+                        help='Override settle_time from hyperparams.json: '
+                             'sim-time (s) excluded from the start of cold-start runs')
     parser.add_argument('--resume',      type=str,  default=None, nargs='?', const='latest',
                         help='Lightning .ckpt path, or "latest" to auto-select')
     parser.add_argument('--resume-pt',   type=str,  default=None,
@@ -138,25 +152,62 @@ def main() -> None:
     max_stride = max(getattr(cfg, 'time_strides', (1,)) or (1,))
     seq_len    = (cfg.n_context_frames + getattr(cfg, 'rollout_horizon', 1)) * max_stride + 1
 
+    # Random causal context block, unless temporal striding is on — the two are
+    # mutually exclusive (the stride subsample would cut across the two-block
+    # splice; see scripts/train.py for the full rationale).
+    ctx_n = cfg.n_context_frames
+    if max_stride > 1:
+        print(f'  [WARN] time_strides={cfg.time_strides}: random context frames '
+              f'disabled (incompatible with temporal striding)')
+        ctx_n = None
+    settle_time = (args.settle_time if args.settle_time is not None
+                   else train_hp.get('settle_time', 0.0))
+
+    # ---- data module (built and set up FIRST: the probe label dimensions, the
+    # per-sample mesh masks, and whether a val split exists all come from it,
+    # exactly as in scripts/train.py) ----
+    dm = FVMLightningDataModule(
+        data_dir     = args.data,
+        seq_len      = seq_len,
+        resolution   = (cfg.img_size, cfg.img_size),
+        batch_size   = batch_size,
+        num_workers  = args.workers,
+        val_fraction = args.val_fraction,
+        val_budget   = args.val_budget,
+        n_context    = ctx_n,
+        settle_time  = settle_time,
+    )
+    dm.setup()
+    inner = dm._inner
+    assert inner is not None
+
     # ---- pixel mask (loaded once in main process; moved to each GPU as a buffer) ----
+    primary = args.data[0]
     mesh_dirs = []
-    if (args.data / 'shared_mesh.pkl').exists():
-        mesh_dirs.append(args.data)
+    if (primary / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(primary)
     else:
-        for p in args.data.iterdir():
+        for p in primary.iterdir():
             if p.is_dir() and (p / 'shared_mesh.pkl').exists():
                 mesh_dirs.append(p)
-                
+
     if not mesh_dirs:
-        raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
-        
+        raise RuntimeError(f'No shared_mesh.pkl found in {primary} or its subdirectories')
+
     first_mdir = mesh_dirs[0]
     renderer   = build_renderer(first_mdir, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(first_mdir, renderer, (cfg.img_size, cfg.img_size))
-    # Per-sample masks: built via the SAME canonical (sorted) ordering the datamodule
-    # assigns mesh_ids from, so row i really is geometry i.
-    mesh_masks = load_mesh_masks(args.data, (cfg.img_size, cfg.img_size))
-    print(f'Per-sample masks: {mesh_masks.shape[0]} geometries')
+    # Per-sample masks from the datamodule: canonical (sorted) ordering across
+    # EVERY root passed to --data, so row i really is geometry i.
+    mesh_masks = inner.mesh_masks
+    if mesh_masks is not None:
+        print(f'Per-sample masks: {mesh_masks.shape[0]} geometries')
+    has_val = inner._val_dataset is not None
+    if has_val:
+        print(f'Validation:      {len(inner._val_dataset)} sequences from held-out '
+              f'runs ({inner.val_fraction:.0%} of the corpus)')
+    else:
+        print('Validation:      disabled (val_fraction=0)')
 
     # ---- resolve checkpoint ----
     resume: Optional[str] = args.resume
@@ -182,6 +233,17 @@ def main() -> None:
         cosine_t_max          = train_hp.get('cosine_t_max', 10_000),
         pixel_mask            = pixel_mask,
         mesh_masks            = mesh_masks,
+        # Scheduled sampling is invalid with the random context block (the
+        # module hard-errors on the combination; scripts/train.py has the full
+        # story).  The horizon>1 BPTT rollout is the real exposure-bias fix.
+        self_input_prob       = (0.0 if ctx_n is not None else SELF_INPUT_PROB),
+        ctx_random            = ctx_n is not None,
+        # Context-probe label spaces, read off the corpus like scripts/train.py:
+        # without these the theta-regression and viscosity-class heads are never
+        # built and the physics context gets no gradient pressure.
+        probe_bc_dim          = getattr(inner, 'bc_dim', 0),
+        probe_ctx_dim         = getattr(inner, 'ctx_dim', 0),
+        probe_n_visc_models   = getattr(inner, 'n_visc_models', 0),
         use_gan               = (os.environ.get('HFM_USE_GAN') not in ('0', 'false', 'False'))
                                  if os.environ.get('HFM_USE_GAN') is not None
                                  else bool(train_hp.get('use_gan', True)),
@@ -201,15 +263,6 @@ def main() -> None:
     print(f'Discriminator:  {n_disc:.1f}M params'
           + ('' if module.discriminator is not None else '  [DISABLED: use_gan=false]'))
     print(f'Devices:        {args.devices}  |  seq_len: {seq_len}  |  batch: {batch_size}\n')
-
-    # ---- data module ----
-    dm = FVMLightningDataModule(
-        data_dir    = str(args.data),
-        seq_len     = seq_len,
-        resolution  = (cfg.img_size, cfg.img_size),
-        batch_size  = batch_size,
-        num_workers = args.workers,
-    )
 
     # ---- callbacks ----
     CKPT_DIR.mkdir(exist_ok=True)
@@ -248,8 +301,11 @@ def main() -> None:
         callbacks            = callbacks,
         log_every_n_steps    = args.log_every,
         num_sanity_val_steps = 0,
+        # 0 disables the val loop entirely (val_dataloader is never even
+        # requested) when there is no held-out split to score.
+        limit_val_batches    = 1.0 if has_val else 0,
         enable_progress_bar  = True,
-        precision            = train_hp.get('precision', 'bf16-true'),
+        precision            = train_hp.get('precision', 'bf16-mixed'),
     )
 
     trainer.fit(module, dm, ckpt_path=resume)
