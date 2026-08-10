@@ -175,6 +175,7 @@ def main() -> None:
         weight_decay          = train_hp['weight_decay'],
         l1_weight             = train_hp['l1_weight'],
         grad_weight           = train_hp.get('grad_weight', 0.0),
+        tile_weight           = train_hp.get('tile_weight', 0.0),
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = train_hp.get('disc_update_threshold', DISC_UPDATE_THRESHOLD),

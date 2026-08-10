@@ -53,6 +53,7 @@ class HFMLightningModule(L.LightningModule):
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
         grad_weight: float = 0.0,
+        tile_weight: float = 0.0,
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.5,
@@ -80,7 +81,8 @@ class HFMLightningModule(L.LightningModule):
         # Complete GAN toggle: no discriminator is built or applied when use_gan=False.
         self.discriminator   = HFMDiscriminator(cfg) if use_gan else None
         self.criterion       = FluidLoss(l1_weight, pixel_mask=pixel_mask,
-                                         grad_weight=grad_weight)
+                                         grad_weight=grad_weight,
+                                         tile_weight=tile_weight)
 
         # Multi-timestep training: each step samples a stride s from time_strides and
         # trains on every s-th frame, so the timestep reaches the model only through

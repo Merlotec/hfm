@@ -77,6 +77,8 @@
 
     "_grad_weight": "Gradient-difference loss |grad(pred) - grad(gt)|_1, masked to pairs where both pixels are fluid. Penalises WRONG gradients, so it suppresses grain (gradients absent from GT) without blurring sharp features (matching a steep true gradient REDUCES it). Enters the criterion, so the persistence baseline and the logged ratio include it consistently. 0 disables.",
     "grad_weight": 0.2,
+    "_tile_weight": "Tile-mean loss: the error field mean-pooled over the decoder's 16px token tiles (fluid-weighted), charged L2+L1. Targets the measured dominant artifact: per-tile DC offsets that are 80-90% of the rho error variance per step, spatially smooth at first, then decorrelating into a visible 16px blob grid ~10 rollout steps out. Pooling first makes the offset the penalised quantity instead of a rounding error inside pixel MSE. In the criterion, so persistence baselines and the ratio include it consistently.",
+    "tile_weight": 1.0,
     "l1_weight": 0.01,
     "precision": "bf16-mixed"
   }

@@ -31,8 +31,20 @@ from .distributed import allreduce_grads, allreduce_stats, host_grad_sync_enable
 # ---------------------------------------------------------------------------
 
 class FluidLoss(nn.Module):
-    """MSE + L1 reconstruction loss over valid (non-hole) pixels only, with an
-    optional gradient-difference term.
+    """MSE + L1 reconstruction loss over valid (non-hole) pixels only, with
+    optional gradient-difference and tile-mean terms.
+
+    The tile-mean term penalises the PER-TILE average error: the error field is
+    mean-pooled over the decoder's 16 px token tiles (mask-weighted, so partially
+    masked tiles average over their fluid pixels only) and charged with L2 + L1.
+    Motivation, measured on rollouts: 80-90% of the rho error variance is a
+    per-tile DC offset -- each decoded tile sits at a slightly wrong level.  Per
+    step these offsets are spatially smooth and pixelwise tiny, so MSE barely
+    notices them, but through autoregressive feedback adjacent tiles decorrelate
+    and surface as a 16 px blob grid from ~10 steps out (beyond the BPTT
+    horizon).  Pooling first makes the offset THE quantity being penalised
+    instead of a rounding error inside the pixel loss, attacking the artifact at
+    its per-step seed.
 
     The gradient term penalises WRONG spatial gradients, |grad(pred) - grad(gt)|,
     not gradient magnitude.  That distinction is what lets it suppress grain
@@ -50,15 +62,36 @@ class FluidLoss(nn.Module):
         l1_weight: float = 0.1,
         pixel_mask: Optional[torch.Tensor] = None,
         grad_weight: float = 0.0,
+        tile_weight: float = 0.0,
+        tile_px: int = 16,
         **kwargs,  # absorb removed hole_weight / hole_fill_sigma args
     ):
         super().__init__()
         self.l1_weight = l1_weight
         self.grad_weight = grad_weight
+        self.tile_weight = tile_weight
+        self.tile_px = tile_px
         if pixel_mask is not None:
             self.register_buffer('pixel_mask', pixel_mask)
         else:
             self.pixel_mask: Optional[torch.Tensor] = None
+
+    def _tile_term(self, pred: torch.Tensor, target: torch.Tensor,
+                   w: Optional[torch.Tensor]) -> torch.Tensor:
+        d = pred - target
+        k = self.tile_px
+        if w is None:
+            tm = F.avg_pool2d(d, k)                        # per-tile mean error
+            return tm.pow(2).mean() + self.l1_weight * tm.abs().mean()
+        # Mask-weighted tile mean: average the error over each tile's FLUID
+        # pixels, and drop tiles that are entirely hole.  A plain avg_pool would
+        # dilute rim tiles toward zero and reward nothing.
+        ws = F.avg_pool2d(w, k)                            # fluid fraction per tile
+        tm = F.avg_pool2d(d * w, k) / ws.clamp_min(1e-6)
+        tw = (ws > 0).to(d.dtype)                          # tile has any fluid
+        n = tw.expand_as(tm).sum().clamp_min(1.0)
+        return ((tm.pow(2) * tw).sum() / n
+                + self.l1_weight * (tm.abs() * tw).sum() / n)
 
     def _grad_term(self, pred: torch.Tensor, target: torch.Tensor,
                    w: Optional[torch.Tensor]) -> torch.Tensor:
@@ -84,6 +117,8 @@ class FluidLoss(nn.Module):
             loss = d.pow(2).mean() + self.l1_weight * d.abs().mean()
             if self.grad_weight > 0.0:
                 loss = loss + self.grad_weight * self._grad_term(pred, target, None)
+            if self.tile_weight > 0.0:
+                loss = loss + self.tile_weight * self._tile_term(pred, target, None)
             return loss
         # Boolean indexing flattens across samples; weight instead so a per-sample
         # mask broadcasts and the normaliser counts only that sample's fluid pixels.
@@ -95,6 +130,8 @@ class FluidLoss(nn.Module):
         loss = ((d.pow(2) * w).sum() / n) + self.l1_weight * ((d.abs() * w).sum() / n)
         if self.grad_weight > 0.0:
             loss = loss + self.grad_weight * self._grad_term(pred, target, w)
+        if self.tile_weight > 0.0:
+            loss = loss + self.tile_weight * self._tile_term(pred, target, w)
         return loss
 
 
@@ -530,6 +567,7 @@ class GANTrainer:
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
         grad_weight: float = 0.0,
+        tile_weight: float = 0.0,
         hole_weight: float = 0.1,
         hole_fill_sigma: float = 15.0,
         gan_start_step: int = 10_000,
@@ -564,6 +602,7 @@ class GANTrainer:
         self.discriminator    = HFMDiscriminator(cfg) if use_gan else None
         self.criterion        = FluidLoss(
             l1_weight, pixel_mask=pixel_mask, grad_weight=grad_weight,
+            tile_weight=tile_weight,
             hole_weight=hole_weight, hole_fill_sigma=hole_fill_sigma,
         )
 
