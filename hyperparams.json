@@ -65,7 +65,7 @@
     "grad_allreduce_bf16": true,
 
     "_gan": "use_gan=false disables the discriminator completely (not built, trained, saved, or applied) — pure reconstruction training. Env HFM_USE_GAN=0/1 overrides.",
-    "use_gan": true,
+    "use_gan": false,
     "_disc_update_threshold": "Discriminator strength cap. disc (the logged value) is the discriminator BCE loss: ~1.39 = chance, LOWER = stronger disc. The disc is only trained while threshold < d_loss < 2.0, so once it drops below the threshold it is frozen and the generator pulls it back up; it hovers at the threshold instead of collapsing toward 0 and overpowering the generator.",
     "disc_update_threshold": 0.5,
 
