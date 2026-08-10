@@ -56,6 +56,14 @@ class RefinerConfig:
     groups: int = 32
     t_dim: int = 256
     d_ctx: int = 384              # must match the base cfg's d_ctx
+    # 0 = legacy mean-pooled context vector [B, d_ctx].  > 0 = the refiner sees
+    # ALL n context tokens [B, n, d_ctx]: each summary token is a learned query
+    # slot with a stable identity, so per-token LayerNorm + flatten + MLP is a
+    # meaningful (order-stable) encoding, not a bag-of-tokens hack.  Mean-pooling
+    # provably suffices for the probe's labels (dt, BCs, physics class), but it
+    # discards whatever ELSE the 16 tokens carry -- flow-regime detail the
+    # refiner may condition texture on.
+    n_ctx_tokens: int = 0
     dropout: float = 0.0
 
 
@@ -75,22 +83,50 @@ def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ConditionEmbed(nn.Module):
-    """t-embedding MLP + projected mean-pooled context vector, summed."""
+    """t-embedding MLP + projected context, summed.
 
-    def __init__(self, t_dim: int, d_ctx: int):
+    n_ctx_tokens = 0: context arrives mean-pooled as [B, d_ctx] (legacy).
+    n_ctx_tokens = K: context arrives as the full token set [B, K, d_ctx];
+    tokens are LayerNormed individually, flattened in their (stable) slot
+    order, and projected.  Either way the result is one [B, t_dim] embedding
+    consumed by every FiLM layer.
+    """
+
+    def __init__(self, t_dim: int, d_ctx: int, n_ctx_tokens: int = 0):
         super().__init__()
+        self.n_ctx_tokens = n_ctx_tokens
         self.t_mlp = nn.Sequential(
             nn.Linear(t_dim, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim)
         )
-        self.ctx_proj = nn.Sequential(
-            nn.LayerNorm(d_ctx), nn.Linear(d_ctx, t_dim), nn.SiLU(),
-            nn.Linear(t_dim, t_dim),
-        )
+        if n_ctx_tokens > 0:
+            self.ctx_norm = nn.LayerNorm(d_ctx)          # per token, pre-flatten
+            self.ctx_proj = nn.Sequential(
+                nn.Linear(d_ctx * n_ctx_tokens, t_dim), nn.SiLU(),
+                nn.Linear(t_dim, t_dim),
+            )
+        else:
+            # EXACT legacy layout (LayerNorm inside the Sequential) so existing
+            # refiner checkpoints keep loading key-for-key.
+            self.ctx_norm = None
+            self.ctx_proj = nn.Sequential(
+                nn.LayerNorm(d_ctx), nn.Linear(d_ctx, t_dim), nn.SiLU(),
+                nn.Linear(t_dim, t_dim),
+            )
 
-    def forward(self, t: torch.Tensor, ctx_vec: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, t: torch.Tensor, ctx: Optional[torch.Tensor]) -> torch.Tensor:
         emb = self.t_mlp(timestep_embedding(t, self.t_mlp[0].in_features))
-        if ctx_vec is not None:
-            emb = emb + self.ctx_proj(ctx_vec.float())
+        if ctx is not None:
+            c = ctx.float()
+            if self.n_ctx_tokens > 0:
+                if c.dim() != 3 or c.shape[1] != self.n_ctx_tokens:
+                    raise ValueError(
+                        f'expected full context [B, {self.n_ctx_tokens}, d_ctx], '
+                        f'got {tuple(c.shape)} -- this refiner was built for all '
+                        f'tokens, not the pooled vector')
+                c = self.ctx_norm(c).flatten(1)
+            elif c.dim() == 3:                      # tolerate tokens: pool them
+                c = c.mean(dim=1)
+            emb = emb + self.ctx_proj(c)
         return emb                                             # [B, t_dim]
 
 
@@ -141,7 +177,8 @@ class RefinerUNet(nn.Module):
         w = [rcfg.base_width * m for m in rcfg.channel_mults]  # e.g. [64, 128, 192]
         g, td, dr, nb = rcfg.groups, rcfg.t_dim, rcfg.dropout, rcfg.blocks_per_level
 
-        self.embed = ConditionEmbed(td, rcfg.d_ctx)
+        self.embed = ConditionEmbed(td, rcfg.d_ctx,
+                                    vars(rcfg).get('n_ctx_tokens', 0))
         self.in_conv = nn.Conv2d(rcfg.cond_channels, w[0], 3, padding=1)
 
         def blocks(c_in, c_out):
@@ -178,7 +215,7 @@ class RefinerUNet(nn.Module):
         x_in: torch.Tensor,         # [B, C, H, W]  frame the base stepped from
         pixel_mask: torch.Tensor,   # [B or 1, 1, H, W]
         t: torch.Tensor,            # [B] in [0, 1]
-        ctx_vec: Optional[torch.Tensor],  # [B, d_ctx] mean-pooled context
+        ctx_vec: Optional[torch.Tensor],  # [B, d_ctx] pooled or [B, K, d_ctx] full
     ) -> torch.Tensor:
         B = x_t.shape[0]
         m = pixel_mask.to(x_t.dtype).expand(B, 1, x_t.shape[2], x_t.shape[3])

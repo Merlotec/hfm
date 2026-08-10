@@ -603,12 +603,12 @@ class GANTrainer:
         minimises when persist_norm_loss is on, and reads absolutely: 1.0 means
         "no better than copying the input", < 1 means it genuinely beats it.
 
-        SHARDED under DDP: batch i is scored by rank i % world, and the three
-        sums are allreduced at the end, so validation costs 1/world the wall
-        time instead of parking world-1 ranks at a barrier while rank 0 scores
-        everything.  COLLECTIVE: when distributed, every rank must call this
-        (all see the same dataloader; the shard is by batch index), and every
-        rank returns the same reduced numbers.
+        COLLECTIVE under DDP: every rank must call this, with a dataloader
+        holding its own DISJOINT slice (dm.val_dataloader(shard=True)); the
+        three sums are allreduced at the end and every rank returns the same
+        reduced numbers.  The sharding lives in the DATALOADER, not here: the
+        old batch-skip scheme (score batch i on rank i % world) still fetched
+        and rendered every batch on every rank, so it saved almost nothing.
         """
         self.model.eval()
         self.context_encoder.eval()
@@ -621,9 +621,7 @@ class GANTrainer:
             rank  = torch.distributed.get_rank()
             world = torch.distributed.get_world_size()
         tot_recon, tot_persist, count = 0.0, 0.0, 0
-        for bi, batch in enumerate(dataloader):
-            if bi % world != rank:
-                continue
+        for batch in dataloader:
             # (frames, mesh_id, ...) when the datamodule tags labels, else frames
             if isinstance(batch, (tuple, list)):
                 batch, mesh_b = batch[0], batch[1]

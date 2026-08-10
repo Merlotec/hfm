@@ -1064,8 +1064,25 @@ class FVMDataModule:
                   f'{self.legacy_stride_max}) / {n_mod} alternating sequences')
 
         self._dataset = ResilientConcat(ConcatDataset(train_parts))
-        self._val_dataset = (ResilientConcat(ConcatDataset(val_datasets))
-                             if val_datasets else None)
+        # Cap each val run's contribution.  A legacy 700-frame run yields ~600
+        # sliding windows against an alternating segment's ~20, so an uncapped
+        # mixed val set multiplies validation wall time by ~30x and lets a few
+        # long runs dominate the metric.  Every k-th window is kept (windows
+        # overlap by seq_len-1 frames, so thinning drops redundancy, not
+        # coverage), deterministically, so the metric stays the same measurement
+        # every epoch.
+        VAL_MAX_WINDOWS = 48
+        val_parts = []
+        for ds in val_datasets:
+            k = max(1, -(-len(ds) // VAL_MAX_WINDOWS))
+            val_parts.append(torch.utils.data.Subset(ds, range(0, len(ds), k))
+                             if k > 1 else ds)
+        if any(len(a) != len(b) for a, b in zip(val_parts, val_datasets)):
+            print(f'  val capped: {sum(len(v) for v in val_parts)} windows '
+                  f'(from {sum(len(v) for v in val_datasets)}) across '
+                  f'{len(val_parts)} held-out runs')
+        self._val_dataset = (ResilientConcat(ConcatDataset(val_parts))
+                             if val_parts else None)
         # print the MESH count too: without it a multi-mesh run looks identical to a
         # single-mesh one, which is how the shared-mask bug stayed invisible.
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} '
@@ -1114,13 +1131,34 @@ class FVMDataModule:
             persistent_workers = self.num_workers > 0,
         )
 
-    def val_dataloader(self) -> Optional[DataLoader]:
-        """The held-out runs.  None when val_fraction is 0."""
+    def val_dataloader(self, shard: bool = False) -> Optional[DataLoader]:
+        """The held-out runs.  None when val_fraction is 0.
+
+        shard=True gives each rank a DISJOINT sample-level slice (rank, rank+W,
+        rank+2W, ...).  Without it, GANTrainer.validate's old batch-skip scheme
+        still made every rank's workers FETCH AND RENDER every batch and only
+        skipped the cheap scoring, so validation cost the full set per rank.
+        Keep shard=False under Lightning, which injects its own
+        DistributedSampler and would otherwise double-shard to 1/W^2.
+        """
         assert self._dataset is not None, 'Call setup() first'
         if self._val_dataset is None:
             return None
+        ds = self._val_dataset
+        if shard and torch.distributed.is_available() and torch.distributed.is_initialized():
+            r, w = torch.distributed.get_rank(), torch.distributed.get_world_size()
+            # BATCH-ALIGNED blocks, not an interleaved stride: the metric is a
+            # mean of per-batch masked means, which is not invariant to
+            # regrouping samples into different batches.  Giving rank r whole
+            # batches (b = r, r+w, r+2w, ...) reproduces exactly the batches the
+            # unsharded loader would form, so the reduced result is identical to
+            # the single-process number.
+            B, n = self.batch_size, len(ds)
+            idx = [j for b0 in range(r * B, n, w * B)
+                   for j in range(b0, min(b0 + B, n))]
+            ds = torch.utils.data.Subset(ds, idx)
         return DataLoader(
-            self._val_dataset,
+            ds,
             batch_size         = self.batch_size,
             shuffle            = False,
             num_workers        = self.num_workers,

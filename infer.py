@@ -369,7 +369,8 @@ def main():
         from hfm.refiner import RefinerUNet, sample_detail
         print(f'\nLoading refiner: {args.refine}')
         rck = torch.load(args.refine, map_location='cpu', weights_only=False)
-        refiner = RefinerUNet(rck['refiner_cfg']).to(device)
+        refiner_cfg = rck['refiner_cfg']
+        refiner = RefinerUNet(refiner_cfg).to(device)
         refiner.load_state_dict(rck.get('refiner_ema', rck['refiner']))
         refiner.eval()
         refiner_sigma = rck['sigma_d'].to(device)
@@ -483,7 +484,12 @@ def main():
         saliency_fakes = []
         saliency_reals = []
         x = frames_gt[n_context]
-        ctx_vec = context.float().mean(dim=1) if refiner is not None else None
+        # Match the loaded refiner's conditioning contract: full token set for
+        # n_ctx_tokens > 0 refiners, mean-pooled vector for legacy ones.
+        ctx_vec = None
+        if refiner is not None:
+            full = vars(refiner_cfg).get('n_ctx_tokens', 0) > 0
+            ctx_vec = context.float() if full else context.float().mean(dim=1)
 
         # Persistence-normalised metric, same construction as trainer.validate:
         # the baseline "predicts no change" and is scored against the same

@@ -14,6 +14,7 @@ Run from the hfm/ root:
 
 import argparse
 import csv
+import time as _time
 import json
 import math
 import os
@@ -280,7 +281,7 @@ def main():
     # loss could not be told apart from ordinary overfitting.  The split here is by
     # RUN and deterministic (see data.is_val_run), so every rank agrees on it and it
     # survives restarts; the held-out runs are never trained on.
-    val_dl = dm.val_dataloader()
+    val_dl = dm.val_dataloader(shard=True)
     val_pixel_mask = None
     if val_dl is not None:
         assert dm._val_dataset is not None
@@ -504,7 +505,13 @@ def main():
         # parked 7 tiles at the barrier while one scored the whole set.
         val = {'recon': float('nan'), 'persist': float('nan'), 'ratio': float('nan')}
         if val_dl is not None:
+            # Loud start marker: validation renders on CPU workers and can take
+            # minutes; without this line it is indistinguishable from a hang.
+            if is_main():
+                print('  [val] scoring held-out runs...', flush=True)
+            _v0 = _time.time()
             val = trainer.validate(val_dl, pixel_mask=val_pixel_mask)
+            val['secs'] = _time.time() - _v0
 
         if is_main():
             # Ratios first: they are the comparable pair.  train_ratio vs val_ratio
@@ -515,7 +522,8 @@ def main():
                 f'  [epoch {epoch:3d}] train_ratio={train_ratio:.3f}  '
                 f'val_ratio={val["ratio"]:.3f}   '
                 f'(raw: train={train_loss:.4f}  val={val["recon"]:.4f}  '
-                f'val_persist={val["persist"]:.4f})'
+                f'val_persist={val["persist"]:.4f}  '
+                f'val_time={val.get("secs", float("nan")):.0f}s)'
             )
             if loss_writer is not None and loss_csv is not None:
                 loss_writer.writerow([

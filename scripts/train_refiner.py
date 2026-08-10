@@ -124,7 +124,7 @@ def make_pair(frames, mesh_ids, mesh_masks, model, ce, cfg, device,
     ctx_frames = [sub[:, t] for t in range(nc)]
     with amp():
         context = ce(ctx_frames, pixel_mask=mask)
-    ctx_vec = context.float().mean(dim=1)
+    ctx_vec = context.float()               # ALL tokens [B, K, d_ctx]
 
     x_cur = sub[:, nc] * mask
     x_in = x_cur
@@ -205,6 +205,9 @@ def main():
         blocks_per_level=args.blocks_per_level,
         dropout=args.dropout,
         d_ctx=cfg.d_ctx,
+        # Full context conditioning: the refiner's FiLM embedding sees ALL
+        # summary tokens (flattened in slot order), not the mean-pooled vector.
+        n_ctx_tokens=cfg.n_ctx_tokens,
     )
     refiner = RefinerUNet(rcfg).to(device)
     print(f'Refiner: {sum(q.numel() for q in refiner.parameters()) / 1e6:.2f}M params')

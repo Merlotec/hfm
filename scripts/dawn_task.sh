@@ -152,7 +152,7 @@ if [ "${SLURM_PROCID:-0}" = "0" ]; then
   echo "  nodes=${SLURM_NNODES:-?} ntasks=${SLURM_NTASKS:-?} localid=${SLURM_LOCALID:-?} cpus/task=${SLURM_CPUS_PER_TASK:-?}"
   echo "  OMP_NUM_THREADS=$OMP_NUM_THREADS CCL_WORKER_COUNT=$CCL_WORKER_COUNT CCL_WORKER_AFFINITY=$CCL_WORKER_AFFINITY"
   echo "  CCL_ATL_TRANSPORT=$CCL_ATL_TRANSPORT HFM_DDP_BACKEND=${HFM_DDP_BACKEND:-<auto>} HFM_HOST_GRAD_SYNC=${HFM_HOST_GRAD_SYNC:-0}"
-  echo "  tuning: HFM_TRY_XCCL=${HFM_TRY_XCCL:-0} HFM_ACCUM_STEPS=${HFM_ACCUM_STEPS:-<hp>} HFM_GRAD_ALLREDUCE_BF16=${HFM_GRAD_ALLREDUCE_BF16:-0}"
+  echo "  tuning: HFM_TRY_XCCL=${HFM_TRY_XCCL:-0} HFM_ACCUM_STEPS=${HFM_ACCUM_STEPS:-<hp>} HFM_GRAD_ALLREDUCE_BF16=${HFM_GRAD_ALLREDUCE_BF16:-<hp>}"
   echo "  cpus visible to this rank: $(nproc) | affinity: $(taskset -pc $$ 2>/dev/null || echo n/a)"
   python - <<'PY' || true
 import torch, torch.distributed as d
