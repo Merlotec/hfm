@@ -117,6 +117,10 @@ def main() -> None:
                              '(deterministic run-name split; 0 disables)')
     parser.add_argument('--val-budget',  type=int, default=512,
                         help='Max validation windows scored per epoch')
+    parser.add_argument('--save-t-max', type=float, default=None,
+                        help='Exclude runs whose frame interval exceeds this '
+                             '(default: training.save_t_max in hyperparams.json; '
+                             'negative disables)')
     parser.add_argument('--settle-time', type=float, default=None,
                         help='Override settle_time from hyperparams.json: '
                              'sim-time (s) excluded from the start of cold-start runs')
@@ -176,6 +180,10 @@ def main() -> None:
         val_budget   = args.val_budget,
         n_context    = ctx_n,
         settle_time  = settle_time,
+        save_t_max   = (None if (v := (args.save_t_max
+                                       if args.save_t_max is not None
+                                       else train_hp.get('save_t_max'))) is None
+                        or v <= 0 else float(v)),
     )
     dm.setup()
     inner = dm._inner

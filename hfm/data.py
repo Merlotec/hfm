@@ -933,6 +933,14 @@ class FVMDataModule:
         # save_t=0.01 spans effective dt 0.01..0.10, meeting the alternating
         # corpus's U(0.01, 0.2) across most of its range.
         legacy_stride_max: int = 10,
+        # Hard ceiling on the physical frame interval trained on (None = accept
+        # everything).  Alternating runs whose recorded save_t exceeds it are
+        # EXCLUDED at index time (train and val alike), and the legacy stride
+        # augmentation is capped so effective dt = stride * save_t respects the
+        # same ceiling.  This is what makes "trained on dt in [lo, hi]" a
+        # property of the RUN, not of whatever mixture happens to be on disk;
+        # the excluded runs stay available as an out-of-range evaluation set.
+        save_t_max: Optional[float] = None,
         cache_frames: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
@@ -956,6 +964,7 @@ class FVMDataModule:
         self.n_context = n_context
         self.settle_time = settle_time
         self.legacy_stride_max = max(1, int(legacy_stride_max))
+        self.save_t_max = save_t_max
         self.mesh_masks: Optional[torch.Tensor] = None   # [n_mesh, 1, H, W]
         self._val_dataset: Optional[Dataset] = None
 
@@ -1018,7 +1027,21 @@ class FVMDataModule:
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
         )
         datasets, val_datasets = [], []
+        n_dt_excluded = 0
         for d, renderer, mi in runs:
+            st = meta[d].get('save_t')
+            # save_t ceiling: alternating runs above it are excluded outright
+            # (train AND val — out-of-range scoring is a deliberate separate
+            # experiment, not something to leak into the val metric); legacy
+            # runs instead get their stride augmentation capped below.
+            if (self.save_t_max is not None and meta[d].get('has_save_t')
+                    and st is not None and st > self.save_t_max + 1e-9):
+                n_dt_excluded += 1
+                continue
+            legacy_cap = self.legacy_stride_max
+            if self.save_t_max is not None and st:
+                legacy_cap = max(1, min(legacy_cap,
+                                        int(self.save_t_max / st + 1e-9)))
             try:
                 is_val = is_val_run(d, self.val_fraction)
                 ds = builder(
@@ -1030,7 +1053,7 @@ class FVMDataModule:
                     # Legacy fixed-interval runs get stride augmentation; runs
                     # with a real per-segment save_t train at stride 1.
                     dt_stride_max=(1 if meta[d].get('has_save_t')
-                                   else self.legacy_stride_max),
+                                   else legacy_cap),
                     # Validation stays DETERMINISTIC: a random context would make
                     # the val metric a different measurement every epoch, and the
                     # whole point of the ratio is that its movement means something.
@@ -1040,6 +1063,9 @@ class FVMDataModule:
                 quarantine_run(e.sim_dir, e.reason)
                 continue
             (val_datasets if is_val else datasets).append(ds)
+        if n_dt_excluded:
+            print(f'  [save_t<= {self.save_t_max}] excluded {n_dt_excluded} run(s) '
+                  f'with frame interval above the ceiling')
         n_short = sum(1 for ds in datasets if len(ds) == 0)
         datasets = [ds for ds in datasets if len(ds) > 0]
         val_datasets = [ds for ds in val_datasets if len(ds) > 0]

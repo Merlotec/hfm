@@ -118,6 +118,13 @@ def load_config() -> tuple[HFMConfig, dict]:
     return cfg, t
 
 
+def _resolve_save_t_max(args, train_hp):
+    """CLI > hyperparams; negative CLI value disables the ceiling entirely."""
+    v = args.save_t_max if args.save_t_max is not None \
+        else train_hp.get('save_t_max')
+    return None if v is None or v <= 0 else float(v)
+
+
 def get_device() -> torch.device:
     """Single-process device pick.  Multi-rank runs go through
     hfm.distributed.init_distributed() instead, which also selects XPU."""
@@ -174,6 +181,10 @@ def main():
                              'output) get per-sample stride augmentation 1..10, so '
                              'their effective dt spans 0.01..0.10.  The two corpus '
                              'types are balanced to roughly equal draw probability.')
+    parser.add_argument('--save-t-max', type=float, default=None,
+                        help='Exclude runs whose frame interval exceeds this '
+                             '(default: training.save_t_max in hyperparams.json; '
+                             'pass a negative value to disable the ceiling)')
     parser.add_argument('--settle-time', type=float, default=None,
                         help='Override settle_time from hyperparams.json: sim-time (s) '
                              'discarded from the front of COLD-START runs only, where '
@@ -256,6 +267,7 @@ def main():
         n_context      = ctx_n,
         settle_time    = (args.settle_time if args.settle_time is not None
                           else train_hp.get('settle_time', 0.0)),
+        save_t_max     = _resolve_save_t_max(args, train_hp),
     )
     dm.setup()
 

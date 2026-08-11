@@ -549,6 +549,7 @@ class FVMLightningDataModule(L.LightningDataModule):
         val_budget:   int = 512,
         n_context: Optional[int] = None,
         settle_time: float = 0.0,
+        save_t_max: Optional[float] = None,
     ):
         super().__init__()
         self._n_context = n_context
@@ -556,6 +557,7 @@ class FVMLightningDataModule(L.LightningDataModule):
         self._return_mesh_id = return_mesh_id
         self._val_fraction = val_fraction
         self._val_budget  = val_budget
+        self._save_t_max  = save_t_max
         self._data_dir    = data_dir
         self._seq_len     = seq_len
         self._resolution  = resolution
@@ -578,6 +580,7 @@ class FVMLightningDataModule(L.LightningDataModule):
             val_budget     = self._val_budget,
             n_context      = self._n_context,
             settle_time    = self._settle_time,
+            save_t_max     = self._save_t_max,
         )
 
     def prepare_data(self) -> None:
