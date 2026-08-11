@@ -1018,6 +1018,14 @@ class GANTrainer:
         elif self.discriminator is None:
             print('  [info] GAN disabled (use_gan=False); discriminator not loaded')
 
+        # Optimizer/scheduler load_state_dict restores HYPERPARAMETERS as well
+        # as moment/schedule state (weight_decay, lr, base_lrs), which silently
+        # reverts any change made in hyperparams.json since the checkpoint was
+        # written.  Capture the constructor-time (current-config) values and
+        # re-assert them after loading: moments and schedule position resume,
+        # but the current config wins on hyperparameters.
+        cur_wd  = [g['weight_decay'] for g in self.gen_optimizer.param_groups]
+        cur_base = list(self.scheduler.base_lrs)
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
         if disc_ok and self.disc_optimizer is not None and 'disc_optimizer' in ckpt:
             try:
@@ -1025,4 +1033,7 @@ class GANTrainer:
             except Exception:
                 print('  [warn] disc_optimizer reinitialised')
         self.scheduler.load_state_dict(ckpt['scheduler'])
+        for g, w in zip(self.gen_optimizer.param_groups, cur_wd):
+            g['weight_decay'] = w
+        self.scheduler.base_lrs = cur_base
         self.global_step = ckpt.get('global_step', 0)

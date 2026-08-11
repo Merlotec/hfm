@@ -233,4 +233,7 @@ fi
 # hfm/distributed.py, which selects xpu:<SLURM_LOCALID> and uses the native
 # 'xccl' backend (torch>=2.7) or oneCCL 'ccl'.  Rank/size come from SLURM_* vars.
 cd "$SLURM_SUBMIT_DIR"
-exec python scripts/train.py
+# Extra train.py arguments via environment (sbatch does not forward args to
+# srun'd task scripts), e.g.:
+#   sbatch --export=ALL,HFM_TRAIN_ARGS="--resume latest" dawn_train.slurm
+exec python scripts/train.py ${HFM_TRAIN_ARGS:-}
