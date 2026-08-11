@@ -85,7 +85,7 @@ def load_config() -> tuple[HFMConfig, dict]:
     ml_keys = ('use_quadtree', 'ml_levels', 'ml_finest_px', 'ml_dims', 'ml_passes',
                'ml_blocks_per_level', 'ml_untie_passes',
                'residual_prediction', 'mask_aware_decoder', 'persist_norm_loss',
-               'ctx_temporal_diffs')
+               'ctx_temporal_diffs', 'ctx_corr', 'ctx_corr_radius', 'ctx_corr_pool')
     ml_kwargs = {k: m[k] for k in ml_keys if k in m}
     cfg = HFMConfig(
         img_size               = m['img_size'],

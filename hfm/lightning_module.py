@@ -230,12 +230,19 @@ class HFMLightningModule(L.LightningModule):
         context = self.context_encoder(frames[:n], pixel_mask=mask)
 
         # ---- context probe: recover dt and the BCs from the context alone ----
+        # stride_cls_weight > 0: probe as TRAINING SIGNAL (gradient reaches the
+        # encoder).  == 0: probe as INSTRUMENT only — heads train on a DETACHED
+        # context so the metrics keep measuring what the context carries, but
+        # the encoder receives nothing (see trainer.train_step_gan).
         probe_term = None
         probed = False
         w_probe = getattr(self.cfg, 'stride_cls_weight', 0.0)
-        if self.stride_probe is not None and w_probe > 0.0:
+        if self.stride_probe is not None:
+            ctx_probe = context if w_probe > 0.0 else context.detach()
+            if w_probe <= 0.0:
+                w_probe = 1.0        # scales only the probe heads' own update
             pm = {}
-            probe_term = probe_losses(self.stride_probe, context, dt=dt, bc=bc,
+            probe_term = probe_losses(self.stride_probe, ctx_probe, dt=dt, bc=bc,
                                       ctx=ctx_vec, ctx_cls=ctx_cls, metrics=pm)
             self._probe_metrics = pm
             probed = True

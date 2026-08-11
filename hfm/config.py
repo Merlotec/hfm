@@ -71,6 +71,19 @@ class HFMConfig:
     # which no probe (and, in practice, not the trunk either) can linearise.
     # With explicit diffs, stride classification goes 0.33 -> 0.98 in isolation.
     ctx_temporal_diffs: bool = True
+    # RAFT-style local correlation between consecutive context frames: cosine
+    # similarity of the (pooled) fields under every displacement in a
+    # (2R+1)^2 window, projected into each patch token.  Feature displacement
+    # between frames is |u|*dt in pixels, so the ridge of this volume is a
+    # physics-INVARIANT readout of the timestep — the correlation primitive
+    # that a per-frame linear patch embed cannot express, and the estimator
+    # that transfers where texture-statistics proxies fail (the fvm_validation
+    # dt saturation).  ctx_corr_pool is the downsample factor before
+    # correlating (4 -> 64x64 grid); radius is in POOLED pixels, so R=4 spans
+    # +-16 native px, one patch.
+    ctx_corr: bool = False
+    ctx_corr_radius: int = 4
+    ctx_corr_pool: int = 4
     n_context_frames: int = 5
     ctx_patch_px: int = 16
     d_ctx: int = 256

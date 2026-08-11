@@ -10,11 +10,48 @@ governing equations for this sequence.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from typing import List, Optional
 
 from .config import HFMConfig
 from .model import PatchEmbed, LearnedPos2D, FeedForward
+
+
+class _CorrFeatures(nn.Module):
+    """RAFT-style local correlation volume between consecutive frames.
+
+    For every position on a pooled grid, the cosine similarity between the
+    field vector at frame t and the field vector at frame t-1 shifted by each
+    displacement in a (2R+1) x (2R+1) window.  Advection moves features by
+    |u|*dt pixels, so the displacement of the correlation ridge, next to the
+    velocity channels the encoder already sees, is a direct physics-invariant
+    readout of the timestep.  A per-frame linear patch embedding has no
+    cross-frame correlation primitive, so without this the encoder must
+    approximate displacement matching through attention over 16px tokens —
+    the friction that pushes it toward texture-statistics proxies instead.
+    """
+
+    def __init__(self, radius: int, pool: int):
+        super().__init__()
+        self.R, self.pool = radius, pool
+        self.n_out = (2 * radius + 1) ** 2
+
+    def forward(self, cur: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
+        """[B, C, H, W] x2 (same frame pair, already masked) -> [B, (2R+1)^2, H/pool, W/pool]."""
+        f1 = F.avg_pool2d(cur, self.pool)
+        f0 = F.avg_pool2d(prev, self.pool)
+        # Cosine across channels: correlation should say "same feature moved
+        # here", independent of the local field magnitude (which varies by
+        # orders of magnitude between freestream and wake).
+        f1 = f1 / f1.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        f0 = f0 / f0.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        R = self.R
+        f0p = F.pad(f0, (R, R, R, R))
+        h, w = f1.shape[-2:]
+        maps = [(f1 * f0p[:, :, dy:dy + h, dx:dx + w]).sum(1)
+                for dy in range(2 * R + 1) for dx in range(2 * R + 1)]
+        return torch.stack(maps, dim=1)
 
 
 class _ContextBlock(nn.Module):
@@ -65,6 +102,16 @@ class ContextEncoder(nn.Module):
         self.use_diffs = bool(vars(cfg).get('ctx_temporal_diffs', False))
         in_ch = (2 * cfg.in_channels if self.use_diffs else cfg.in_channels) + 1
         self.patch_embed  = PatchEmbed(in_ch, cfg.ctx_patch_px, cfg.d_ctx)
+        # RAFT-style correlation features (same instance-dict guard as above:
+        # only a cfg constructed by current code can enable them).
+        self.use_corr = bool(vars(cfg).get('ctx_corr', False))
+        if self.use_corr:
+            self.corr = _CorrFeatures(int(vars(cfg).get('ctx_corr_radius', 4)),
+                                      int(vars(cfg).get('ctx_corr_pool', 4)))
+            # Projected into the patch tokens additively; zero-init (see
+            # _init_weights) makes it a no-op at initialisation, so enabling
+            # correlation perturbs nothing until the gradient asks for it.
+            self.corr_proj = nn.Linear(self.corr.n_out, cfg.d_ctx)
         self.spatial_pos  = LearnedPos2D(P, P, cfg.d_ctx)
         self.temporal_pos = nn.Embedding(64, cfg.d_ctx)   # supports up to 64 input frames
 
@@ -96,6 +143,11 @@ class ContextEncoder(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+        # AFTER the generic Linear init: correlation projection starts as a
+        # strict no-op (see __init__).
+        if getattr(self, 'corr_proj', None) is not None:
+            nn.init.zeros_(self.corr_proj.weight)
+            nn.init.zeros_(self.corr_proj.bias)
 
     def forward(
         self,
@@ -121,11 +173,19 @@ class ContextEncoder(nn.Module):
                 # making the timestep readable at the very first conv instead of
                 # having to be disentangled from appearance deep in the trunk.
                 diff = frame - prev if prev is not None else torch.zeros_like(frame)
-                prev = frame
                 frame_aug = torch.cat([frame, diff, mask_ch], dim=1)
             else:
                 frame_aug = torch.cat([frame, mask_ch], dim=1)
             tok = self.spatial_pos(self.patch_embed(frame_aug))  # [B, P, P, d_ctx]
+            if self.use_corr and prev is not None:
+                # Displacement evidence for this frame pair, pooled to the
+                # patch grid and added into the patch tokens.  Frame 0 has no
+                # pair; it contributes nothing (the projection of zeros is
+                # zero anyway, so skipping is exact, not an approximation).
+                c = self.corr(frame, prev)                       # [B, n, h, w]
+                c = F.avg_pool2d(c, c.shape[-1] // tok.shape[1]) # -> patch grid
+                tok = tok + self.corr_proj(c.permute(0, 2, 3, 1))
+            prev = frame
             tok = rearrange(tok, 'b h w d -> b (h w) d')         # [B, P², d_ctx]
             tok = tok + self.temporal_pos.weight[t]            # broadcast temporal bias
             tokens.append(tok)

@@ -39,7 +39,7 @@
     "time_strides": [
       1
     ],
-    "stride_cls_weight": 0.5,
+    "stride_cls_weight": 0.0,
     "persist_norm_loss": true,
     "_residual": "residual_prediction=true: model predicts the frame-to-frame DELTA (out = x + f(x)); a zero-init decoder then starts at exact persistence. MUST match how the checkpoint being loaded was trained \u2014 inference on an absolute-trained checkpoint with this on doubles the field each step and explodes (infer.py --no-residual works around). mask_aware_decoder feeds the geometry mask to the decoder convs.",
     "residual_prediction": true,
@@ -54,7 +54,9 @@
     "n_ctx_heads": 8,
     "disc_dim": 128,
     "disc_adv_weight": 0.01,
-    "disc_lr": 0.0001
+    "disc_lr": 0.0001,
+    "ctx_corr": true,
+    "ctx_corr_radius": 4
   },
   "training": {
     "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic \u2014 training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",

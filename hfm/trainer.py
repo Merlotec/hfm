@@ -364,12 +364,24 @@ def train_step_gan(
 
     # ---- context probe: recover stride / mesh / BCs from the context alone ----
     # frames[] is already stride-subsampled by the caller; the stride reaches
-    # the encoder only through the inter-frame motion.  The probe both measures
-    # and enforces that the context carries each labelled quantity.
+    # the encoder only through the inter-frame motion.
+    #
+    # stride_cls_weight > 0: the probe is a TRAINING SIGNAL — its gradient
+    # flows into the encoder, actively pushing dt / theta / BC into the
+    # context tokens.
+    # stride_cls_weight == 0: the probe is an INSTRUMENT only — its heads
+    # still train, but on a DETACHED context, so the train/val probe metrics
+    # keep measuring what the context carries while ZERO gradient reaches the
+    # encoder.  Whatever the probe can then read off got there purely from the
+    # dynamics loss.
     probe_term = None
-    if probe is not None and probe_dt is not None and stride_cls_weight > 0.0:
+    probe_w = stride_cls_weight
+    if probe is not None and probe_dt is not None:
+        ctx_probe = context if probe_w > 0.0 else context.detach()
+        if probe_w <= 0.0:
+            probe_w = 1.0            # scales only the probe heads' own update
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            probe_term = probe_losses(probe, context, dt=probe_dt, bc=probe_bc,
+            probe_term = probe_losses(probe, ctx_probe, dt=probe_dt, bc=probe_bc,
                                       ctx=probe_ctx, ctx_cls=probe_ctx_cls,
                                       metrics=metrics)
 
@@ -433,7 +445,7 @@ def train_step_gan(
     if adv_weight == 0.0:
         recon_loss = recon_rollout        # raw value, for the log
         gen_loss = gen_recon if probe_term is None \
-            else gen_recon + stride_cls_weight * probe_term
+            else gen_recon + probe_w * probe_term
         # NaN bail must be GLOBAL: if one rank bailed while others proceeded to a
         # collective (DDP reducer or host allreduce), the job would hang/diverge.
         (bad,) = allreduce_stats(0.0 if torch.isfinite(gen_loss) else 1.0)
@@ -517,7 +529,7 @@ def train_step_gan(
     else:
         total_loss = gen_recon
     if probe_term is not None:
-        total_loss = total_loss + stride_cls_weight * probe_term
+        total_loss = total_loss + probe_w * probe_term
     (bad,) = allreduce_stats(0.0 if torch.isfinite(total_loss) else 1.0)
     if bad > 0.0:
         _zero_and_restore()
@@ -1006,7 +1018,20 @@ class GANTrainer:
 
         if 'context_encoder' in ckpt:
             try:
-                self.context_encoder.load_state_dict(ckpt['context_encoder'])
+                miss, unexp = self.context_encoder.load_state_dict(
+                    ckpt['context_encoder'], strict=False)
+                # The ONLY tolerated difference is the correlation projection
+                # being new: it is zero-initialised (an exact no-op), so a
+                # pre-ctx_corr checkpoint resumes bit-identically and the
+                # correlation path trains up from nothing.  Anything else
+                # missing or unexpected is a real shape mismatch — re-raise
+                # into the explanatory SystemExit below.
+                ok = lambda ks: all(k.startswith('corr') for k in ks)
+                if not (ok(miss) and ok(unexp)):
+                    raise RuntimeError(f'missing={list(miss)} unexpected={list(unexp)}')
+                if miss:
+                    print(f'  [info] ctx_corr enabled on a pre-corr checkpoint: '
+                          f'{list(miss)} start zero-init (no-op)')
             except RuntimeError as e:
                 print(f'  [ERROR] context encoder does not match this config: {e}')
                 raise SystemExit(
@@ -1061,7 +1086,17 @@ class GANTrainer:
         # but the current config wins on hyperparameters.
         cur_wd  = [g['weight_decay'] for g in self.gen_optimizer.param_groups]
         cur_base = list(self.scheduler.base_lrs)
-        self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
+        try:
+            self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
+        except ValueError as e:
+            # Param-group size mismatch: the current config added parameters
+            # (e.g. ctx_corr's corr_proj) that the checkpointed optimizer never
+            # saw.  Adam moments cannot be partially restored, so start the
+            # optimizer fresh; weights are already loaded, and the schedule
+            # position still resumes below.  Expect a brief loss blip while
+            # moments rebuild.
+            print(f'  [warn] optimizer state incompatible with current config '
+                  f'({e}); starting with a FRESH optimizer')
         if disc_ok and self.disc_optimizer is not None and 'disc_optimizer' in ckpt:
             try:
                 self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
