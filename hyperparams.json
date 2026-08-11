@@ -1,41 +1,49 @@
 {
   "_comment": "Fluid Model hyperparameters.",
-
   "model": {
     "img_size": 256,
     "in_channels": 4,
     "patch_px": 16,
-
     "d_patch": 384,
     "skip_ch": 32,
-
     "n_global_tokens": 16,
     "n_heads": 8,
-
     "noise_std": 0.0,
-
     "n_layers": 12,
     "mlp_ratio": 4.0,
-    "dropout": 0.0,
-
+    "dropout": 0.1,
     "_multilevel": "Fixed-quadtree QuadtreeHFM knobs (use_quadtree=true). d_patch/n_layers/patch_px/n_global_tokens above are legacy flat-HFM fields the quadtree ignores. ml_dims is a bell curve peaking at level 1; ml_passes is the non-increasing per-level self-attn budget (last = 'number of layers'). Tie/untie: ml_blocks_per_level gives each level that many distinct blocks cycled across its passes (1 = tied); ml_untie_passes=true overrides to one block per pass (fully untied, ~22.8M gen vs ~6M tied).",
     "use_quadtree": false,
     "ml_levels": 4,
     "ml_finest_px": 4,
-    "ml_dims": [192, 384, 256, 96],
-    "ml_passes": [8, 6, 5, 4],
-    "ml_blocks_per_level": [1, 1, 1, 1],
+    "ml_dims": [
+      192,
+      384,
+      256,
+      96
+    ],
+    "ml_passes": [
+      8,
+      6,
+      5,
+      4
+    ],
+    "ml_blocks_per_level": [
+      1,
+      1,
+      1,
+      1
+    ],
     "ml_untie_passes": true,
-
     "_strides": "Multi-timestep training. The physical timestep is dt = stride * save_t, and gen_alternating draws save_t per segment over 0.01..0.2, so dt is continuous and varies run to run WITHOUT any frame striding: hence time_strides=[1]. The probe REGRESSES log(dt) from the context (plus the BC summary) rather than classifying a stride index. stride_cls_weight scales that whole probe loss; 0.5 because at 0.1 the probe never learned the large timesteps and the model hedged with an average delta. persist_norm_loss=true trains on loss/persistence per rollout term so every dt contributes O(1) gradient rather than the large-dt samples dominating, i.e. the training objective becomes the logged ratio.",
-    "time_strides": [1],
+    "time_strides": [
+      1
+    ],
     "stride_cls_weight": 0.5,
     "persist_norm_loss": true,
-
-    "_residual": "residual_prediction=true: model predicts the frame-to-frame DELTA (out = x + f(x)); a zero-init decoder then starts at exact persistence. MUST match how the checkpoint being loaded was trained — inference on an absolute-trained checkpoint with this on doubles the field each step and explodes (infer.py --no-residual works around). mask_aware_decoder feeds the geometry mask to the decoder convs.",
+    "_residual": "residual_prediction=true: model predicts the frame-to-frame DELTA (out = x + f(x)); a zero-init decoder then starts at exact persistence. MUST match how the checkpoint being loaded was trained \u2014 inference on an absolute-trained checkpoint with this on doubles the field each step and explodes (infer.py --no-residual works around). mask_aware_decoder feeds the geometry mask to the decoder convs.",
     "residual_prediction": true,
     "mask_aware_decoder": true,
-
     "ctx_temporal_diffs": true,
     "n_context_frames": 5,
     "ctx_patch_px": 16,
@@ -44,37 +52,31 @@
     "n_ctx_tokens": 16,
     "n_ctx_layers": 4,
     "n_ctx_heads": 8,
-
     "disc_dim": 128,
     "disc_adv_weight": 0.01,
-    "disc_lr": 1e-4
+    "disc_lr": 0.0001
   },
-
   "training": {
-    "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic — training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",
+    "_sizing": "Dawn PVC 1550, 1 node x 8 tiles (ZE_FLAT), ~64GB HBM/tile. batch_size is PER RANK: effective batch = 32 x 8 = 256. lr ~sqrt-scaled from 1e-4@bs4. Dataset is now ~645k sequences -> ~2520 steps/epoch, so 20 epochs ~= 50k optimizer steps and cosine_t_max matches that. IMPORTANT: CosineAnnealingLR is periodic \u2014 training past cosine_t_max makes the LR RISE again, so keep n_epochs x steps/epoch <= cosine_t_max.",
     "_settle_time": "Sim-time (s) dropped from the front of COLD-START runs only (gen_alternating segment 0, or any run_gen trajectory; detected from ic.json segment_id). Measured one-step persistence after an impulsive start: 1.635 at 0-0.05s, 0.829 at 0.1-0.2s, 0.301 at 0.2-0.4s, 0.077 at 0.4-0.7s, 0.012 at 0.7-1.0s, i.e. the field settles by ~0.7s, a 140x drop. The cut is in SIM TIME not frames because a segment spans 30*save_t: at save_t=0.01 all 30 frames are transient, at save_t=0.2 only the first four are. Costs ~8.5% of the corpus; continuation segments are never touched.",
     "settle_time": 0.7,
     "batch_size": 32,
     "n_epochs": 200,
     "num_workers": 8,
-
     "_distributed": "Comms/DDP tuning. Each has an env override that WINS: HFM_ACCUM_STEPS, HFM_TRY_XCCL=1, HFM_GRAD_ALLREDUCE_BF16=1. On Dawn, scripts/dawn_task.sh sets the backend explicitly (shell env wins over these).",
     "_comms": "Host-staged gloo is the floor: device collectives (oneCCL-ZE AND torch-native xccl) both GPU-fault (NotPresent/PDE, drm_neo.cpp:288) on compute-runtime 25.18.33578.77 -- see dawn_task.sh RE-TEST RESULT. try_xccl stays false until the runtime moves past 25.18. Meanwhile: accum_steps=2 halves how often the ~170MB host allreduce runs (effective batch 256 -> 512; lr left as-is, which errs conservative), and grad_allreduce_bf16 halves its size (division still fp32). Validation is sharded across ranks (batch i -> rank i%world), so it no longer parks 7 tiles behind rank 0.",
     "accum_steps": 2,
     "try_xccl": false,
     "grad_allreduce_bf16": true,
-
-    "_gan": "use_gan=false disables the discriminator completely (not built, trained, saved, or applied) — pure reconstruction training. Env HFM_USE_GAN=0/1 overrides.",
+    "_gan": "use_gan=false disables the discriminator completely (not built, trained, saved, or applied) \u2014 pure reconstruction training. Env HFM_USE_GAN=0/1 overrides.",
     "use_gan": false,
     "_disc_update_threshold": "Discriminator strength cap. disc (the logged value) is the discriminator BCE loss: ~1.39 = chance, LOWER = stronger disc. The disc is only trained while threshold < d_loss < 2.0, so once it drops below the threshold it is frozen and the generator pulls it back up; it hovers at the threshold instead of collapsing toward 0 and overpowering the generator.",
     "disc_update_threshold": 0.5,
-
-    "lr": 4e-4,
-    "weight_decay": 1e-5,
+    "lr": 0.0004,
+    "weight_decay": 0.0001,
     "clip_grad": 1.0,
     "lr_schedule": "cosine",
     "cosine_t_max": 50000,
-
     "_grad_weight": "Gradient-difference loss |grad(pred) - grad(gt)|_1, masked to pairs where both pixels are fluid. Penalises WRONG gradients, so it suppresses grain (gradients absent from GT) without blurring sharp features (matching a steep true gradient REDUCES it). Enters the criterion, so the persistence baseline and the logged ratio include it consistently. 0 disables.",
     "grad_weight": 0.2,
     "_tile_weight": "Tile-mean loss: the error field mean-pooled over the decoder's 16px token tiles (fluid-weighted), charged L2+L1. Targets the measured dominant artifact: per-tile DC offsets that are 80-90% of the rho error variance per step, spatially smooth at first, then decorrelating into a visible 16px blob grid ~10 rollout steps out. Pooling first makes the offset the penalised quantity instead of a rounding error inside pixel MSE. In the criterion, so persistence baselines and the ratio include it consistently.",
