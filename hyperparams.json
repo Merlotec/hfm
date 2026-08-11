@@ -8,7 +8,7 @@
     "skip_ch": 32,
     "n_global_tokens": 16,
     "n_heads": 8,
-    "noise_std": 0.0,
+    "noise_std": 0.02,
     "n_layers": 12,
     "mlp_ratio": 4.0,
     "dropout": 0.1,
