@@ -28,11 +28,11 @@ module load default-dawn                       # base env + GPU (level-zero) dri
 # the startup metadata storm (a python import is ~10^4 stat+read RPCs PER RANK,
 # all against the RDS metadata server).  One-time prep on a login node, and
 # again after ANY pip install (the mtime+size key invalidates stale copies):
-#   tar -cf ~/rds/hpc-work/venvs/flsim-xpu.tar -C ~/rds/hpc-work/venvs flsim-xpu
+#   tar -cf "$_VENV_RDS.tar" -C "$(dirname "$_VENV_RDS")" "$(basename "$_VENV_RDS")"
 # The staged copy works because the venv's base interpreter (pyvenv.cfg) is the
 # system python3.9 on the node image; python finds site-packages relative to
 # its own bin/ path, so the venv is relocatable without touching activate.
-_VENV_RDS="$HOME/rds/hpc-work/venvs/flsim-xpu"     # EDIT to your env
+_VENV_RDS="$HOME/rds/rds-airr-p67-Z6yB993aUHo/nk624/venvs/flsim-xpu"  # EDIT to your env
 if [ "${HFM_STAGE_VENV:-0}" = "1" ]; then
   _TAR="${HFM_VENV_TAR:-${_VENV_RDS}.tar}"
   _KEY=$(stat -c '%Y_%s' "$_TAR" 2>/dev/null) \
