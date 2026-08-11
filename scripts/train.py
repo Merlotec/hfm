@@ -390,7 +390,9 @@ def main():
         loss_writer = csv.writer(loss_csv)
         if write_header:
             loss_writer.writerow(['epoch', 'train_ratio', 'val_ratio',
-                                  'train_loss', 'val_loss', 'val_persist'])
+                                  'train_loss', 'val_loss', 'val_persist',
+                                  'val_dt_rel', 'val_ctx_mse', 'val_bc_mse',
+                                  'val_visc_acc'])
             loss_csv.flush()
 
     nan_streak = 0
@@ -526,18 +528,31 @@ def main():
             # is the generalisation gap; the raw losses beside them are on different
             # scales (different dt, different window transience) and cannot be
             # subtracted from one another.
+            # Held-out probe metrics answer "is the context encoder generalising
+            # or memorising?" — compare against the train-side numbers in the
+            # step lines: train visc_acc=1.0 with val_visc_acc at chance (0.25)
+            # is memorisation; both high is genuine inference.
+            probe_s = ''
+            if 'dt_rel_err' in val:
+                probe_s = (f'  val_dt_rel={val["dt_rel_err"]:.3f}'
+                           + (f'  val_ctx={val["ctx_mse"]:.3f}' if 'ctx_mse' in val else '')
+                           + (f'  val_bc={val["bc_mse"]:.3f}' if 'bc_mse' in val else '')
+                           + (f'  val_visc_acc={val["visc_acc"]:.2f}' if 'visc_acc' in val else ''))
             print(
                 f'  [epoch {epoch:3d}] train_ratio={train_ratio:.3f}  '
-                f'val_ratio={val["ratio"]:.3f}   '
+                f'val_ratio={val["ratio"]:.3f} {probe_s}  '
                 f'(raw: train={train_loss:.4f}  val={val["recon"]:.4f}  '
                 f'val_persist={val["persist"]:.4f}  '
                 f'val_time={val.get("secs", float("nan")):.0f}s)'
             )
             if loss_writer is not None and loss_csv is not None:
+                _pf = lambda k: (f'{val[k]:.6f}' if k in val else '')
                 loss_writer.writerow([
                     epoch, f'{train_ratio:.6f}', f'{val["ratio"]:.6f}',
                     f'{train_loss:.6f}', f'{val["recon"]:.6f}',
-                    f'{val["persist"]:.6f}'])
+                    f'{val["persist"]:.6f}',
+                    _pf('dt_rel_err'), _pf('ctx_mse'), _pf('bc_mse'),
+                    _pf('visc_acc')])
                 loss_csv.flush()
             _save_loss_plot(loss_log_path, loss_plot_path)
 

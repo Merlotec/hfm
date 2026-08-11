@@ -685,6 +685,8 @@ class GANTrainer:
         """
         self.model.eval()
         self.context_encoder.eval()
+        if self.stride_probe is not None:
+            self.stride_probe.eval()
         device      = next(self.model.parameters()).device
         device_type = device.type
         amp         = device_type in ('cuda', 'xpu')
@@ -694,10 +696,22 @@ class GANTrainer:
             rank  = torch.distributed.get_rank()
             world = torch.distributed.get_world_size()
         tot_recon, tot_persist, count = 0.0, 0.0, 0
+        # Probe metrics on HELD-OUT runs: the direct answer to "is the context
+        # encoder generalising or memorising?".  Weighted sums per key, since a
+        # batch contributes a metric only when it carries that label.
+        PROBE_KEYS = ('dt_rel_err', 'bc_mse', 'ctx_mse', 'visc_acc')
+        p_sum = {k: 0.0 for k in PROBE_KEYS}
+        p_n   = {k: 0.0 for k in PROBE_KEYS}
         for batch in dataloader:
-            # (frames, mesh_id, ...) when the datamodule tags labels, else frames
+            # (frames, mesh_id, bc, save_t, ctx, ctx_cls) when tagged, else frames
+            bc = save_t = ctx_vec = ctx_cls = None
             if isinstance(batch, (tuple, list)):
-                batch, mesh_b = batch[0], batch[1]
+                mesh_b  = batch[1] if len(batch) > 1 else None
+                bc      = batch[2] if len(batch) > 2 else None
+                save_t  = batch[3] if len(batch) > 3 else None
+                ctx_vec = batch[4] if len(batch) > 4 else None
+                ctx_cls = batch[5] if len(batch) > 5 else None
+                batch   = batch[0]
             else:
                 mesh_b = None
             mask     = self._mask_ctx(pixel_mask, mesh_b, val=True)
@@ -706,6 +720,17 @@ class GANTrainer:
                                   len(frames) - nc - 1))
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
                 context = self.context_encoder(frames[:nc], pixel_mask=mask)
+                if self.stride_probe is not None and save_t is not None:
+                    pm: dict = {}
+                    with torch.no_grad():
+                        probe_losses(self.stride_probe, context,
+                                     dt=save_t.float().to(device), bc=bc,
+                                     ctx=ctx_vec, ctx_cls=ctx_cls, metrics=pm)
+                    B = batch.shape[0]
+                    for k in PROBE_KEYS:
+                        if k in pm and pm[k] == pm[k]:      # present and finite
+                            p_sum[k] += pm[k] * B
+                            p_n[k]   += B
                 # Same unrolled metric as training: predict horizon steps, feeding
                 # predictions forward, average over the horizon.
                 x_cur, terms, bases = frames[nc], [], []
@@ -730,10 +755,16 @@ class GANTrainer:
             # long=True: ranks arrive here minutes apart (each rendered its own
             # shard, at Lustre speed, possibly through corrupt-run retries); the
             # default 300 s group turned that spread into a timeout that killed
-            # the whole job at an epoch boundary.
-            tot_recon, tot_persist, count = allreduce_stats(
-                tot_recon, tot_persist, float(count), long=True)
-            count = int(count)
+            # the whole job at an epoch boundary.  Probe sums ride the same
+            # collective; the key ORDER is fixed so every rank reduces the same
+            # slots.
+            flat = [tot_recon, tot_persist, float(count)]
+            for k in PROBE_KEYS:
+                flat += [p_sum[k], p_n[k]]
+            red = allreduce_stats(*flat, long=True)
+            tot_recon, tot_persist, count = red[0], red[1], int(red[2])
+            for i, k in enumerate(PROBE_KEYS):
+                p_sum[k], p_n[k] = red[3 + 2 * i], red[4 + 2 * i]
         if count == 0:
             return {'recon': float('nan'), 'persist': float('nan'),
                     'ratio': float('nan')}
@@ -741,8 +772,12 @@ class GANTrainer:
         # Ratio of the MEANS, not the mean of per-batch ratios: a batch that is
         # nearly static has a near-zero baseline, and averaging its ratio would
         # let that one batch dominate the number.
-        return {'recon': recon, 'persist': persist,
-                'ratio': recon / persist if persist > 0 else float('inf')}
+        out = {'recon': recon, 'persist': persist,
+               'ratio': recon / persist if persist > 0 else float('inf')}
+        for k in PROBE_KEYS:
+            if p_n[k] > 0:
+                out[k] = p_sum[k] / p_n[k]
+        return out
 
     def to(self, device: torch.device) -> "GANTrainer":
         self.model           = self.model.to(device)

@@ -386,13 +386,22 @@ class HFMLightningModule(L.LightningModule):
     # Lightning runs this under no_grad + eval() + the precision plugin's
     # autocast, so the numerics match GANTrainer.validate's bf16 path.
 
+    # Fixed slot order for the cross-rank sum; probe keys contribute
+    # (weighted sum, weight) pairs after the three loss slots.
+    _VAL_PROBE_KEYS = ('dt_rel_err', 'bc_mse', 'ctx_mse', 'visc_acc')
+
     def on_validation_epoch_start(self) -> None:
-        self._val_sums = [0.0, 0.0, 0.0]   # recon, persist, batch count
+        # recon, persist, batch count, then (sum, n) per probe key
+        self._val_sums = [0.0] * (3 + 2 * len(self._VAL_PROBE_KEYS))
 
     def validation_step(self, batch, batch_idx: int) -> None:
-        mesh_ids = None
+        mesh_ids = bc = save_t = ctx_vec = ctx_cls = None
         if isinstance(batch, (tuple, list)):
             mesh_ids = batch[1] if len(batch) > 1 else None
+            bc       = batch[2] if len(batch) > 2 else None
+            save_t   = batch[3] if len(batch) > 3 else None
+            ctx_vec  = batch[4] if len(batch) > 4 else None
+            ctx_cls  = batch[5] if len(batch) > 5 else None
             batch = batch[0]
         frames = [batch[:, t] for t in range(batch.shape[1])]
         n    = self.cfg.n_context_frames
@@ -417,6 +426,18 @@ class HFMLightningModule(L.LightningModule):
             self._val_sums[0] += loss
             self._val_sums[1] += sum(bases) / len(bases)
             self._val_sums[2] += 1.0
+        # Held-out probe metrics: does the encoder recover dt / theta / BC on
+        # runs it never trained on?  (see GANTrainer.validate for rationale)
+        if self.stride_probe is not None and save_t is not None:
+            pm: dict = {}
+            probe_losses(self.stride_probe, context,
+                         dt=save_t.float().to(self.device), bc=bc,
+                         ctx=ctx_vec, ctx_cls=ctx_cls, metrics=pm)
+            B = batch.shape[0]
+            for i, k in enumerate(self._VAL_PROBE_KEYS):
+                if k in pm and pm[k] == pm[k]:
+                    self._val_sums[3 + 2 * i] += pm[k] * B
+                    self._val_sums[4 + 2 * i] += B
 
     def on_validation_epoch_end(self) -> None:
         # float32, not 64: MPS has no float64.  all_gather is a collective —
@@ -426,13 +447,18 @@ class HFMLightningModule(L.LightningModule):
                                          device=self.device))
         if t.dim() > 1:                                    # [world, 3] under DDP
             t = t.sum(0)
-        recon, persist, count = (float(v) for v in t)
+        vals = [float(v) for v in t]
+        recon, persist, count = vals[0], vals[1], vals[2]
         if count == 0:
             return
-        self.log_dict({'val_recon':   recon / count,
-                       'val_persist': persist / count,
-                       'val_ratio':   recon / max(persist, 1e-8)},
-                      prog_bar=True, sync_dist=False)      # already reduced
+        logs = {'val_recon':   recon / count,
+                'val_persist': persist / count,
+                'val_ratio':   recon / max(persist, 1e-8)}
+        for i, k in enumerate(self._VAL_PROBE_KEYS):
+            s, n = vals[3 + 2 * i], vals[4 + 2 * i]
+            if n > 0:
+                logs[f'val_{k}'] = s / n
+        self.log_dict(logs, prog_bar=True, sync_dist=False)  # already reduced
 
     def configure_optimizers(self):  # type: ignore[override]
         gen_params = list(self.model.parameters()) + list(self.context_encoder.parameters())
