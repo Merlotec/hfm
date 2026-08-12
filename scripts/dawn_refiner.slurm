@@ -8,13 +8,16 @@
 # reliably: --export splits its value on COMMAS, so any comma in the argument
 # string is parsed as the start of another VAR=VALUE pair.
 #
-# Unlike dawn_train.slurm this is a ONE-RANK job: scripts/train_refiner.py is
-# single-process by design (the ~8.6M-param refiner trains against a FROZEN base,
-# whose forwards are no-grad), so none of the oneCCL/DDP machinery applies.  It
-# reuses scripts/dawn_task.sh purely for the environment (module purge +
-# default-dawn, venv activation, LD_LIBRARY_PATH ordering, the import-torch
-# preflight that catches flapping RDS mounts); the collective env it also sets is
-# inert at 1 rank.
+# DATA-PARALLEL over the node's 8 XPU tiles, same layout as dawn_train.slurm.
+# The refiner is only ~8.6M params, so the host-staged gradient allreduce Dawn
+# forces on us (~34MB/step, or 17MB with HFM_GRAD_ALLREDUCE_BF16=1) is ~5x
+# cheaper than the base model's, against per-step compute that still includes a
+# frozen-base rollout -- a better compute:communication ratio than the base
+# training already runs at this width.  Set RANKS=1 for the old single-process
+# behaviour (every collective becomes a no-op).
+#
+# Scaling is sub-linear by construction: the frozen-base forward is repeated on
+# every rank, so this parallelises the BATCH, not that work.
 #
 # ---------------------------------------------------------------------------
 #SBATCH --job-name=hfm-refiner
@@ -23,8 +26,8 @@
 #SBATCH --exclusive
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1                 # ONE rank: the refiner is single-device
-#SBATCH --cpus-per-task=32                  # no rank contention -> give the loader cores
+#SBATCH --ntasks-per-node=8                 # 1 rank per PVC tile (2 tiles/card)
+#SBATCH --cpus-per-task=12                  # 96 cores/node / 8 ranks
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/hfm_refiner.out
 #SBATCH --error=logs/hfm_refiner.err
@@ -58,6 +61,9 @@ RESUME=""
 
 # Anything else to append verbatim (e.g. --cache-frames --lr 1e-4).
 EXTRA=""
+
+# Ranks (XPU tiles) to train across.  1 = single process.
+RANKS=8
 # ============================================================================
 
 REFINER_ARGS="--checkpoint $BASE_CKPT --data $DATA"
@@ -82,4 +88,5 @@ export HFM_ENTRY=scripts/train_refiner.py
 export HFM_TRAIN_ARGS="$REFINER_ARGS"
 echo "refiner: python $HFM_ENTRY $HFM_TRAIN_ARGS"
 
-srun --ntasks=1 --ntasks-per-node=1 --export=ALL scripts/dawn_task.sh
+echo "ranks: $RANKS  (global batch = $RANKS x $BATCH_SIZE)"
+srun --ntasks="$RANKS" --ntasks-per-node="$RANKS" --export=ALL scripts/dawn_task.sh
