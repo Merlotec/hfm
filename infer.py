@@ -316,6 +316,10 @@ def main():
                              'of the model\'s own previous prediction. Turns the rollout '
                              'into independent single-step predictions (no compounding '
                              'error), isolating per-step accuracy.')
+    parser.add_argument('--runs', nargs='+', default=None,
+                        help='Only process runs whose directory NAME is in this list '
+                             '(e.g. run_a000_s01_ab12cd34). Default: every run under '
+                             '--data-dir. Errors if a requested run is not found.')
     args = parser.parse_args()
 
     device   = get_device()
@@ -416,6 +420,12 @@ def main():
 
     if not runs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
+    if args.runs:
+        want = set(args.runs)
+        runs = [r for r in runs if r[0].name in want]
+        missing = want - {r[0].name for r in runs}
+        if missing:
+            raise RuntimeError(f'--runs not found under {data_dir}: {sorted(missing)}')
     if args.val_only:
         n_all = len(runs)
         runs = [r for r in runs if is_val_run(r[0], args.val_fraction)]
@@ -502,6 +512,7 @@ def main():
         crit = FluidLoss(l1_weight=0.1).to(device)
         seed = frames_gt[n_context]
         step_loss, step_base, step_loss_ref = [], [], []
+        step_mae, step_mae_ref, step_mae_persist = [], [], []
 
         with torch.no_grad():
             for t in range(args.n_predict_run):
@@ -523,18 +534,28 @@ def main():
                 gt.append(frames_gt[n_context + t].cpu())
 
                 target = frames_gt[n_context + t + 1]
+                # MAE = the BASE (non-refined) prediction; MAE_refined = after the
+                # flow-matching refiner.  Both are printed so the refiner's effect
+                # is visible in absolute terms, not only via the loss ratios.
                 mae = (target - pred).abs().mean().item()
                 l   = crit(pred, target, pixel_mask=pixel_mask).item()
                 b_src = frames_gt[n_context + t] if args.teacher_forcing else seed
                 b   = crit(b_src, target, pixel_mask=pixel_mask).item()
+                mae_p = (target - b_src).abs().mean().item()   # persistence MAE
                 step_loss.append(l)
                 step_base.append(b)
-                line = (f'  t={t+1:3d}  MAE={mae:.5f}  loss={l:.5f}  '
-                        f'persist={b:.5f}  ratio={l / b if b > 0 else float("inf"):.3f}')
+                step_mae.append(mae)
+                step_mae_persist.append(mae_p)
+                line = (f'  t={t+1:3d}  MAE={mae:.5f}  MAE_persist={mae_p:.5f}  '
+                        f'loss={l:.5f}  persist={b:.5f}  '
+                        f'ratio={l / b if b > 0 else float("inf"):.3f}')
                 if refined is not None:
+                    mae_ref = (target - refined).abs().mean().item()
                     lr = crit(refined, target, pixel_mask=pixel_mask).item()
                     step_loss_ref.append(lr)
-                    line += f'  ratio_refined={lr / b if b > 0 else float("inf"):.3f}'
+                    step_mae_ref.append(mae_ref)
+                    line += (f'  ratio_refined={lr / b if b > 0 else float("inf"):.3f}'
+                             f'  MAE_refined={mae_ref:.5f}')
                 print(line)
 
                 if discriminator is not None:
@@ -556,12 +577,30 @@ def main():
         # near-static early step with a tiny denominator.
         if step_loss:
             tb = max(sum(step_base), 1e-12)
-            line = (f'  rollout: mean_loss={sum(step_loss) / len(step_loss):.5f}  '
+            line = (f'  rollout: mean_MAE={sum(step_mae) / len(step_mae):.5f}  '
+                    f'mean_MAE_persist={sum(step_mae_persist) / len(step_mae_persist):.5f}  '
+                    f'mean_loss={sum(step_loss) / len(step_loss):.5f}  '
                     f'mean_persist={sum(step_base) / len(step_base):.5f}  '
                     f'ratio={sum(step_loss) / tb:.3f}')
             if step_loss_ref:
-                line += f'  ratio_refined={sum(step_loss_ref) / tb:.3f}'
+                line += (f'  ratio_refined={sum(step_loss_ref) / tb:.3f}'
+                         f'  mean_MAE_refined={sum(step_mae_ref) / len(step_mae_ref):.5f}')
             print(line)
+
+            # Machine-readable copy of the per-step table (same numbers as the
+            # printed lines) for downstream plotting/report pipelines.  Refined
+            # columns are empty when no refiner is loaded.
+            with open(run_out / 'metrics.csv', 'w') as f:
+                f.write('t,MAE,MAE_refined,MAE_persist,loss,persist,ratio,ratio_refined\n')
+                for i in range(len(step_loss)):
+                    m, l, b = step_mae[i], step_loss[i], step_base[i]
+                    mr = f'{step_mae_ref[i]:.6f}' if step_mae_ref else ''
+                    rr = (f'{step_loss_ref[i] / b:.4f}'
+                          if step_loss_ref and b > 0 else '')
+                    ratio = f'{l / b:.4f}' if b > 0 else ''
+                    f.write(f'{i + 1},{m:.6f},{mr},{step_mae_persist[i]:.6f},'
+                            f'{l:.6f},{b:.6f},{ratio},{rr}\n')
+            print(f'  metrics → {run_out / "metrics.csv"}')
 
         # ---- save outputs ----
         gt_arr   = torch.cat(gt,    dim=0).numpy()

@@ -990,6 +990,12 @@ class GANTrainer:
             # Pin the normalisation so inference reproduces training exactly.
             'norm_mean':       None if self.norm_mean is None else self.norm_mean.tolist(),
             'norm_std':        None if self.norm_std  is None else self.norm_std.tolist(),
+            # Pin the train/val split too: is_val_run is a stable md5 of the run
+            # name, so the split is reproducible ONLY if val_fraction is the same.
+            # Resuming with a different one silently moves runs across the
+            # boundary (held-out runs become training data, or vice versa), and
+            # without this record there is no way to detect it after the fact.
+            'val_fraction':    getattr(self, 'val_fraction', None),
         }
         # Only persist discriminator state when the GAN is enabled.
         if self.discriminator is not None and self.disc_optimizer is not None:
@@ -1003,6 +1009,8 @@ class GANTrainer:
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        # Stashed for the caller to compare against the split it just built.
+        self.resumed_val_fraction = ckpt.get('val_fraction')
         # Load into the raw modules — checkpoints are always saved unwrapped (see
         # save()), so loading through a DDP wrapper would look for 'module.*' keys.
         # Normally load() runs before wrap_ddp(), but stay correct either way.

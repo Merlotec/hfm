@@ -352,6 +352,8 @@ def main():
     # Pin the training normalisation into every checkpoint this run writes, so
     # inference can't silently normalise with different stats (see infer.load_stats).
     trainer.norm_mean, trainer.norm_std = dm.mean, dm.std
+    # Recorded into every checkpoint so a later resume can detect a changed split.
+    trainer.val_fraction = dm.val_fraction
     trainer.to(device)
 
     if args.resume == 'latest':
@@ -364,6 +366,28 @@ def main():
     if args.resume:
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
+        # The split is a stable md5 of each run NAME thresholded at val_fraction,
+        # so it survives restarts unchanged — but ONLY at the same fraction.
+        # Lowering it pulls previously held-out runs into training (they are then
+        # no longer a clean val set); raising it moves already-trained runs into
+        # val (flattering the val metric).  Neither is visible in the loss curves,
+        # so fail loudly rather than let it pass.
+        prev = getattr(trainer, 'resumed_val_fraction', None)
+        if prev is not None and abs(prev - dm.val_fraction) > 1e-9:
+            print(f'\n  !! VAL SPLIT CHANGED: checkpoint was trained with '
+                  f'val_fraction={prev}, this run uses {dm.val_fraction}.')
+            print(f'     The held-out set is threshold-based, so runs have moved '
+                  f'across the boundary: with '
+                  f'{"a lower" if dm.val_fraction < prev else "a higher"} fraction, '
+                  + ('runs that were held out are now TRAINED ON.'
+                     if dm.val_fraction < prev else
+                     'runs already trained on are now scored as VALIDATION.'))
+            print(f'     Re-run with --val-fraction {prev} to keep the original '
+                  f'split, or start fresh if you meant to change it.')
+            sys.exit(1)
+        if prev is None:
+            print('  [note] checkpoint predates val_fraction recording — cannot '
+                  'verify the split matches; confirm --val-fraction by hand.')
 
     # AFTER load(): checkpoints are stored unwrapped, and DDP reuses the same
     # Parameter objects so the optimizers built in GANTrainer.__init__ stay valid.

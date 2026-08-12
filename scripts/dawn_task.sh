@@ -236,4 +236,7 @@ cd "$SLURM_SUBMIT_DIR"
 # Extra train.py arguments via environment (sbatch does not forward args to
 # srun'd task scripts), e.g.:
 #   sbatch --export=ALL,HFM_TRAIN_ARGS="--resume latest" dawn_train.slurm
-exec python scripts/train.py ${HFM_TRAIN_ARGS:-}
+# HFM_ENTRY selects the script (default: base-model training).  The refiner is
+# single-process (scripts/dawn_refiner.slurm sets HFM_ENTRY + 1 task); all the
+# oneCCL/DDP env above is inert for a 1-rank job.
+exec python "${HFM_ENTRY:-scripts/train.py}" ${HFM_TRAIN_ARGS:-}

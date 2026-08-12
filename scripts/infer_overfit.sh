@@ -8,8 +8,11 @@ cd "$(dirname "$0")/.."
 DATA_DIR="$(pwd)/../data/fvm_gen_alternating"
 OUT_DIR="$(pwd)/out/infer"
 # CKPT="$(pwd)/checkpoints/ckpt-step037500.ckpt"
-CKPT="$(pwd)/checkpoints/train_step010000.pt"
-DET_CKPT="$(pwd)/checkpoints/refiner_step020000.pt"
+CKPT="$(pwd)/checkpoints/dynamics_b.pt"
+# CKPT="$(pwd)/checkpoints/train_step010000.pt"
+
+# DET_CKPT="$(pwd)/checkpoints/refiner_step020000.pt"
+# DET_CKPT="$(pwd)/checkpoints/refiner_a.pt"
 
 echo "Checkpoint : $CKPT"
 echo "Data       : $DATA_DIR"
@@ -31,7 +34,7 @@ python infer.py \
     --checkpoint "$CKPT" \
     --data-dir   "$DATA_DIR" \
     --out-dir    "$OUT_DIR" \
-    --seq-start 0 \
-    --n-predict  25 
-    # --refine "$DET_CKPT" \
+    --n-predict  25 \
+    --refine "$DET_CKPT" 
+    # --seq-start 0 \
     # --teacher-forcing

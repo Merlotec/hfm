@@ -13,6 +13,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 REAL_DIR="$(pwd)/../data/fvm_gen_alternating"
+# REAL_DIR="$(pwd)/../data/fvm_validation"
 GEN_DIR="$(pwd)/out/infer/viewer"
 VIEWER="$(pwd)/../fvm_model/fvm_viewer/viewer.py"
 PORT="${1:-8051}"
