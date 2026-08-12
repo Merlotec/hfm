@@ -24,6 +24,7 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -89,7 +90,7 @@ def load_base(path: str, device: torch.device, allow_missing_stats: bool):
 @torch.no_grad()
 def make_pair(frames, mesh_ids, mesh_masks, model, ce, cfg, device,
               amp, rollout_mix_prob: float, rollout_max_k: int,
-              force_k: int | None = None):
+              force_k: Optional[int] = None):
     """
     frames: [B, T, C, H, W] on device.  Samples a stride s and a rollout depth
     k, runs the frozen base k teacher-forced/AR steps, and returns
