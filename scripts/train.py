@@ -173,6 +173,10 @@ def _save_loss_plot(log_path: Path, plot_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Declared up front: Python forbids using a name before its `global`
+    # statement in the same scope, and --ckpt-dir's help text prints the default.
+    # Rebinding here makes every later CKPT_DIR use follow with no other edits.
+    global CKPT_DIR
     parser = argparse.ArgumentParser(description='Train HFM on fluid simulation data')
     parser.add_argument('--data',       type=Path, nargs='+', default=[DEFAULT_DATA_DIR],
                         help='One or more dataset directories.  All are pooled: runs '
@@ -207,7 +211,16 @@ def main():
     parser.add_argument('--ckpt-every', type=int,  default=500,
                         help='Save train_step<N>.pt every N steps (0 disables). '
                              'These are what `--resume latest` looks for.')
+    parser.add_argument('--ckpt-dir', type=str, default=None,
+                        help='Directory for checkpoints + loss log/plot '
+                             f'(default: {CKPT_DIR}). `--resume latest` also '
+                             'searches HERE, so a run started with --ckpt-dir '
+                             'must resume with the same one.')
     args = parser.parse_args()
+
+    if args.ckpt_dir:
+        CKPT_DIR = Path(args.ckpt_dir).resolve()
+    print(f'Checkpoints: {CKPT_DIR}')
 
     # Let fp32 matmuls use TF32 tensor cores (Ampere+/CUDA, and the XPU equivalent).
     # bf16 autocast already covers most matmuls; this picks up the ones that stay fp32.
@@ -419,7 +432,7 @@ def main():
     loss_log_path  = CKPT_DIR / 'loss_log.csv'
     loss_plot_path = CKPT_DIR / 'loss_plot.png'
     if is_main():                       # only rank 0 writes logs/plots/checkpoints
-        CKPT_DIR.mkdir(exist_ok=True)
+        CKPT_DIR.mkdir(parents=True, exist_ok=True)
         # Append mode — safe for resume; write header only when starting fresh
         write_header = not loss_log_path.exists()
         loss_csv    = open(loss_log_path, 'a', newline='')

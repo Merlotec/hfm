@@ -144,6 +144,10 @@ def make_pair(frames, mesh_ids, mesh_masks, model, ce, cfg, device,
 # ---------------------------------------------------------------------------
 
 def main():
+    # Declared up front: Python forbids using a name before its `global`
+    # statement in the same scope, and --ckpt-dir's help text prints the default.
+    # Rebinding here makes every later CKPT_DIR use follow with no other edits.
+    global CKPT_DIR
     p = argparse.ArgumentParser(description='Train the flow-matching refiner')
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Frozen base HFM checkpoint (.pt or .ckpt)')
@@ -169,7 +173,15 @@ def main():
     p.add_argument('--allow-missing-stats', action='store_true')
     p.add_argument('--cache-frames', action='store_true',
                    help='Pre-render all frames in memory (small overfit runs)')
+    p.add_argument('--ckpt-dir', type=str, default=None,
+                   help=f'Directory for refiner checkpoints + loss log '
+                        f'(default: {CKPT_DIR}). --resume paths are given '
+                        f'explicitly, so this only affects where NEW ones land.')
     args = p.parse_args()
+
+    if args.ckpt_dir:
+        CKPT_DIR = Path(args.ckpt_dir).resolve()
+    print(f'Checkpoints: {CKPT_DIR}')
 
     from hfm.distributed import pick_device
     device = pick_device()
@@ -261,7 +273,7 @@ def main():
         print(f'  sigma_d = {[round(float(v), 5) for v in sigma_d]}')
 
     # ---- logging ----
-    CKPT_DIR.mkdir(exist_ok=True)
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
     log_path = CKPT_DIR / 'refiner_loss_log.csv'
     if not log_path.exists() or not args.resume:
         with open(log_path, 'w', newline='') as f:

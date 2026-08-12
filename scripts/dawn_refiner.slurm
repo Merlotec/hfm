@@ -42,6 +42,11 @@ BASE_CKPT="checkpoints/dynamics_a.ckpt"
 # Dataset root (same corpus the base was trained on).
 DATA="$HOME/rds/rds-airr-p67-Z6yB993aUHo/nk624/data/fvm_gen_alternating_gpu"
 
+# Where NEW refiner checkpoints + refiner_loss_log.csv land.  Empty = the repo's
+# checkpoints/ dir.  Point it at RDS scratch to keep the repo clean, or to give
+# each experiment its own directory.
+CKPT_DIR=""
+
 BATCH_SIZE=16
 NUM_WORKERS=16          # 1 rank owns the node's cores; 4 (the script default) idles the XPU
 EPOCHS=50
@@ -58,6 +63,7 @@ EXTRA=""
 REFINER_ARGS="--checkpoint $BASE_CKPT --data $DATA"
 REFINER_ARGS="$REFINER_ARGS --batch-size $BATCH_SIZE --num-workers $NUM_WORKERS"
 REFINER_ARGS="$REFINER_ARGS --epochs $EPOCHS --max-steps $MAX_STEPS --ckpt-every $CKPT_EVERY"
+[ -n "$CKPT_DIR" ] && REFINER_ARGS="$REFINER_ARGS --ckpt-dir $CKPT_DIR"
 [ -n "$RESUME" ] && REFINER_ARGS="$REFINER_ARGS --resume $RESUME"
 [ -n "$EXTRA" ]  && REFINER_ARGS="$REFINER_ARGS $EXTRA"
 
