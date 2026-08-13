@@ -346,6 +346,13 @@ class EMA:
     def update(self, module: nn.Module) -> None:
         for k, v in module.state_dict().items():
             s = self.shadow[k]
+            if s.device != v.device:
+                # Resume path: the checkpoint is read with map_location='cpu'
+                # while the module already lives on the accelerator, so the
+                # shadow comes back on the wrong device and every rank dies
+                # here on the first update.  Migrate on first touch instead —
+                # this also covers a module moved after the EMA was built.
+                s = self.shadow[k] = s.to(v.device)
             if v.dtype.is_floating_point:
                 s.mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
             else:

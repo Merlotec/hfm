@@ -264,6 +264,7 @@ def main():
     eval_net = copy.deepcopy(refiner)     # receives EMA weights at eval time
     global_step = 0
     sigma_d = None
+    sigma_base_step = base_step        # base sigma_d is/was calibrated against
 
     if args.resume:
         rck = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -273,8 +274,26 @@ def main():
         sched.load_state_dict(rck['scheduler'])
         global_step = rck['global_step']
         sigma_d = rck['sigma_d'].to(device)   # NEVER recalibrate on resume
+        # sigma_d converts between data units and the flow-matching working space
+        # (d~ = d/sigma_d when training, x*sigma_d when sampling).  It is a direct
+        # function of the BASE's residual magnitude, so a different base means a
+        # stale scale -- and it cannot simply be recalibrated here, because the
+        # loaded weights encode a velocity field expressed in the OLD units.
+        sigma_base_step = rck.get('sigma_base_step', rck.get('base_global_step'))
         if main:
             print(f'Resumed {args.resume} at step {global_step}')
+            if str(sigma_base_step) != str(base_step):
+                print(f'\n  !! BASE CHANGED SINCE CALIBRATION: sigma_d was calibrated '
+                      f'against base step {sigma_base_step}, this run uses '
+                      f'{base_step}.')
+                print(f'     sigma_d is NOT recalibrated on resume (the loaded '
+                      f'weights are expressed in the old units), so training '
+                      f'continues against a stale scale.')
+                print(f'     A better base has smaller residuals, so an oversized '
+                      f'sigma_d shrinks d~ = d/sigma_d and the flow-matching '
+                      f'target drowns in the unit-variance noise.')
+                print(f'     Small base change -> tolerable. Large one -> drop '
+                      f'--resume and train fresh so sigma_d recalibrates.\n')
 
     def batch_iter():
         epoch = 0
@@ -343,6 +362,11 @@ def main():
             'refiner_ema': ema.state_dict(),
             'refiner_cfg': rcfg,
             'sigma_d': sigma_d.cpu(),
+            # Recorded SEPARATELY from base_global_step: after a resume onto a new
+            # base the two differ, and without this the checkpoint would claim the
+            # new base's calibration while carrying the old scale -- invisible to
+            # infer.py's mismatch check, which compares base_global_step.
+            'sigma_base_step': sigma_base_step,
             'base_checkpoint': str(args.checkpoint),
             'base_global_step': base_step,
             'base_cfg': cfg,
